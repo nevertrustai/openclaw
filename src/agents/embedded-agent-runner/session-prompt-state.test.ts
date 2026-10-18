@@ -1,11 +1,13 @@
 import { SYSTEM_PROMPT_CACHE_BOUNDARY } from "@openclaw/ai/internal/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { SessionEntry } from "../sessions/session-manager-types.js";
+import type { AnyAgentTool } from "../tools/common.js";
 import {
   clearEmbeddedSessionPromptStates,
   beginSessionSystemPrompt,
   prepareEmbeddedSessionActiveProjectKeys,
   prepareSessionSystemPrompt,
+  prepareSessionToolSurface,
   persistSessionSystemPrompt,
   retainEmbeddedSessionPromptState,
 } from "./session-prompt-state.js";
@@ -434,6 +436,112 @@ describe("system prompt series", () => {
     expect(restarted.restart).toBe(true);
     expect(restarted.update).toBeUndefined();
     expect(restarted.systemPrompt).toContain(changed.trimEnd());
+  });
+});
+
+describe("session tool surface", () => {
+  let lease: ReturnType<typeof retainEmbeddedSessionPromptState>;
+  beforeEach(() => {
+    lease = retainEmbeddedSessionPromptState("tool-surface");
+    sessionIds.add("tool-surface");
+  });
+  afterEach(() => lease[Symbol.dispose]());
+  const routeKey = "openai/gpt-6-sol/openai-responses";
+  const tool = (name: string, description = `${name} tool`) =>
+    ({
+      name,
+      label: name,
+      description,
+      parameters: { type: "object", properties: { [name]: { type: "string" } } },
+      execute: async () => ({
+        content: [{ type: "text" as const, text: `${name} ran` }],
+        details: {},
+      }),
+    }) as unknown as AnyAgentTool;
+  const surface = (
+    tools: AnyAgentTool[],
+    entries: SessionEntry[] = [],
+    route = routeKey,
+    toolPolicy = "policy-a",
+  ) =>
+    prepareSessionToolSurface({ state: lease.state, routeKey: route, toolPolicy, entries, tools });
+  const definitions = (tools: AnyAgentTool[]) =>
+    tools
+      .map(({ name, description, parameters }) => ({ name, description, parameters }))
+      .toSorted((a, b) => a.name.localeCompare(b.name));
+  async function persist(entries: SessionEntry[]) {
+    prepareSessionSystemPrompt({
+      state: lease.state,
+      routeKey,
+      systemPrompt: "Base.",
+      entries,
+    }).commit();
+    await persistSessionSystemPrompt(lease.state, (customType, data) => {
+      entries.push({
+        type: "custom",
+        customType,
+        data: structuredClone(data),
+        id: `marker-${entries.length}`,
+        parentId: null,
+        timestamp: "2026-10-01T00:00:00Z",
+      });
+    });
+  }
+
+  it("keeps every pinned definition on a turn that builds fewer tools and refuses the missing ones", async () => {
+    const entries: SessionEntry[] = [];
+    const userTurn = surface([tool("read"), tool("gateway"), tool("message")]);
+    await persist(entries);
+    const backgroundTurn = surface([tool("read"), tool("message")], entries);
+    expect(definitions(backgroundTurn)).toEqual(definitions(userTurn));
+    const refused = await backgroundTurn
+      .find((entry) => entry.name === "gateway")!
+      .execute("x", {});
+    expect(refused.details).toMatchObject({ gated: true });
+    expect(JSON.stringify(refused.content)).toContain("gateway is not available in this turn");
+  });
+
+  it("restores the pin from the transcript after a restart and extends it once for a new tool", async () => {
+    const entries: SessionEntry[] = [];
+    surface([tool("read"), tool("gateway")]);
+    await persist(entries);
+    clearEmbeddedSessionPromptStates(["tool-surface"]);
+    lease[Symbol.dispose]();
+    lease = retainEmbeddedSessionPromptState("tool-surface");
+    const restored = surface([tool("read")], entries);
+    expect(restored.map((entry) => entry.name).toSorted()).toEqual(["gateway", "read"]);
+    expect(lease.state.pendingToolSurface).toBeUndefined();
+    const extended = surface([tool("read"), tool("heartbeat_respond")], entries);
+    expect(extended.map((entry) => entry.name).toSorted()).toEqual([
+      "gateway",
+      "heartbeat_respond",
+      "read",
+    ]);
+    expect(lease.state.pendingToolSurface?.tools.map((entry) => entry.name)).toEqual([
+      "gateway",
+      "heartbeat_respond",
+      "read",
+    ]);
+  });
+
+  it("drops pinned tools when the tool policy changes", () => {
+    surface([tool("read"), tool("exec")]);
+    expect(surface([tool("read")], [], routeKey, "policy-b").map((entry) => entry.name)).toEqual([
+      "read",
+    ]);
+  });
+
+  it("starts a new pin for another route and sends a changed definition as built", () => {
+    surface([tool("read"), tool("gateway")]);
+    expect(surface([tool("read")], [], "anthropic/claude-opus-5/anthropic-messages")).toHaveLength(
+      1,
+    );
+    const changed = surface(
+      [tool("read", "read v2")],
+      [],
+      "anthropic/claude-opus-5/anthropic-messages",
+    );
+    expect(changed.map((entry) => entry.description)).toEqual(["read v2"]);
   });
 });
 

@@ -427,6 +427,10 @@ export function collectPromptCacheTools(
   return sortPromptCacheToolsByName(snapshots);
 }
 
+// The session tool pin holds the tool block on every route; system prompts are
+// pinned only on routes with in-history prompt updates, so they are reported, not asserted.
+const PROMPT_PREFIX_CHANGE_CODES = new Set<PromptCacheChange["code"]>(["tools"]);
+
 export function beginPromptCacheObservation(
   params: PromptCacheIdentity & {
     provider: string;
@@ -438,6 +442,8 @@ export function beginPromptCacheObservation(
     systemPrompt: string;
     tools: readonly PromptCacheToolSnapshot[];
     messages: readonly Message[];
+    /** Turn attribution for diagnostics, such as the trigger and input provenance. */
+    turn?: string;
   },
 ) {
   const key = buildTrackerKey(params);
@@ -525,10 +531,19 @@ export function beginPromptCacheObservation(
   trackers.delete(key);
   pruneMapToMaxSize(trackers, MAX_TRACKERS - 1);
   trackers.set(key, tracker);
+  // Within one session the tool definitions depend only on session and config facts;
+  // a model, transport or retention change starts over.
+  const prefixChanges = restarted
+    ? []
+    : changes.filter(({ code }) => PROMPT_PREFIX_CHANGE_CODES.has(code));
+  if (process.env.OPENCLAW_PROMPT_CACHE_ASSERT === "1" && (violation || prefixChanges.length)) {
+    const detail = [violation, ...prefixChanges]
+      .filter((change) => change !== undefined)
+      .map((change) => `${change.code}(${change.detail})`)
+      .join(", ");
+    throw new Error(`[prompt-cache] prefix changed within session: ${detail} ${params.turn ?? ""}`);
+  }
   if (violation) {
-    if (process.env.OPENCLAW_PROMPT_CACHE_ASSERT === "1") {
-      throw new Error(violation.detail);
-    }
     if (!historyRewriteWarnings.check(params.sessionKey?.trim() || params.sessionId)) {
       log.warn(`[prompt-cache] ${violation.detail} sessionKey=${params.sessionKey ?? key}`);
     }

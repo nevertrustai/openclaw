@@ -1,3 +1,5 @@
+import { stableStringify } from "@openclaw/normalization-core";
+import { sha256Hex } from "@openclaw/normalization-core/node-crypto";
 import { withOwnedSessionTranscriptWrites } from "../../../config/sessions/transcript-write-context.js";
 import type { ContextEngine } from "../../../context-engine/types.js";
 import { createAnthropicPayloadLogger } from "../../anthropic-payload-log.js";
@@ -12,6 +14,7 @@ import {
   retainEmbeddedSessionPromptState,
   beginSessionSystemPrompt,
   prepareSessionSystemPrompt,
+  prepareSessionToolSurface,
   retireSessionSystemPrompt,
 } from "../session-prompt-state.js";
 import { restoreCacheTtlToolResultProjections } from "../tool-result-truncation.js";
@@ -194,6 +197,23 @@ export async function prepareEmbeddedAttemptSessionRuntime(input: {
   resources.getUserTranscriptContexts =
     preparedSessionManager.userMessageBoundary.getUserTranscriptContexts;
 
+  // Every turn of the session sends the pinned tool definitions, on any route. A tool
+  // policy change starts a new pin, so configured removals leave the provider request.
+  const toolPolicyDigest = sha256Hex(
+    stableStringify([
+      attempt.config?.tools,
+      attempt.config?.agents?.entries?.[sessionAgentId]?.tools,
+    ]),
+  );
+  const sessionTools = usesSystemPromptSeries
+    ? prepareSessionToolSurface({
+        state: sessionPromptState,
+        routeKey: promptRouteKey,
+        toolPolicy: toolPolicyDigest,
+        entries: sessionManager.getBranch(),
+        tools: effectiveTools,
+      })
+    : effectiveTools;
   const state: EmbeddedAttemptSessionRuntimeState = {
     currentTurnImageFailureCount: 0,
     prePromptMessageCount: 0,
@@ -217,7 +237,7 @@ export async function prepareEmbeddedAttemptSessionRuntime(input: {
               clientTools,
               codeModeControlsEnabledForRun,
               deferredDirectoryToolsCallable,
-              effectiveTools,
+              effectiveTools: sessionTools,
               replaySafetyOptions,
               sandboxSessionKey,
               sessionAgentId,

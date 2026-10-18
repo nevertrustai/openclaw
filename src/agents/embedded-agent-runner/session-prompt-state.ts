@@ -1,14 +1,17 @@
 /** Transcript-backed prompt projection state cached by an embedded session lifecycle. */
 import { stripSystemPromptCacheBoundary } from "@openclaw/ai/internal/shared";
+import { stableStringify } from "@openclaw/normalization-core";
 import { sha256Hex } from "@openclaw/normalization-core/node-crypto";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { pruneMapToMaxSize } from "../../infra/map-size.js";
 import type { Message } from "../../llm/types.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
+import { gateAgentToolExecution } from "../agent-tool-availability.js";
 import { getOpenClawSystemUpdateKind } from "../internal-runtime-context.js";
 import type { AgentMessage } from "../runtime/index.js";
 import type { SessionEntry } from "../sessions/session-manager-types.js";
 import { shareSystemPromptPrefix } from "../sessions/system-prompt-pool.js";
+import type { AnyAgentTool } from "../tools/common.js";
 import {
   prepareCacheTtlCheckpoint,
   serializeCacheTtlToolResultProjections,
@@ -31,6 +34,8 @@ type EmbeddedSessionPromptState = {
   systemPrompt?: SystemPromptSeries;
   pendingSystemPrompt?: SystemPromptSeries;
   systemPromptRouteKey?: string;
+  toolSurface?: ToolSurface;
+  pendingToolSurface?: ToolSurface;
   removedRuntimeContextKeys?: Set<string>;
   runtimeContextCarrierPositions?: number[];
 };
@@ -44,6 +49,92 @@ type SystemPromptSeries = {
   permissionNotice?: string;
   restart: boolean;
 };
+
+type ToolDefinition = Pick<AnyAgentTool, "name" | "description" | "parameters">;
+type ToolSurface = {
+  routeKey: string;
+  historyId: string | null;
+  /** Digest of the tool policy config; a policy change starts a new pin. */
+  toolPolicy: string;
+  tools: ToolDefinition[];
+};
+
+function describeTool(tool: AnyAgentTool): ToolDefinition {
+  return { name: tool.name, description: tool.description, parameters: tool.parameters };
+}
+
+function sameToolDefinition(left: ToolDefinition, right: ToolDefinition | undefined): boolean {
+  return (
+    right !== undefined &&
+    left.description === right.description &&
+    stableStringify(left.parameters) === stableStringify(right.parameters)
+  );
+}
+
+/**
+ * The session pins every tool definition it has sent, so a turn that builds fewer
+ * tools keeps the provider prefix: retained definitions refuse their calls. New or
+ * changed definitions extend the pin once and are written with the next checkpoint.
+ */
+export function prepareSessionToolSurface(params: {
+  state: EmbeddedSessionPromptState;
+  routeKey: string;
+  toolPolicy: string;
+  entries: SessionEntry[];
+  tools: AnyAgentTool[];
+}): AnyAgentTool[] {
+  const historyId =
+    params.entries.findLast((entry) => entry.type === "compaction" || entry.type === "reset")?.id ??
+    null;
+  const restored = (): ToolSurface | undefined => {
+    const markerIndex = params.entries.findLastIndex(
+      (entry) => entry.type === "custom" && entry.customType === "openclaw.system-prompt",
+    );
+    const entry = params.entries[markerIndex];
+    const data = entry?.type === "custom" ? entry.data : undefined;
+    return isRecord(data) &&
+      Array.isArray(data.tools) &&
+      data.routeKey === params.routeKey &&
+      data.historyId === historyId &&
+      data.toolPolicy === params.toolPolicy &&
+      !params.entries.slice(markerIndex + 1).some((later) => later.type === "model_change")
+      ? {
+          routeKey: params.routeKey,
+          historyId,
+          toolPolicy: params.toolPolicy,
+          tools: data.tools as ToolDefinition[],
+        }
+      : undefined;
+  };
+  const candidate = params.state.pendingToolSurface ?? params.state.toolSurface ?? restored();
+  const known =
+    candidate?.routeKey === params.routeKey &&
+    candidate.historyId === historyId &&
+    candidate.toolPolicy === params.toolPolicy
+      ? candidate
+      : undefined;
+  const pinned = new Map(known?.tools.map((tool) => [tool.name, tool]));
+  const current = params.tools.map(describeTool);
+  const built = new Set(current.map((tool) => tool.name));
+  const retained = [...pinned.values()].filter((tool) => !built.has(tool.name));
+  if (!known || current.some((tool) => !sameToolDefinition(tool, pinned.get(tool.name)))) {
+    params.state.pendingToolSurface = {
+      routeKey: params.routeKey,
+      historyId,
+      toolPolicy: params.toolPolicy,
+      tools: [...current, ...retained].toSorted((a, b) => a.name.localeCompare(b.name)),
+    };
+  }
+  return [
+    ...params.tools,
+    ...retained.map((tool) =>
+      gateAgentToolExecution(
+        { ...tool, label: tool.name, execute: async () => ({ content: [], details: {} }) },
+        `${tool.name} is not available in this turn. Do not retry ${tool.name}.`,
+      ),
+    ),
+  ];
+}
 
 /** Unsent preparation belongs to its attempt; an incapable route rebuilds the full prompt. */
 export function beginSessionSystemPrompt(params: {
@@ -205,6 +296,8 @@ export async function retireSessionSystemPrompt(
 ): Promise<void> {
   state.systemPrompt = undefined;
   state.pendingSystemPrompt = undefined;
+  state.toolSurface = undefined;
+  state.pendingToolSurface = undefined;
   state.systemPromptRouteKey = routeKey;
   await appendEntry("openclaw.system-prompt", { restart: true, routeKey });
 }
@@ -218,7 +311,9 @@ export async function persistSessionSystemPrompt(
     return;
   }
   const previous = state.systemPrompt;
+  const toolSurface = state.pendingToolSurface ?? state.toolSurface;
   if (
+    state.pendingToolSurface ||
     snapshot.restart ||
     !previous ||
     snapshot.prefix !== previous.prefix ||
@@ -228,15 +323,37 @@ export async function persistSessionSystemPrompt(
     snapshot.permissionNotice !== previous.permissionNotice
   ) {
     try {
-      await appendEntry("openclaw.system-prompt", snapshot);
+      await appendEntry(
+        "openclaw.system-prompt",
+        toolSurface
+          ? { ...snapshot, toolPolicy: toolSurface.toolPolicy, tools: toolSurface.tools }
+          : snapshot,
+      );
     } catch (error) {
       // Rejection can follow a durable commit; keep pending work, but distrust the cached checkpoint.
       state.systemPrompt = undefined;
+      state.toolSurface = undefined;
       throw error;
     }
   }
   state.systemPrompt = { ...snapshot, restart: false };
   state.pendingSystemPrompt = undefined;
+  state.toolSurface = toolSurface;
+  state.pendingToolSurface = undefined;
+}
+
+/** Routes without the prompt series checkpoint the tool pin alone. */
+export async function persistSessionToolSurface(
+  state: EmbeddedSessionPromptState,
+  appendEntry: (customType: string, data: unknown) => unknown,
+): Promise<void> {
+  const surface = state.pendingToolSurface;
+  if (!surface) {
+    return;
+  }
+  await appendEntry("openclaw.system-prompt", surface);
+  state.toolSurface = surface;
+  state.pendingToolSurface = undefined;
 }
 
 const MAX_SESSION_PROMPT_STATES = 64;
