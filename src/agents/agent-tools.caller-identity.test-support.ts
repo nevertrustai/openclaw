@@ -95,4 +95,35 @@ export function registerPluginOnlyCallerIdentityCase({
       resolvePluginToolsSpy.mockRestore();
     }
   });
+
+  it("carries this turn's provider-hosted web_search decision into session events", async () => {
+    let observedAllow: string[] | undefined;
+    const resolvePluginToolsSpy = vi
+      .spyOn(openClawPluginTools, "resolveOpenClawPluginToolsForOptions")
+      .mockReturnValue([
+        {
+          name: "file_fetch",
+          label: "File fetch",
+          description: "Fetch a file",
+          parameters: { type: "object", properties: {} },
+          execute: async () => {
+            observedAllow = getGatewayToolCallerIdentity()?.sessionEventToolsAllow;
+            return { content: [{ type: "text" as const, text: "ok" }], details: {} };
+          },
+        },
+      ]);
+    try {
+      const tools = createOpenClawCodingTools({
+        config: testConfig,
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        includeCoreTools: false,
+        toolConstructionPlan: pluginOnlyConstructionPlan,
+      });
+      await requireTool(tools, "file_fetch").execute?.("tool-call-1", {});
+      expect(observedAllow).toEqual(["file_fetch", "web_search"]);
+    } finally {
+      resolvePluginToolsSpy.mockRestore();
+    }
+  });
 }
