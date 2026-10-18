@@ -858,7 +858,7 @@ describe("CI changed Node test plan", () => {
         { targets: [acp], configs: ["test/vitest/vitest.acp.config.ts"] },
         {
           targets: ["src/gateway/setup-inference.first-signin.integration.test.ts"],
-          configs: ["test/vitest/vitest.gateway-database-workers.config.ts"],
+          configs: ["test/vitest/vitest.gateway-server-isolated.config.ts"],
         },
         {
           targets: [
