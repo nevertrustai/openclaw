@@ -10,6 +10,7 @@ import {
   prepareSessionToolSurface,
   persistSessionSystemPrompt,
   retainEmbeddedSessionPromptState,
+  retireSessionSystemPrompt,
 } from "./session-prompt-state.js";
 
 const sessionIds = new Set<string>();
@@ -520,6 +521,49 @@ describe("session tool surface", () => {
     expect(lease.state.pendingToolSurface?.tools.map((entry) => entry.name)).toEqual([
       "gateway",
       "heartbeat_respond",
+      "read",
+    ]);
+  });
+
+  it("keeps a restored pin in later checkpoints that change only the system prompt", async () => {
+    const entries: SessionEntry[] = [];
+    surface([tool("read"), tool("gateway")]);
+    await persist(entries);
+    clearEmbeddedSessionPromptStates(["tool-surface"]);
+    lease[Symbol.dispose]();
+    lease = retainEmbeddedSessionPromptState("tool-surface");
+    surface([tool("read"), tool("gateway")], entries);
+    prepareSessionSystemPrompt({
+      state: lease.state,
+      routeKey,
+      systemPrompt: "Base.\n\n## Skills\nrefreshed",
+      entries,
+    }).commit();
+    await persistSessionSystemPrompt(lease.state, (customType, data) => {
+      entries.push({
+        type: "custom",
+        customType,
+        data: structuredClone(data),
+        id: `marker-${entries.length}`,
+        parentId: null,
+        timestamp: "2026-10-01T00:00:00Z",
+      });
+    });
+    clearEmbeddedSessionPromptStates(["tool-surface"]);
+    lease[Symbol.dispose]();
+    lease = retainEmbeddedSessionPromptState("tool-surface");
+    expect(
+      surface([tool("read")], entries)
+        .map((entry) => entry.name)
+        .toSorted(),
+    ).toEqual(["gateway", "read"]);
+  });
+
+  it("keeps the new pin through a series restart during prompt admission", async () => {
+    surface([tool("read"), tool("gateway")]);
+    await retireSessionSystemPrompt(lease.state, routeKey, () => undefined);
+    expect(lease.state.pendingToolSurface?.tools.map((entry) => entry.name)).toEqual([
+      "gateway",
       "read",
     ]);
   });

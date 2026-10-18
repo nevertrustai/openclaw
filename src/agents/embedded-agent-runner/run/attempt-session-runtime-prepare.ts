@@ -9,6 +9,8 @@ import { DEFAULT_CONTEXT_TOKENS } from "../../defaults.js";
 import { getOpenClawSystemUpdateKind } from "../../internal-runtime-context.js";
 import type { AgentSession } from "../../sessions/index.js";
 import { withSessionManagerAppend } from "../../sessions/session-manager-append-admission.js";
+import type { AnyAgentTool } from "../../tools/common.js";
+import { declarePromptToolPin } from "../prompt-cache-observability.js";
 import { getProviderPromptState } from "../provider-prompt-state.js";
 import {
   retainEmbeddedSessionPromptState,
@@ -205,15 +207,22 @@ export async function prepareEmbeddedAttemptSessionRuntime(input: {
       attempt.config?.agents?.entries?.[sessionAgentId]?.tools,
     ]),
   );
-  const sessionTools = usesSystemPromptSeries
-    ? prepareSessionToolSurface({
-        state: sessionPromptState,
-        routeKey: promptRouteKey,
-        toolPolicy: toolPolicyDigest,
-        entries: sessionManager.getBranch(),
-        tools: effectiveTools,
-      })
-    : effectiveTools;
+  const pinTools = usesSystemPromptSeries
+    ? (tools: AnyAgentTool[]) => {
+        const pending = sessionPromptState.pendingToolSurface;
+        const pinned = prepareSessionToolSurface({
+          state: sessionPromptState,
+          routeKey: promptRouteKey,
+          toolPolicy: toolPolicyDigest,
+          entries: sessionManager.getBranch(),
+          tools,
+        });
+        if (sessionPromptState.pendingToolSurface !== pending) {
+          declarePromptToolPin(attempt);
+        }
+        return pinned;
+      }
+    : undefined;
   const state: EmbeddedAttemptSessionRuntimeState = {
     currentTurnImageFailureCount: 0,
     prePromptMessageCount: 0,
@@ -237,7 +246,8 @@ export async function prepareEmbeddedAttemptSessionRuntime(input: {
               clientTools,
               codeModeControlsEnabledForRun,
               deferredDirectoryToolsCallable,
-              effectiveTools: sessionTools,
+              effectiveTools,
+              pinTools,
               replaySafetyOptions,
               sandboxSessionKey,
               sessionAgentId,

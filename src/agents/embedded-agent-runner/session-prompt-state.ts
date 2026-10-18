@@ -113,6 +113,8 @@ export function prepareSessionToolSurface(params: {
     candidate.toolPolicy === params.toolPolicy
       ? candidate
       : undefined;
+  // A restored pin rides along with later combined checkpoints.
+  params.state.toolSurface = params.state.pendingToolSurface ? params.state.toolSurface : known;
   const pinned = new Map(known?.tools.map((tool) => [tool.name, tool]));
   const current = params.tools.map(describeTool);
   const built = new Set(current.map((tool) => tool.name));
@@ -296,8 +298,6 @@ export async function retireSessionSystemPrompt(
 ): Promise<void> {
   state.systemPrompt = undefined;
   state.pendingSystemPrompt = undefined;
-  state.toolSurface = undefined;
-  state.pendingToolSurface = undefined;
   state.systemPromptRouteKey = routeKey;
   await appendEntry("openclaw.system-prompt", { restart: true, routeKey });
 }

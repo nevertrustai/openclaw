@@ -81,6 +81,8 @@ type PromptCacheTracker = {
   requestedAt: number;
   pendingChanges: PromptCacheChange[] | null;
   unmeasuredChanges?: PromptCacheChange[] | null;
+  /** The session tool pin changed the tool block on purpose before the next request. */
+  toolPinChanged?: boolean;
 };
 
 const trackers = new Map<string, PromptCacheTracker>();
@@ -533,9 +535,10 @@ export function beginPromptCacheObservation(
   trackers.set(key, tracker);
   // Within one session the tool definitions depend only on session and config facts;
   // a model, transport or retention change starts over.
-  const prefixChanges = restarted
-    ? []
-    : changes.filter(({ code }) => PROMPT_PREFIX_CHANGE_CODES.has(code));
+  const prefixChanges =
+    restarted || previous?.toolPinChanged
+      ? []
+      : changes.filter(({ code }) => PROMPT_PREFIX_CHANGE_CODES.has(code));
   if (process.env.OPENCLAW_PROMPT_CACHE_ASSERT === "1" && (violation || prefixChanges.length)) {
     const detail = [violation, ...prefixChanges]
       .filter((change) => change !== undefined)
@@ -567,6 +570,17 @@ export function declarePromptHistoryRewrite(
       tracker.sessionKey === params.sessionKey?.trim()
     ) {
       (tracker.declaredRewrites ??= new Set()).add(params.reason);
+    }
+  }
+}
+
+export function declarePromptToolPin(params: PromptCacheIdentity): void {
+  for (const tracker of trackers.values()) {
+    if (
+      tracker.sessionId === params.sessionId &&
+      tracker.sessionKey === params.sessionKey?.trim()
+    ) {
+      tracker.toolPinChanged = true;
     }
   }
 }
