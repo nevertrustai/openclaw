@@ -7,6 +7,7 @@ import { pruneMapToMaxSize } from "../../infra/map-size.js";
 import type { Message } from "../../llm/types.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import { gateAgentToolExecution } from "../agent-tool-availability.js";
+import { copyAgentToolMetadata } from "../agent-tool-metadata.js";
 import { getOpenClawSystemUpdateKind } from "../internal-runtime-context.js";
 import type { AgentMessage } from "../runtime/index.js";
 import type { SessionEntry } from "../sessions/session-manager-types.js";
@@ -116,7 +117,17 @@ export function prepareSessionToolSurface(params: {
   // A restored pin rides along with later combined checkpoints.
   params.state.toolSurface = params.state.pendingToolSurface ? params.state.toolSurface : known;
   const pinned = new Map(known?.tools.map((tool) => [tool.name, tool]));
-  const current = params.tools.map(describeTool);
+  // Sibling guidance in a description follows the tools a turn built; the pin keeps
+  // the session's wording while the parameters match.
+  const tools = params.tools.map((tool) => {
+    const pin = pinned.get(tool.name);
+    return pin &&
+      pin.description !== tool.description &&
+      stableStringify(pin.parameters) === stableStringify(tool.parameters)
+      ? copyAgentToolMetadata(tool, { ...tool, description: pin.description })
+      : tool;
+  });
+  const current = tools.map(describeTool);
   const built = new Set(current.map((tool) => tool.name));
   const retained = [...pinned.values()].filter((tool) => !built.has(tool.name));
   if (!known || current.some((tool) => !sameToolDefinition(tool, pinned.get(tool.name)))) {
@@ -128,7 +139,7 @@ export function prepareSessionToolSurface(params: {
     };
   }
   return [
-    ...params.tools,
+    ...tools,
     ...retained.map((tool) =>
       gateAgentToolExecution(
         { ...tool, label: tool.name, execute: async () => ({ content: [], details: {} }) },

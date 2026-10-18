@@ -575,16 +575,27 @@ describe("session tool surface", () => {
     ]);
   });
 
-  it("starts a new pin for another route and sends a changed definition as built", () => {
+  it("starts a new pin for another route", () => {
     surface([tool("read"), tool("gateway")]);
     expect(surface([tool("read")], [], "anthropic/claude-opus-5/anthropic-messages")).toHaveLength(
       1,
     );
-    const changed = surface(
-      [tool("read", "read v2")],
-      [],
-      "anthropic/claude-opus-5/anthropic-messages",
+  });
+
+  it("keeps the pinned description when only sibling guidance changes", async () => {
+    surface([tool("exec", "Run commands. No sleep loops; use automations."), tool("automations")]);
+    const eventTurn = surface([tool("exec", "Run commands.")]);
+    expect(eventTurn.find((entry) => entry.name === "exec")?.description).toBe(
+      "Run commands. No sleep loops; use automations.",
     );
+    expect(JSON.stringify((await eventTurn[0]!.execute("x", {})).content)).toContain("exec ran");
+  });
+
+  it("sends a definition with changed parameters as built", () => {
+    surface([tool("read")]);
+    const changed = surface([
+      { ...tool("read", "read v2"), parameters: { type: "object", properties: {} } },
+    ] as AnyAgentTool[]);
     expect(changed.map((entry) => entry.description)).toEqual(["read v2"]);
   });
 });
