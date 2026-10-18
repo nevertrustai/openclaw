@@ -97,7 +97,7 @@ export function registerPluginOnlyCallerIdentityCase({
   });
 
   it("carries this turn's provider-hosted web_search decision into session events", async () => {
-    let observedAllow: string[] | undefined;
+    let observedAllow: readonly string[] | undefined;
     const resolvePluginToolsSpy = vi
       .spyOn(openClawPluginTools, "resolveOpenClawPluginToolsForOptions")
       .mockReturnValue([
