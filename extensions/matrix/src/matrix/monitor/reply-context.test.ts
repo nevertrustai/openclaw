@@ -106,11 +106,8 @@ describe("matrix reply context", () => {
       getEvent,
       vi.fn(async () => "Bob"),
     );
-    const first = await resolveReplyContext();
-    expect(first).toStrictEqual({});
-
-    const second = await resolveReplyContext();
-    expect(second).toEqual({
+    await expect(resolveReplyContext()).resolves.toStrictEqual({});
+    await expect(resolveReplyContext()).resolves.toEqual({
       summary: "Recovered message",
       senderLabel: "Bob",
       senderId: "@bob:example.org",
@@ -124,9 +121,7 @@ describe("matrix reply context", () => {
       vi.fn(async () => message("Hello", "@charlie:example.org")),
       vi.fn().mockRejectedValueOnce(new Error("unknown member")),
     );
-    const result = await resolveReplyContext();
-
-    expect(result).toEqual({
+    await expect(resolveReplyContext()).resolves.toEqual({
       summary: "Hello",
       senderLabel: "@charlie:example.org",
       senderId: "@charlie:example.org",

@@ -155,37 +155,26 @@ describe("createRoomHistoryTracker — watermark monotonicity", () => {
 });
 
 describe("createRoomHistoryTracker — roomQueues eviction", () => {
-  it("clears stale room watermarks when an evicted room is recreated", () => {
-    const tracker = createTracker(200, 1);
-    const room1 = tracker.room("!room1:test");
-    const room2 = tracker.room("!room2:test");
-    room1.record("old msg in room1");
-    const firstSnapshot = room1.prepare("trigger in room1");
-    room1.consume(firstSnapshot);
-
-    // room2 creation evicts room1 (maxRoomQueues=1)
-    room2.record("msg in room2");
-    room1.record("new msg in room1");
-    const history = room1.prepare("new trigger").history;
-    expect(history).toHaveLength(1);
-    expect(history[0]?.body).toBe("new msg in room1");
-  });
-
-  it("ignores late consumeHistory calls after the room queue was evicted", () => {
-    const tracker = createTracker(200, 1);
-    const room1 = tracker.room("!room1:test");
-    const room2 = tracker.room("!room2:test");
-    room1.record("old msg in room1");
-    const prepared = room1.prepare("trigger in room1", "$trigger");
-
-    // room2 creation evicts room1 (maxRoomQueues=1) while the trigger is still in flight.
-    room2.record("msg in room2");
-
-    // Late completion for the evicted room must not recreate a stale watermark.
-    room1.consume(prepared, "$trigger");
-    room1.record("new msg in room1");
-    const history = room1.prepare("new trigger").history;
-    expect(history).toHaveLength(1);
-    expect(history[0]?.body).toBe("new msg in room1");
-  });
+  it.each([false, true])(
+    "keeps recreated rooms free of stale watermarks (late completion: %s)",
+    (late) => {
+      const tracker = createTracker(200, 1);
+      const room1 = tracker.room("!room1:test");
+      const room2 = tracker.room("!room2:test");
+      room1.record("old msg in room1");
+      const prepared = room1.prepare("trigger in room1", late ? "$trigger" : undefined);
+      if (!late) {
+        room1.consume(prepared);
+      }
+      // A late completion must not recreate the watermark after this eviction.
+      room2.record("msg in room2");
+      if (late) {
+        room1.consume(prepared, "$trigger");
+      }
+      room1.record("new msg in room1");
+      expect(room1.prepare("new trigger").history.map(({ body }) => body)).toEqual([
+        "new msg in room1",
+      ]);
+    },
+  );
 });

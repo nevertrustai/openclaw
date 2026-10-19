@@ -211,9 +211,7 @@ describe("matrix approval reactions", () => {
 
   it("still resolves approval reactions when generic reaction notifications are off", async () => {
     const cfg = buildConfig({ reactionNotifications: "off" });
-    await registerTarget({
-      allowedDecisions: ["deny"],
-    });
+    await registerTarget({ allowedDecisions: ["deny"] });
     const client = createReactionClient(
       vi.fn().mockResolvedValue({
         event_id: "$approval-msg",
@@ -221,11 +219,7 @@ describe("matrix approval reactions", () => {
         content: { body: "approval prompt" },
       }),
     );
-    await handleReaction({
-      client,
-      cfg,
-      reactionKey: "❌",
-    });
+    await handleReaction({ client, cfg, reactionKey: "❌" });
     expect(resolveMatrixApproval).toHaveBeenCalledWith(approvalCall(cfg, { decision: "deny" }));
     expect(systemEvents()).toEqual([]);
   });
@@ -238,11 +232,7 @@ describe("matrix approval reactions", () => {
       approvalKind: "plugin",
     });
     const client = createReactionClient();
-    await handleReaction({
-      client,
-      cfg,
-      targetEventId: "$plugin-approval-msg",
-    });
+    await handleReaction({ client, cfg, targetEventId: "$plugin-approval-msg" });
     expect(client.getEvent).not.toHaveBeenCalled();
     expect(resolveMatrixApproval).toHaveBeenCalledWith(
       approvalCall(cfg, { approvalId: "plugin:req-123", approvalKind: "plugin" }),
@@ -254,23 +244,16 @@ describe("matrix approval reactions", () => {
     resolveMatrixApproval.mockRejectedValueOnce(
       new Error("unknown or expired approval id req-123"),
     );
-    await registerTarget({
-      allowedDecisions: ["deny"],
-    });
+    await registerTarget({ allowedDecisions: ["deny"] });
     const client = createReactionClient();
-    await handleReaction({
-      client,
-      reactionKey: "❌",
-    });
+    await handleReaction({ client, reactionKey: "❌" });
     expect(client.getEvent).not.toHaveBeenCalled();
     expect(await resolveTarget("❌")).toBeNull();
   });
 
   it("retains approval anchors and propagates transient Gateway failures for replay", async () => {
     const cfg = buildConfig();
-    await registerTarget({
-      allowedDecisions: ["allow-once"],
-    });
+    await registerTarget({ allowedDecisions: ["allow-once"] });
     const client = createReactionClient();
     resolveMatrixApproval.mockRejectedValueOnce(new Error("gateway 503"));
     await expect(handleReaction({ client, cfg })).rejects.toThrow("gateway 503");
@@ -290,32 +273,23 @@ describe("matrix approval reactions", () => {
       approval: { id: "req-123", status: "denied", decision: "deny" },
     });
     await registerTarget({});
-    await registerTarget({
-      roomId: "!approvals:example.org",
-      eventId: "$approval-dm",
-    });
+    await registerTarget({ roomId: "!approvals:example.org", eventId: "$approval-dm" });
     const client = createReactionClient();
-    await handleReaction({
-      client,
-      cfg,
-      reactionKey: "✅",
-      logVerboseMessage,
-    });
+    await handleReaction({ client, cfg, reactionKey: "✅", logVerboseMessage });
     expect(await resolveTarget("✅")).toBeNull();
     expect(await resolveTarget("✅", "!approvals:example.org", "$approval-dm")).toBeNull();
     expect(editMessageMatrix).toHaveBeenCalledTimes(2);
-    expect(editMessageMatrix).toHaveBeenCalledWith(
-      "!ops:example.org",
-      "$approval-msg",
-      "Already resolved: Denied\n\nID: req-123",
-      { cfg, accountId: "default", client },
-    );
-    expect(editMessageMatrix).toHaveBeenCalledWith(
-      "!approvals:example.org",
-      "$approval-dm",
-      "Already resolved: Denied\n\nID: req-123",
-      { cfg, accountId: "default", client },
-    );
+    for (const [room, event] of [
+      ["!ops:example.org", "$approval-msg"],
+      ["!approvals:example.org", "$approval-dm"],
+    ]) {
+      expect(editMessageMatrix).toHaveBeenCalledWith(
+        room,
+        event,
+        "Already resolved: Denied\n\nID: req-123",
+        { cfg, accountId: "default", client },
+      );
+    }
     expect(logVerboseMessage).toHaveBeenCalledWith(
       "matrix: approval reaction resolved id=req-123 sender=@owner:example.org applied=false status=denied decision=deny",
     );
@@ -324,12 +298,7 @@ describe("matrix approval reactions", () => {
   it("skips target fetches for ordinary reactions when notifications are off", async () => {
     const cfg = buildConfig({ reactionNotifications: "off" });
     const client = createReactionClient();
-    await handleReaction({
-      client,
-      cfg,
-      targetEventId: "$msg-1",
-      reactionKey: "👍",
-    });
+    await handleReaction({ client, cfg, targetEventId: "$msg-1", reactionKey: "👍" });
     expect(client.getEvent).not.toHaveBeenCalled();
     expect(resolveMatrixApproval).not.toHaveBeenCalled();
     expect(systemEvents()).toEqual([]);
