@@ -20,7 +20,11 @@ import type { MSTeamsTurnContext } from "../sdk-types.js";
 // oxfmt-ignore
 import { getRuntimeApiMockState } from "./message-handler-mock-support.test-support.js";
 import { createMSTeamsMessageHandler } from "./message-handler.js";
-import { buildChannelActivity, createMessageHandlerDeps } from "./message-handler.test-support.js";
+import {
+  buildChannelActivity,
+  createMessageHandlerDeps,
+  createTurnContext,
+} from "./message-handler.test-support.js";
 
 const dispatch = getRuntimeApiMockState().dispatchReplyWithBufferedBlockDispatcher;
 const openDM: OpenClawConfig = {
@@ -46,13 +50,7 @@ function createLifecycle(): MSTeamsIngressLifecycle & {
 }
 
 function context(activity: MSTeamsTurnContext["activity"]): MSTeamsTurnContext {
-  return {
-    activity,
-    sendActivity: vi.fn(async () => ({ id: "sent" })),
-    sendActivities: vi.fn(async () => []),
-    updateActivity: vi.fn(async () => ({ id: "updated" })),
-    deleteActivity: vi.fn(async () => {}),
-  };
+  return createTurnContext(activity, { sent: "sent", updated: "updated" });
 }
 
 function directActivity(id: string, text: string): MSTeamsTurnContext["activity"] {
@@ -107,33 +105,51 @@ describe("Microsoft Teams drain claim ownership", () => {
     dispatch.mockClear();
   });
 
-  it("fans merged-flush adoption to every constituent claim", async () => {
-    const clock = createClockedDebounce();
-    const handler = createHandler(
-      {
-        messages: { inbound: { debounceMs: 40 } },
-        ...openDM,
-      },
-      clock.createDebouncer,
-    );
-    const first = createLifecycle();
-    const second = createLifecycle();
-    try {
-      const results = [
-        await handler(context(directActivity("activity-first", "part one")), first),
-        await handler(context(directActivity("activity-second", "part two")), second),
-      ];
-
-      expect(results).toEqual([{ kind: "deferred" }, { kind: "deferred" }]);
-      await clock.flush(40);
-      expect(dispatch).toHaveBeenCalledTimes(1);
-      expectAdopted(first);
-      expectAdopted(second);
-      expect(dispatch.mock.calls[0]?.[0].ctx.BodyForAgent).toContain("part one\npart two");
-    } finally {
-      await clock.close();
-    }
-  });
+  it.each([
+    {
+      name: "merged-flush constituents",
+      cfg: { ...openDM, messages: { inbound: { debounceMs: 40 } } },
+      messages: [
+        directActivity("activity-first", "part one"),
+        directActivity("activity-second", "part two"),
+      ],
+      delay: 40,
+      dispatches: 1,
+      body: "part one\npart two",
+    },
+    {
+      name: "mention-gated no-dispatch turn",
+      cfg: { channels: { msteams: { groupPolicy: "open" as const, requireMention: true } } },
+      messages: [
+        buildChannelActivity({ id: "activity-gated", text: "not for the bot", entities: [] }),
+      ],
+      delay: 20,
+      dispatches: 0,
+      body: undefined,
+    },
+  ])(
+    "adopts every deferred claim for $name",
+    async ({ cfg, messages, delay, dispatches, body }) => {
+      const clock = createClockedDebounce();
+      const handler = createHandler(cfg, clock.createDebouncer, delay);
+      const claims = messages.map(() => createLifecycle());
+      try {
+        for (const [index, message] of messages.entries()) {
+          expect(await handler(context(message), claims[index])).toEqual({ kind: "deferred" });
+        }
+        await clock.flush(delay);
+        expect(dispatch).toHaveBeenCalledTimes(dispatches);
+        for (const claim of claims) {
+          expectAdopted(claim);
+        }
+        if (body) {
+          expect(dispatch.mock.calls[0]?.[0].ctx.BodyForAgent).toContain(body);
+        }
+      } finally {
+        await clock.close();
+      }
+    },
+  );
 
   it("dispatches HTML-only text through the immediate debounce flush without double stripping", async () => {
     const handler = createHandler();
@@ -158,32 +174,6 @@ describe("Microsoft Teams drain claim ownership", () => {
       replyOptions: { turnAdoptionLifecycle: { admission: "exclusive" } },
     });
     expectAdopted(lifecycle);
-  });
-
-  it("completes a gated no-dispatch turn instead of stalling its claim", async () => {
-    const clock = createClockedDebounce();
-    const handler = createHandler(
-      { channels: { msteams: { groupPolicy: "open", requireMention: true } } },
-      clock.createDebouncer,
-      20,
-    );
-    const lifecycle = createLifecycle();
-    const gatedActivity = buildChannelActivity({
-      id: "activity-gated",
-      text: "not for the bot",
-      entities: [],
-    }) as MSTeamsTurnContext["activity"];
-
-    try {
-      const result = await handler(context(gatedActivity), lifecycle);
-
-      expect(result).toEqual({ kind: "deferred" });
-      await clock.flush(20);
-      expectAdopted(lifecycle);
-      expect(dispatch).not.toHaveBeenCalled();
-    } finally {
-      await clock.close();
-    }
   });
 
   it("preserves abandon retry accounting, backoff, threshold, and restart behavior", async () => {
@@ -239,63 +229,48 @@ describe("Microsoft Teams drain claim ownership", () => {
       };
       return { ...ingress, waitForIdle: monitor.waitForIdle, drainDebounce };
     };
-    const expectPendingAttempt = async (
-      ingress: ReturnType<typeof createIntegratedIngress>,
-      attempts: number,
+    type Pending = Awaited<ReturnType<typeof queue.listPending>>[number];
+    const restart = async (
+      timestamp: number,
+      expected: number | Pending,
+      dispatches: number,
+      replay = true,
     ) => {
-      await ingress.waitForIdle();
-      await vi.advanceTimersByTimeAsync(40);
-      await ingress.drainDebounce();
-      const pending = await queue.listPending({ limit: "all" });
-      expect(pending).toEqual([
-        expect.objectContaining({
-          id: "activity-abandon",
-          attempts,
-          lastAttemptAt: expect.any(Number),
-          lastError: "turn-abandoned",
-        }),
-      ]);
-      const observed = pending[0];
-      const lastAttemptAt = observed?.lastAttemptAt;
-      if (lastAttemptAt === undefined) {
-        throw new Error(`Missing Microsoft Teams retry timestamp for attempt ${attempts}`);
-      }
-      return { ...observed, lastAttemptAt };
-    };
-    const retryAt = async (timestamp: number, attempts: number, dispatches: number) => {
       vi.setSystemTime(timestamp);
       const ingress = createIntegratedIngress();
       ingress.start();
-      await ingress.accept(incoming);
-      const pending = await expectPendingAttempt(ingress, attempts);
-      expect(dispatchMock).toHaveBeenCalledTimes(dispatches);
-      await ingress.stop();
-      return pending;
-    };
-    const expectBackoff = async (
-      pending: Awaited<ReturnType<typeof expectPendingAttempt>>,
-      offset: number,
-      dispatches: number,
-    ) => {
-      vi.setSystemTime(pending.lastAttemptAt + offset);
-      const ingress = createIntegratedIngress();
-      ingress.start();
-      await ingress.accept(incoming);
+      if (replay) {
+        await ingress.accept(incoming);
+      }
       await ingress.waitForIdle();
+      if (typeof expected === "number") {
+        await vi.advanceTimersByTimeAsync(40);
+        await ingress.drainDebounce();
+      }
+      const pending = await queue.listPending({ limit: "all" });
+      expect(pending).toEqual([
+        typeof expected === "number"
+          ? expect.objectContaining({
+              id: "activity-abandon",
+              attempts: expected,
+              lastAttemptAt: expect.any(Number),
+              lastError: "turn-abandoned",
+            })
+          : expected,
+      ]);
       expect(dispatchMock).toHaveBeenCalledTimes(dispatches);
-      expect(await queue.listPending({ limit: "all" })).toEqual([pending]);
+      const observed = pending[0];
+      if (!observed || observed.lastAttemptAt === undefined) {
+        throw new Error("Missing Microsoft Teams retry timestamp");
+      }
       await ingress.stop();
+      return { ...observed, lastAttemptAt: observed.lastAttemptAt };
     };
 
     try {
-      const first = createIntegratedIngress();
-      first.start();
-      const firstAttempt = await expectPendingAttempt(first, 1);
-      expect(dispatchMock).toHaveBeenCalledTimes(1);
-      await first.stop();
-
-      await expectBackoff(firstAttempt, 999, 1);
-      const secondAttempt = await retryAt(firstAttempt.lastAttemptAt + 1_001, 2, 2);
+      const firstAttempt = await restart(now, 1, 1, false);
+      await restart(firstAttempt.lastAttemptAt + 999, firstAttempt, 1);
+      const secondAttempt = await restart(firstAttempt.lastAttemptAt + 1_001, 2, 2);
 
       for (let attempt = 3; attempt < DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS; attempt += 1) {
         const claim = await queue.claim("activity-abandon", { ownerId: `seed-${attempt}` });
@@ -307,18 +282,18 @@ describe("Microsoft Teams drain claim ownership", () => {
           releasedAt: secondAttempt.lastAttemptAt,
         });
       }
-      const thresholdAttempt = await retryAt(
+      const thresholdAttempt = await restart(
         secondAttempt.lastAttemptAt + 64_001,
         DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS,
         3,
       );
 
-      const beyondAttempt = await retryAt(
+      const beyondAttempt = await restart(
         thresholdAttempt.lastAttemptAt + 128_001,
         DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS + 1,
         4,
       );
-      await expectBackoff(beyondAttempt, 1_000, 4);
+      await restart(beyondAttempt.lastAttemptAt + 1_000, beyondAttempt, 4);
     } finally {
       try {
         await stopCurrent?.();

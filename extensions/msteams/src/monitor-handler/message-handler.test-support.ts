@@ -2,8 +2,22 @@ import { vi } from "vitest";
 import type { OpenClawConfig, PluginRuntime, RuntimeEnv } from "../../runtime-api.js";
 import { installMSTeamsTestRuntime } from "../monitor-handler.test-helpers.js";
 import type { MSTeamsMessageHandlerDeps } from "../monitor-handler.types.js";
+import type { MSTeamsTurnContext } from "../sdk-types.js";
 
 export const channelConversationId = "19:general@thread.tacv2";
+
+export function createTurnContext(
+  activity: MSTeamsTurnContext["activity"],
+  ids?: { sent: string; updated: string },
+): MSTeamsTurnContext {
+  return {
+    activity,
+    sendActivity: vi.fn(async () => ids && { id: ids.sent }),
+    sendActivities: vi.fn(async () => []),
+    updateActivity: vi.fn(async () => ids && { id: ids.updated }),
+    deleteActivity: vi.fn(async () => undefined),
+  };
+}
 
 type MessageHandlerDepsOptions = {
   accountId?: string;
