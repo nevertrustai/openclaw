@@ -65,27 +65,15 @@ afterEach(async () => {
   gatewayWork.resetGatewayWorkAdmission();
 });
 
-it.each([true])("runs retention after startup preparation, pending=%s", async (pending) => {
+it("runs retention while another agent is still preparing its database", async () => {
   await withAgentDatabaseStartupAdmission(async (admission) => {
     const preparation = createDeferredCore();
-    if (pending) {
-      admission.track(preparation.promise);
-    }
+    admission.track(preparation.promise);
+    startCronMaintenance(scheduler, () => "/synthetic/cron/jobs.json");
+    const tick = clock.advanceBy(5_000);
     try {
-      startCronMaintenance(scheduler, () => "/synthetic/cron/jobs.json");
-      const tick = clock.advanceBy(5_000);
-      if (pending) {
-        expect(mocks.history).not.toHaveBeenCalled();
-        expect(mocks.registry).not.toHaveBeenCalled();
-        expect(gatewayWork.getActiveGatewayRootWorkCount()).toBe(0);
-        await clock.advanceBy(60_000);
-        expect(mocks.info).toHaveBeenCalledExactlyOnceWith(
-          "Cron maintenance deferred until agent database startup preparation completes",
-        );
-      }
-      preparation.resolve();
-      await tick;
       expect(mocks.history).toHaveBeenCalledOnce();
+      await tick;
       expect(mocks.registry).toHaveBeenCalledOnce();
       expect(mocks.warn).not.toHaveBeenCalled();
       expect(mocks.error).not.toHaveBeenCalled();
@@ -93,9 +81,9 @@ it.each([true])("runs retention after startup preparation, pending=%s", async (p
       await clock.advanceBy(60_000);
       expect(mocks.history).toHaveBeenCalledOnce();
       expect(mocks.registry).toHaveBeenCalledOnce();
-      expect(mocks.info).toHaveBeenCalledTimes(pending ? 1 : 0);
     } finally {
       preparation.resolve();
+      await tick;
     }
   });
 });
@@ -116,7 +104,7 @@ it("sleeps until the retained session deadline when history is empty", async () 
   expect(mocks.registry).toHaveBeenCalledTimes(2);
 });
 
-it.each(["session", "stores", "config"] as const)(
+it.each(["session", "stores", "config", "agent-ready"] as const)(
   "wakes for committed %s changes and replaces their previous expiry without polling unrelated sessions",
   async (kind) => {
     mocks.registry.mockResolvedValueOnce({ nextSweepAtMs: 200_000 });
@@ -130,10 +118,12 @@ it.each(["session", "stores", "config"] as const)(
     mocks.registry.mockResolvedValueOnce({ nextSweepAtMs: 500_000 });
     if (kind === "session") {
       sessionChanges.emit({ sessionKey: "agent:main:cron:job:run:new", scope: "session-entry" });
+    } else if (kind === "agent-ready") {
+      sessionChanges.emit({ all: true, scope: { agentId: "main", topology: true } });
     } else {
       sessionChanges.emit({ all: true, scope: kind });
     }
-    await clock.advanceTo(125_000);
+    await clock.advanceTo(kind === "agent-ready" ? 65_000 : 125_000);
     expect(mocks.registry).toHaveBeenCalledTimes(2);
     await clock.advanceTo(200_000);
     expect(mocks.registry).toHaveBeenCalledTimes(2);
@@ -155,25 +145,6 @@ it("retains a committed cron wake received while the previous registry read is i
   await sweep;
   await clock.advanceTo(65_000);
   expect(mocks.registry).toHaveBeenCalledTimes(2);
-});
-
-it("cancels the startup wait when the Gateway stops", async () => {
-  await withAgentDatabaseStartupAdmission(async (admission) => {
-    const preparation = createDeferredCore();
-    admission.track(preparation.promise);
-    try {
-      startCronMaintenance(scheduler, () => "/synthetic/cron/jobs.json");
-      const tick = clock.advanceBy(5_000);
-      await scheduler.stop();
-      await tick;
-      preparation.resolve();
-      expect(mocks.history).not.toHaveBeenCalled();
-      expect(mocks.warn).not.toHaveBeenCalled();
-      expect(mocks.error).not.toHaveBeenCalled();
-    } finally {
-      preparation.resolve();
-    }
-  });
 });
 
 describe("Cron maintenance admission diagnostics", () => {
