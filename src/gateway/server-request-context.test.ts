@@ -1,9 +1,9 @@
 import { writeFileSync } from "node:fs";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import {
-  GATEWAY_CLIENT_CAPS,
-  GATEWAY_CLIENT_IDS,
-  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_CAPS as CAPS,
+  GATEWAY_CLIENT_IDS as IDS,
+  GATEWAY_CLIENT_MODES as MODES,
 } from "../../packages/gateway-protocol/src/client-info.js";
 import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -128,7 +128,7 @@ describe("createGatewayRequestContext", () => {
                 context: { ...context },
                 client: makeGatewayClient({
                   connId: "detached-reader",
-                  clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
+                  clientId: IDS.CONTROL_UI,
                   scopes: ["operator.admin"],
                 }),
                 respond,
@@ -174,7 +174,7 @@ describe("createGatewayRequestContext", () => {
         clients.add({
           ...makeGatewayClient({
             connId: `event-${index}`,
-            clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
+            clientId: IDS.CONTROL_UI,
             scopes: ["operator.admin"],
           }),
           usesSharedGatewayAuth: false,
@@ -399,35 +399,22 @@ describe("createGatewayRequestContext", () => {
 
   it.each([false, true])("selects capable approval routes (delivery clients: %s)", (delivery) => {
     const clients = [
-      approvalClient("cli", GATEWAY_CLIENT_IDS.CLI, { scopes: ["operator.admin"] }),
-      approvalClient("backend", GATEWAY_CLIENT_IDS.GATEWAY_CLIENT, {
-        mode: GATEWAY_CLIENT_MODES.BACKEND,
-      }),
+      approvalClient("cli", IDS.CLI, { scopes: ["operator.admin"] }),
+      approvalClient("backend", IDS.GATEWAY_CLIENT, { mode: MODES.BACKEND }),
       ...(delivery
         ? [
-            approvalClient("control-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, {
-              mode: GATEWAY_CLIENT_MODES.WEBCHAT,
-            }),
-            approvalClient("ios", GATEWAY_CLIENT_IDS.IOS_APP, {
-              mode: GATEWAY_CLIENT_MODES.UI,
-              scopes: ["operator.admin"],
-            }),
-            approvalClient("bridge", GATEWAY_CLIENT_IDS.CLI, {
-              caps: [GATEWAY_CLIENT_CAPS.APPROVALS],
-            }),
-            approvalClient("acp", GATEWAY_CLIENT_IDS.CLI, {
-              caps: [GATEWAY_CLIENT_CAPS.EXEC_APPROVALS],
-            }),
-            approvalClient("tui", GATEWAY_CLIENT_IDS.TUI),
-            approvalClient("plugin-bridge", GATEWAY_CLIENT_IDS.CLI, {
-              caps: [GATEWAY_CLIENT_CAPS.PLUGIN_APPROVALS],
-            }),
-            approvalClient("runtime", GATEWAY_CLIENT_IDS.GATEWAY_CLIENT, {
-              mode: GATEWAY_CLIENT_MODES.BACKEND,
+            approvalClient("control-ui", IDS.CONTROL_UI, { mode: MODES.WEBCHAT }),
+            approvalClient("ios", IDS.IOS_APP, { mode: MODES.UI, scopes: ["operator.admin"] }),
+            approvalClient("bridge", IDS.CLI, { caps: [CAPS.APPROVALS] }),
+            approvalClient("acp", IDS.CLI, { caps: [CAPS.EXEC_APPROVALS] }),
+            approvalClient("tui", IDS.TUI),
+            approvalClient("plugin-bridge", IDS.CLI, { caps: [CAPS.PLUGIN_APPROVALS] }),
+            approvalClient("runtime", IDS.GATEWAY_CLIENT, {
+              mode: MODES.BACKEND,
               approvalRuntime: true,
             }),
-            approvalClient("invalidated-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, { invalidated: true }),
-            approvalClient("unscoped-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, { scopes: [] }),
+            approvalClient("invalidated-ui", IDS.CONTROL_UI, { invalidated: true }),
+            approvalClient("unscoped-ui", IDS.CONTROL_UI, { scopes: [] }),
           ]
         : []),
     ];
@@ -449,7 +436,7 @@ describe("createGatewayRequestContext", () => {
       expect(
         context.getApprovalClientConnIds?.({
           excludeConnId: "control-ui",
-          filter: (client) => client.connect.client.id === GATEWAY_CLIENT_IDS.IOS_APP,
+          filter: (client) => client.connect.client.id === IDS.IOS_APP,
         }),
       ).toEqual(new Set(["ios"]));
     }
@@ -492,16 +479,14 @@ describe("createGatewayRequestContext", () => {
     "disconnects only authority for the reassigned durable profile (%s transport)",
     (transport) => {
       const target = {
-        ...approvalClient("profile-target", GATEWAY_CLIENT_IDS.CONTROL_UI, {
-          scopes: ["operator.admin"],
-        }),
+        ...approvalClient("profile-target", IDS.CONTROL_UI, { scopes: ["operator.admin"] }),
         authenticatedUserProfile: { profileId: "profile-ada" },
       };
       const unrelated = {
-        ...approvalClient("profile-unrelated", GATEWAY_CLIENT_IDS.CONTROL_UI, { scopes: [] }),
+        ...approvalClient("profile-unrelated", IDS.CONTROL_UI, { scopes: [] }),
         authenticatedUserProfile: { profileId: "profile-grace" },
       };
-      const unidentified = approvalClient("shared-secret", GATEWAY_CLIENT_IDS.CLI, {
+      const unidentified = approvalClient("shared-secret", IDS.CLI, {
         scopes: ["operator.admin"],
       });
       const clients = new GatewayClientRegistry([target, unrelated, unidentified] as never);

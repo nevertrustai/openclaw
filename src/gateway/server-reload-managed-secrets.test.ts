@@ -13,6 +13,7 @@ import {
   attachRuntimeConfigWriteApplication,
   createRuntimeConfigWriteApplication,
 } from "../config/runtime-write-application.js";
+import type { ModelDefinitionConfig } from "../config/types.models.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { PluginRuntimeApplicationError } from "../plugins/lifecycle.js";
 import {
@@ -60,6 +61,15 @@ function configPair(
   name = "Luna",
   extraModel?: { id: string; contextWindow: number },
 ) {
+  const model: ModelDefinitionConfig = {
+    id: "gpt-5.6-luna",
+    name,
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    maxTokens: 4096,
+    ...(contextWindow === undefined ? {} : { contextWindow }),
+  };
   const source = {
     agents: { defaults: { models: { "openai/gpt-5.6-luna": { agentRuntime: { id: runtime } } } } },
     models: {
@@ -67,29 +77,15 @@ function configPair(
         openai: {
           api: "openai-responses",
           baseUrl: "https://api.openai.com/v1",
-          models: [
-            {
-              id: "gpt-5.6-luna",
-              name,
-              reasoning: true,
-              input: ["text", "image"],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              maxTokens: 4096,
-              ...(contextWindow === undefined ? {} : { contextWindow }),
-            },
-          ],
+          models: [model, ...(extraModel ? [{ ...model, ...extraModel }] : [])],
         },
       },
     },
   } satisfies OpenClawConfig;
-  const models = source.models.providers.openai.models;
-  if (extraModel) {
-    models.push({ ...models[0]!, ...extraModel });
-  }
   const config: OpenClawConfig = structuredClone(source);
   // The loader may seed catalog compatibility; this is not authored request policy.
-  for (const model of config.models!.providers!.openai!.models) {
-    model.compat = { supportsStore: false };
+  for (const runtimeModel of config.models!.providers!.openai!.models) {
+    runtimeModel.compat = { supportsStore: false };
   }
   return { source, config };
 }

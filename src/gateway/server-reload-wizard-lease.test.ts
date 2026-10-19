@@ -210,10 +210,7 @@ it.each(["committed mixed", "uncommitted channel-only"] as const)(
     const reloadPlugins = vi.fn<ManagedGatewayConfigReloaderParams["reloadPlugins"]>(
       async (params) => {
         params
-          .prepareConfigEffects({
-            pluginIds: new Set(["fixture"]),
-            channels: new Set(),
-          })
+          .prepareConfigEffects({ pluginIds: new Set(["fixture"]), channels: new Set() })
           .retire();
         await params.commitRuntime();
         pluginCommitted.resolve();
