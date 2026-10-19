@@ -67,7 +67,7 @@ import type { MemoryAudience } from "../plugins/memory-provider-types.js";
 import { getPluginToolMeta } from "../plugins/tool-metadata.js";
 import {
   DEFAULT_GATEWAY_HTTP_TOOL_DENY,
-  GATEWAY_OWNER_ONLY_CORE_TOOLS,
+  resolveGatewayOwnerOnlyToolDenylist,
 } from "../security/dangerous-tools.js";
 import type { McpLoopbackRequestContext } from "./mcp-grant-store.js";
 import {
@@ -269,11 +269,9 @@ export async function resolveGatewayScopedTools(
     params.admittedRunContext &&
     getAdmittedRunDelegatedAuthority(params.admittedRunContext);
   const ownerOnlyGatewayDeny = [
-    ...(params.senderIsOwner === false || (surface === "http" && params.senderIsOwner !== true)
-      ? GATEWAY_OWNER_ONLY_CORE_TOOLS.filter(
-          (name) => name !== "sessions" && (name !== "portal" || !sessionPortalTarget),
-        )
-      : []),
+    ...resolveGatewayOwnerOnlyToolDenylist(
+      surface === "http" ? params.senderIsOwner === true : params.senderIsOwner,
+    ).filter((name) => name !== "sessions" && (name !== "portal" || !sessionPortalTarget)),
     // Attach grants also use loopback; session binding is not run authority.
     ...(params.senderIsOwner !== true &&
     !assignmentAdmitted &&

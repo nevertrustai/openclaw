@@ -190,6 +190,7 @@ describe("resolveGatewayScopedTools excludeToolNames", () => {
       "computer",
       "mobile_ui",
       "openclaw",
+      "intent",
       "sessions",
     ];
     expect(args.pluginToolDenylist).toEqual(denied);
