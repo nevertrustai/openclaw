@@ -183,9 +183,7 @@ it("commits model-only role changes without retiring permitted models or origina
       gateway: {
         roles: {
           default: roleName,
-          definitions: {
-            [roleName]: { ...role(["operator.write"]), modelPolicy: {} },
-          },
+          definitions: { [roleName]: { ...role(["operator.write"]), modelPolicy: {} } },
         },
       },
     };
@@ -234,14 +232,8 @@ it("commits model-only role changes without retiring permitted models or origina
       );
       original = accepted[0];
       assert(original);
-      modelA = bindOperatorModelExecution(original.authority, {
-        provider: "fixture",
-        model: "a",
-      });
-      modelB = bindOperatorModelExecution(original.authority, {
-        provider: "fixture",
-        model: "b",
-      });
+      modelA = bindOperatorModelExecution(original.authority, { provider: "fixture", model: "a" });
+      modelB = bindOperatorModelExecution(original.authority, { provider: "fixture", model: "b" });
       assert(modelA && modelB);
       vi.spyOn(sessionQueries, "getActiveSessionRunCount").mockReturnValue(2);
       const rejected = write(candidate, 1, "roles");

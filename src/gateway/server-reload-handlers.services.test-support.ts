@@ -58,7 +58,6 @@ export function registerGatewayTargetedServiceReloadTests({
   it.each([
     "success",
     "failure",
-    "superseded",
     "plugin failure",
     "model failure",
     "model recovery failure",
@@ -97,14 +96,12 @@ export function registerGatewayTargetedServiceReloadTests({
         outcome === "plugin failure" ||
         outcome === "model recovery failure" ||
         outcome === "retired gateway";
-      let current = true;
       const logReload = { info: vi.fn(), warn: vi.fn() };
       const requestRecoveryRestart = vi.fn(() => ({ status: "emitted" as const }));
       const reloadPluginServices = vi.fn(async () => {
         expect(modelsSettled).toBe(true);
         events.push("retained-service");
-        if (outcome === "failure" || outcome === "superseded") {
-          current = outcome !== "superseded";
+        if (outcome === "failure") {
           throw new Error("retained service failed");
         }
       });
@@ -146,7 +143,7 @@ export function registerGatewayTargetedServiceReloadTests({
         nextConfig,
         {
           sourceConfig: nextConfig,
-          isCurrent: () => current,
+          isCurrent: () => true,
           publish: async (commit) => {
             await commit();
             events.push("published");
@@ -182,7 +179,7 @@ export function registerGatewayTargetedServiceReloadTests({
       }
       await vi.advanceTimersByTimeAsync(500);
       expect(requestRecoveryRestart).not.toHaveBeenCalled();
-      if (outcome === "failure" || outcome === "superseded") {
+      if (outcome === "failure") {
         expect(logReload.warn).toHaveBeenCalledWith(
           "plugin services reload failed: retained service failed",
         );

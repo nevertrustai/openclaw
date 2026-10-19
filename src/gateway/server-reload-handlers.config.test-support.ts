@@ -103,11 +103,7 @@ export function createTestConfigRevisionProjector(): ManagedGatewayConfigReloade
 }
 
 export function createCronRestartPlan(): GatewayReloadPlan {
-  return createHotTailPlan({
-    changedPaths: ["cron"],
-    hotReasons: ["cron"],
-    restartCron: true,
-  });
+  return createHotTailPlan({ changedPaths: ["cron"], hotReasons: ["cron"], restartCron: true });
 }
 
 export function createHotTailPlan(overrides: Partial<GatewayReloadPlan> = {}): GatewayReloadPlan {
@@ -379,10 +375,7 @@ export function createManagedRestartSequenceConfigs() {
       },
     } satisfies OpenClawConfig,
     replacementConfig: {
-      gateway: {
-        ...deferredConfig.gateway,
-        bind: "lan",
-      },
+      gateway: { ...deferredConfig.gateway, bind: "lan" },
     } satisfies OpenClawConfig,
   };
 }

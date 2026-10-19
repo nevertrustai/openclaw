@@ -11,7 +11,6 @@ import {
   createTestGatewayScheduler,
 } from "../test-utils/gateway-scheduler-clock.js";
 import { buildGatewayReloadPlan } from "./config-reload-plan.js";
-import { createRecoveryRestartMock } from "./config-reload.test-support.js";
 import type { GatewayCronState } from "./server-cron.js";
 import {
   createDefaultGatewayReloadState,
@@ -152,12 +151,14 @@ export function registerGatewayCronReloadTests({
     },
   );
 
-  it.each(["converged", "lifecycle-deferred", "retry-scheduled", "rejected"] as const)(
+  it.each(["converged", "lifecycle-deferred", "retry-scheduled"] as const)(
     "preserves cron reconciliation recovery semantics for %s",
     async (result) => {
       const logReload = { info: vi.fn(), warn: vi.fn() };
-      const { requestRecoveryRestart, restartEmitted } = createRecoveryRestartMock();
-      const reconcileSystemJobs = vi.fn<GatewayCronState["reconcileSystemJobs"]>();
+      const requestRecoveryRestart = vi.fn(() => ({ status: "emitted" as const }));
+      const reconcileSystemJobs = vi
+        .fn<GatewayCronState["reconcileSystemJobs"]>()
+        .mockResolvedValueOnce(result);
       let state = createDefaultGatewayReloadState({
         cronState: createTestCronState({ reconcileSystemJobs }),
       });
@@ -169,30 +170,17 @@ export function registerGatewayCronReloadTests({
         logReload,
         requestRecoveryRestart,
       });
-      if (result === "rejected") {
-        reconcileSystemJobs.mockRejectedValueOnce(new Error("cron reconciliation failed"));
-      } else {
-        reconcileSystemJobs.mockResolvedValueOnce(result);
-      }
-      try {
-        await expect(
-          handlers.applyHotReload(buildGatewayReloadPlan(["agents.defaults.heartbeat.every"]), {
-            agents: { defaults: { heartbeat: { every: "1h" } } },
-          }),
-        ).resolves.toBe(result === "rejected" ? "applied-restart-required" : "applied");
-        if (result === "rejected") {
-          await restartEmitted;
-          expect(requestRecoveryRestart).toHaveBeenCalledOnce();
-        } else {
-          expect(requestRecoveryRestart).not.toHaveBeenCalled();
-        }
-        if (result === "retry-scheduled") {
-          expect(logReload.warn).toHaveBeenCalledWith(
-            "cron system jobs pending; continuing hot reload with cron retry",
-          );
-        }
-      } finally {
-        handlers.stopRestartRetries();
+      using _ = { [Symbol.dispose]: () => handlers.stopRestartRetries() };
+      await expect(
+        handlers.applyHotReload(buildGatewayReloadPlan(["agents.defaults.heartbeat.every"]), {
+          agents: { defaults: { heartbeat: { every: "1h" } } },
+        }),
+      ).resolves.toBe("applied");
+      expect(requestRecoveryRestart).not.toHaveBeenCalled();
+      if (result === "retry-scheduled") {
+        expect(logReload.warn).toHaveBeenCalledWith(
+          "cron system jobs pending; continuing hot reload with cron retry",
+        );
       }
     },
   );

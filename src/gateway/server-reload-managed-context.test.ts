@@ -71,12 +71,11 @@ it("starts replacement channels with the current Gateway owner after a writer se
   // Scheduler jobs retain the writer context even when the fake clock wakes elsewhere.
   const time = createGatewaySchedulerClock();
   const scheduler = createTestGatewayScheduler(time.clock);
-  const initialConfig: OpenClawConfig = {
-    channels: { telegram: { accounts: { default: { name: "Before" } } } },
-  };
-  const nextConfig: OpenClawConfig = {
-    channels: { telegram: { accounts: { default: { name: "After" } } } },
-  };
+  const channelConfig = (name: string): OpenClawConfig => ({
+    channels: { telegram: { accounts: { default: { name } } } },
+  });
+  const initialConfig = channelConfig("Before");
+  const nextConfig = channelConfig("After");
   const plugin: ChannelPlugin = {
     ...createChannelTestPluginBase({ id: "telegram" }),
     reload: { configPrefixes: ["channels.telegram"] },

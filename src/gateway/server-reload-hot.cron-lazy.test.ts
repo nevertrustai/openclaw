@@ -9,6 +9,7 @@ import type {
   GatewayReloadHandlerParams,
 } from "./server-reload-contracts.js";
 import {
+  createDefaultGatewayReloadState,
   createTestCronState,
   makePluginReloadResult,
 } from "./server-reload-handlers.config.test-support.js";
@@ -56,12 +57,11 @@ async function createFixture() {
   const { state: previous, cron: previousCron } = createCronState();
   const { state: next, cron: nextCron } = createCronState();
   buildGatewayCronService.mockReturnValue(next);
-  let state: ReturnType<GatewayReloadHandlerParams["getState"]> = {
+  let state = createDefaultGatewayReloadState({
     hooksConfig: null,
     hookClientIpConfig: { trustedProxies: [], allowRealIpFallback: false },
-    heartbeatRunner: { stop: vi.fn(), updateConfig: vi.fn() },
     cronState: previous,
-  };
+  });
   const setState = vi.fn<GatewayReloadHandlerParams["setState"]>((value) => {
     state = value;
   });

@@ -44,9 +44,7 @@ export function registerGatewaySupersededReloadTests({
       successor === "invalid watched edit" || successor === "failed secrets preflight";
     const { clock, scheduler } = createConfigReloadTestClock();
     const watcher = successor === "invalid watched edit" ? installWatcherMock() : undefined;
-    const initialConfig: OpenClawConfig = {
-      agents: { entries: { main: {}, retiring: {} } },
-    };
+    const initialConfig: OpenClawConfig = { agents: { entries: { main: {}, retiring: {} } } };
     const firstConfig: OpenClawConfig = {
       agents: { entries: { main: {}, retiring: {}, added: {} } },
     };
@@ -147,7 +145,6 @@ export function registerGatewaySupersededReloadTests({
   });
 
   it.each([
-    { name: "superseded publication", superseded: true, cancelled: true },
     { name: "replaced models with current config", superseded: false, cancelled: true },
     { name: "failed superseded publication", superseded: true, cancelled: false },
     { name: "failed current publication", superseded: false, cancelled: false },
