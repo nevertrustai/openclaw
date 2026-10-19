@@ -184,6 +184,8 @@ test("sessions.patchMany commits archive and releases same-session writes before
   const cleanupEntered = createDeferredCore();
   const entered = createDeferredCore();
   const release = createDeferredCore();
+  const before = (gate: PromiseLike<unknown>, operation: PromiseLike<unknown>, message: string) =>
+    withinTest(awaitGateBeforeSettlement(gate, operation, message), signal);
   const originalGc = managedWorktrees.gc.bind(managedWorktrees);
   const gc = vi.spyOn(managedWorktrees, "gc").mockImplementation((params) => {
     cleanupEntered.resolve();
@@ -214,17 +216,14 @@ test("sessions.patchMany commits archive and releases same-session writes before
   let beforeResponseTick: Promise<void> | undefined;
   let cleanup: Promise<void> | undefined;
   try {
-    await withinTest(
+    await before(
       awaitGateBeforeSettlement(
-        awaitGateBeforeSettlement(
-          effectsEntered.promise,
-          archived,
-          "archive did not reach its committed effects",
-        ),
-        entered.promise,
-        "archive awaited worktree removal before responding",
+        effectsEntered.promise,
+        archived,
+        "archive did not reach its committed effects",
       ),
-      signal,
+      entered.promise,
+      "archive awaited worktree removal before responding",
     );
     expect(entry()).toMatchObject({
       archivedAt: expect.any(Number),
@@ -238,13 +237,10 @@ test("sessions.patchMany commits archive and releases same-session writes before
     await fs.access(worktree.path);
 
     beforeResponseTick = tickWorktreeMaintenance();
-    await withinTest(
-      awaitGateBeforeSettlement(
-        beforeResponseTick,
-        cleanupEntered.promise,
-        "worktree cleanup started before the archive response",
-      ),
-      signal,
+    await before(
+      beforeResponseTick,
+      cleanupEntered.promise,
+      "worktree cleanup started before the archive response",
     );
     expect(gc).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
@@ -255,14 +251,7 @@ test("sessions.patchMany commits archive and releases same-session writes before
       payload: { outcomes: [{ ok: true }] },
     });
     cleanup = tickWorktreeMaintenance();
-    await withinTest(
-      awaitGateBeforeSettlement(
-        entered.promise,
-        cleanup,
-        "cleanup did not remove the retired worktree",
-      ),
-      signal,
-    );
+    await before(entered.promise, cleanup, "cleanup did not remove the retired worktree");
     release.resolve();
     await cleanup;
     expect(getRegistryWorktree(process.env, worktree.id)).toMatchObject({

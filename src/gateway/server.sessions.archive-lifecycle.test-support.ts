@@ -1,3 +1,4 @@
+import { expectDefined } from "@openclaw/normalization-core";
 import { expect, onTestFinished, vi } from "vitest";
 import { getRuntimeConfig as getHostRuntimeConfig } from "../config/config.js";
 import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
@@ -70,6 +71,10 @@ export async function activeRunContext(params: {
     throw new Error("expected active run operation");
   }
   const activeOperation = operation;
+  const finish = () => {
+    activeOperation.complete();
+    releaseSessionControllerClaim(claim);
+  };
   const aborted = createDeferredCore();
   const onAbort = () => aborted.resolve();
   entry.input.abortSignal.addEventListener("abort", onAbort, { once: true });
@@ -84,13 +89,11 @@ export async function activeRunContext(params: {
       () => {
         entry.adapter.projectSessionTerminalPersistence = undefined;
         entry.adapter.projectSessionTerminalPersisted = true;
-        activeOperation.complete();
-        releaseSessionControllerClaim(claim);
+        finish();
       },
       (error: unknown) => {
         markChatAbortTerminalPersistenceError(entry, error);
-        activeOperation.complete();
-        releaseSessionControllerClaim(claim);
+        finish();
       },
     );
     terminalStarted.resolve();
@@ -116,8 +119,7 @@ export async function activeRunContext(params: {
     unsubscribe(this: void) {
       entry.input.abortSignal.removeEventListener("abort", onAbort);
       unsubscribe();
-      activeOperation.complete();
-      releaseSessionControllerClaim(claim);
+      finish();
       registration.cleanup();
     },
   };
@@ -252,6 +254,14 @@ type LifecycleHandlerResponse = {
   error?: Parameters<RespondFn>[2];
 };
 
+async function handlerResponse(invoke: (respond: RespondFn) => Promise<void> | undefined) {
+  let response: LifecycleHandlerResponse | undefined;
+  await invoke((ok, payload, error) => {
+    response = { ok, payload, error };
+  });
+  return expectDefined(response, "lifecycle handler response");
+}
+
 export function archiveTarget(key: string, expectedSessionId: string) {
   return { key, expectedSessionId };
 }
@@ -270,23 +280,18 @@ export async function invokeArchiveHandler(params: {
   expectedSessionId: string;
 }): Promise<LifecycleHandlerResponse> {
   const handlers = await getSessionsHandlers();
-  let response: LifecycleHandlerResponse | undefined;
-  const respond: RespondFn = (ok, payload, error) => {
-    response = { ok, payload, error };
-  };
-  await handlers["sessions.patch"]?.({
-    req: {} as never,
-    params: { key: params.sessionKey, archived: true, expectedSessionId: params.expectedSessionId },
-    client: params.client,
-    context: params.context,
-    isWebchatConnect: () => false,
-    sessionMutationAuthorization: params.authorization,
-    respond,
-  } as never);
-  if (!response) {
-    throw new Error("sessions.patch did not respond");
-  }
-  return response;
+  const target = archiveTarget(params.sessionKey, params.expectedSessionId);
+  return handlerResponse((respond) =>
+    handlers["sessions.patch"]?.({
+      req: {} as never,
+      params: { ...target, archived: true },
+      client: params.client,
+      context: params.context,
+      isWebchatConnect: () => false,
+      sessionMutationAuthorization: params.authorization,
+      respond,
+    } as never),
+  );
 }
 
 export async function invokeVisibilityHandler(params: {
@@ -296,18 +301,12 @@ export async function invokeVisibilityHandler(params: {
   visibility: "draft" | "shared";
 }): Promise<LifecycleHandlerResponse> {
   const handlers = await getSessionsHandlers();
-  let response: LifecycleHandlerResponse | undefined;
-  const respond: RespondFn = (ok, payload, error) => {
-    response = { ok, payload, error };
-  };
-  await handlers["session.visibility.set"]?.({
-    params: { sessionKey: params.sessionKey, visibility: params.visibility },
-    client: params.client,
-    context: params.context,
-    respond,
-  } as never);
-  if (!response) {
-    throw new Error("session.visibility.set did not respond");
-  }
-  return response;
+  return handlerResponse((respond) =>
+    handlers["session.visibility.set"]?.({
+      params: { sessionKey: params.sessionKey, visibility: params.visibility },
+      client: params.client,
+      context: params.context,
+      respond,
+    } as never),
+  );
 }

@@ -10,12 +10,18 @@ import { writeOpenAiResponsesSse } from "../../test/helpers/openai-responses-sse
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { setTestEnvValue } from "../test-utils/env.js";
 import {
+  closeProvider,
+  listenProvider,
+  readProviderBody,
+} from "./gateway-provider-fixture.test-support.js";
+import {
   createGatewayConfigPath,
   removeGatewayTempHome,
   resetGatewayTestState,
   setupGatewayTempHome,
 } from "./gateway.test-support.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "./test-helpers.e2e.js";
+import { buildMockOpenAiResponsesProvider } from "./test-openai-responses-model.js";
 
 const prefix = "The answer is";
 const answer = "The answer is 42.";
@@ -74,17 +80,15 @@ function writeResponse(response: ServerResponse, model: string, attempt: number)
         ? { ...item, arguments: "" }
         : { ...item, content: [], status: "in_progress" },
     },
-    ...(writeTool
-      ? [{ type: "response.function_call_arguments.delta", output_index: 0, delta: item.arguments }]
-      : [
-          {
-            type: "response.output_text.delta",
-            output_index: 0,
-            item_id: item.id,
-            content_index: 0,
-            delta: text,
-          },
-        ]),
+    writeTool
+      ? { type: "response.function_call_arguments.delta", output_index: 0, delta: item.arguments }
+      : {
+          type: "response.output_text.delta",
+          output_index: 0,
+          item_id: item.id,
+          content_index: 0,
+          delta: text,
+        },
     { type: "response.output_item.done", output_index: 0, item },
     {
       type: failed ? "response.failed" : "response.completed",
@@ -111,11 +115,7 @@ describe("registered chat.send recovered output over Responses HTTP", () => {
           response.writeHead(404).end();
           return;
         }
-        let body = "";
-        for await (const chunk of request) {
-          body += chunk;
-        }
-        const payload: Record<string, unknown> = JSON.parse(body);
+        const payload: Record<string, unknown> = JSON.parse(await readProviderBody(request));
         if (typeof payload.model !== "string") {
           throw new Error("Responses request has no model");
         }
@@ -125,24 +125,23 @@ describe("registered chat.send recovered output over Responses HTTP", () => {
         writeResponse(response, payload.model, attempts.length);
       })().catch((error: unknown) => response.destroy(error instanceof Error ? error : undefined));
     });
-    await new Promise<void>((resolve) => {
-      provider.listen(0, "127.0.0.1", resolve);
+    const baseUrl = await listenProvider(provider);
+    const providerConfig = buildMockOpenAiResponsesProvider(baseUrl).config;
+    const models = [...scenarios, "recovered", "terminal-fallback"].map((id) => {
+      const model = buildMockOpenAiResponsesProvider(baseUrl, id).config.models[0];
+      model.maxTokens = 256;
+      return model;
     });
-    const address = provider.address();
-    if (!address || typeof address === "string") {
-      throw new Error("Responses fixture did not bind");
-    }
     const entries: NonNullable<NonNullable<OpenClawConfig["agents"]>["entries"]> = {};
+    const fallbacks: Record<string, string[]> = {
+      fallback: ["openai/recovered"],
+      terminal: ["openai/terminal-fallback"],
+    };
     for (const scenario of scenarios) {
       entries[scenario] = {
         model: {
           primary: `openai/${scenario}`,
-          fallbacks:
-            scenario === "fallback"
-              ? ["openai/recovered"]
-              : scenario === "terminal"
-                ? ["openai/terminal-fallback"]
-                : [],
+          fallbacks: fallbacks[scenario] ?? [],
         },
       };
       const agentDir = path.join(home.tempHome, ".openclaw", "agents", scenario, "agent");
@@ -167,19 +166,8 @@ describe("registered chat.send recovered output over Responses HTTP", () => {
         mode: "replace",
         providers: {
           openai: {
-            baseUrl: `http://127.0.0.1:${address.port}/v1`,
-            apiKey: "test",
-            api: "openai-responses",
-            models: [...scenarios, "recovered", "terminal-fallback"].map((id) => ({
-              id,
-              name: id,
-              api: "openai-responses",
-              reasoning: false,
-              input: ["text"],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 128_000,
-              maxTokens: 256,
-            })),
+            ...providerConfig,
+            models,
           },
         },
       },
@@ -215,10 +203,7 @@ describe("registered chat.send recovered output over Responses HTTP", () => {
       }
     } finally {
       if (provider) {
-        provider.closeAllConnections();
-        await new Promise<void>((resolve) => {
-          provider.close(() => resolve());
-        });
+        await closeProvider(provider);
       }
       if (home) {
         home.envSnapshot.restore();
@@ -269,12 +254,12 @@ describe("registered chat.send recovered output over Responses HTTP", () => {
           role: "custom",
           openclawRunError: { runId: started.runId, summary: expect.stringMatching(/\S/) },
         });
-        expect(terminal).toEqual([
-          expect.objectContaining({
+        expect(terminal).toMatchObject([
+          {
             runId: started.runId,
             state: "error",
             errorMessage: expect.stringMatching(/\S/),
-          }),
+          },
         ]);
         const deltas = events.filter(
           (event): event is Extract<ChatEvent, { state: "delta" }> =>
@@ -287,8 +272,7 @@ describe("registered chat.send recovered output over Responses HTTP", () => {
         // Saved assistant content belongs to canonical publication, not the unsaved live tail.
         expect(messageText(liveMessage)).toBe("");
       } else {
-        expect(completed.status).toBe("ok");
-        expect(completed.terminalReply?.text).toBe(answer);
+        expect(completed).toMatchObject({ status: "ok", terminalReply: { text: answer } });
         expect(messageText(history.messages.at(-1))).toBe(answer);
         expect(
           terminal.filter((event) => "message" in event && messageText(event.message) === answer),
