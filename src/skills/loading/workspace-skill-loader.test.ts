@@ -479,10 +479,11 @@ describe("loadWorkspaceSkills", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
-  it("reuses discovery across execution scopes until the passive refresh interval", async ({
-    signal,
-  }) => {
-    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  it("reuses discovery across execution scopes until automatic refresh", async ({ signal }) => {
+    vi.useFakeTimers({
+      toFake: ["Date", "performance", "setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    vi.setSystemTime(0);
     const workspaceDir = await createTempWorkspaceDir();
     const executionDirs = [await createTempWorkspaceDir(), await createTempWorkspaceDir()] as const;
     await writeWorkspaceSkills(workspaceDir, [
@@ -504,8 +505,10 @@ describe("loadWorkspaceSkills", () => {
     const tasks = vi.spyOn(WorkerTaskPool.prototype, "run");
     const completePassiveScan = async () => {
       tasks.mockClear();
-      await vi.advanceTimersByTimeAsync(60_000);
-      await withinTest(Promise.all(tasks.mock.results.map((result) => result.value)), signal);
+      for (let elapsed = 0; elapsed < 30 * 60_000 + 50; elapsed += 60_000) {
+        await vi.advanceTimersByTimeAsync(Math.min(60_000, 30 * 60_000 + 50 - elapsed));
+        await withinTest(Promise.all(tasks.mock.results.map((result) => result.value)), signal);
+      }
     };
     try {
       const first = await prepareWorkspaceSkills(workspaceDir, options);
