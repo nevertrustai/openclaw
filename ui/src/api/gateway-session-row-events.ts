@@ -75,7 +75,7 @@ function decodeRow(value: unknown, transaction: RowTransaction): unknown {
     (wire.agentId !== undefined && typeof wire.agentId !== "string") ||
     !validVersion(wire.version)
   ) {
-    throw new Error("invalid session row identity");
+    throw new Error("invalid session row");
   }
   const identity = sessionRowIdentity(wire.key, wire.agentId);
   let row: Record<string, unknown>;
@@ -90,7 +90,7 @@ function decodeRow(value: unknown, transaction: RowTransaction): unknown {
       "set" in wire ||
       "remove" in wire
     ) {
-      throw new Error("invalid full session row");
+      throw new Error("invalid session row");
     }
     row = full;
   } else {
@@ -114,7 +114,7 @@ function decodeRow(value: unknown, transaction: RowTransaction): unknown {
       (Object.hasOwn(set, "agentId") && set.agentId !== wire.agentId) ||
       "retain" in wire
     ) {
-      throw new Error("invalid session row patch or missing baseline");
+      throw new Error("invalid session row");
     }
     row = { ...previous.row, ...set };
     for (const field of wire.remove) {
@@ -151,20 +151,19 @@ export class GatewaySessionRowEvents {
       let envelope = payload;
       if (Object.hasOwn(payload, "sessionFieldRefs")) {
         const row = asNullableRecord(session);
-        const refs = payload.sessionFieldRefs;
-        if (!row || !Array.isArray(refs)) {
-          throw new Error("invalid session field references");
+        if (!row || !Array.isArray(payload.sessionFieldRefs)) {
+          throw new Error("invalid session row");
         }
         const fields = Object.keys(row).toSorted();
-        const restored = refs.map((index: unknown) => {
-          const field =
-            typeof index === "number" && Number.isInteger(index) ? fields[index] : undefined;
-          if (field === undefined || Object.hasOwn(payload, field)) {
-            throw new Error("invalid session field reference");
+        const restored: Record<string, unknown> = Object.create(null);
+        for (const index of payload.sessionFieldRefs) {
+          const field = fields[index];
+          if (!Number.isInteger(index) || field === undefined || Object.hasOwn(payload, field)) {
+            throw new Error("invalid session row");
           }
-          return [field, row[field]];
-        });
-        envelope = { ...payload, ...Object.fromEntries(restored) };
+          restored[field] = row[field];
+        }
+        envelope = { ...payload, ...restored };
         delete envelope.sessionFieldRefs;
       }
       transaction.commit();
