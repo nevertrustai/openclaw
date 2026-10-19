@@ -6,6 +6,8 @@ import * as uuid from "../../lib/uuid.ts";
 import { ModelSetupWizardRunner } from "./wizard-runner.ts";
 
 type RunnerOptions = ConstructorParameters<typeof ModelSetupWizardRunner>[0];
+const running = { done: false, status: "running" } as const;
+const keyStep = { ...running, step: { id: "key", type: "text" } } as const;
 
 function createRunner(options: Pick<RunnerOptions, "getClient"> & Partial<RunnerOptions>) {
   return new ModelSetupWizardRunner({
@@ -19,114 +21,156 @@ function createRunner(options: Pick<RunnerOptions, "getClient"> & Partial<Runner
   });
 }
 
+function lateAdmission(status: "running" | "busy" = "running", deadline = false) {
+  let runningSession: string | null = null;
+  let firstSessionId = "";
+  let resolveFirstStart: () => void = () => {
+    throw new Error("the first setup request did not start");
+  };
+  let startCount = 0;
+  const request = vi.fn(
+    async (
+      method: string,
+      params?: { sessionId?: string },
+      options?: { signal?: AbortSignal; timeoutMs?: number | null },
+    ) => {
+      if (method === "openclaw.setup.auth.start") {
+        const sessionId = params?.sessionId;
+        if (!sessionId) {
+          throw new Error("missing setup session");
+        }
+        if (startCount++ === 0) {
+          firstSessionId = sessionId;
+          return await new Promise((resolve, reject) => {
+            options?.signal?.addEventListener(
+              "abort",
+              () =>
+                reject(
+                  new Error(deadline ? "aborted" : "Gateway retired the aborted start request"),
+                ),
+              { once: true },
+            );
+            if (deadline && typeof options?.timeoutMs === "number") {
+              setTimeout(
+                () => reject(new Error("Gateway retired the timed-out request")),
+                options.timeoutMs,
+              );
+            }
+            resolveFirstStart = () => {
+              if (status === "busy") {
+                reject(
+                  new GatewayRequestError({
+                    code: "UNAVAILABLE",
+                    message: "Setup busy",
+                    details: { code: "SETUP_ADMISSION_BUSY" },
+                  }),
+                );
+                return;
+              }
+              runningSession = sessionId;
+              resolve({ sessionId, ...running });
+            };
+          });
+        }
+        if (runningSession) {
+          throw new Error("wizard already running");
+        }
+        return { sessionId, done: true, status: "done" };
+      }
+      if (method === "wizard.cancel") {
+        if (runningSession !== params?.sessionId) {
+          throw new Error("wizard not found");
+        }
+        runningSession = null;
+        return { status: "cancelled" };
+      }
+      throw new Error(`unexpected request ${method}`);
+    },
+  );
+  return {
+    request,
+    resolve: () => resolveFirstStart(),
+    session: () => runningSession,
+    firstSession: () => firstSessionId,
+  };
+}
+
 describe("ModelSetupWizardRunner", () => {
-  it("binds runtime enablement to its explicit agent and cancels late admission on the original client", async () => {
-    const sessionId = "00000000-0000-4000-8000-000000000002";
-    const generateUUID = vi.spyOn(uuid, "generateUUID").mockReturnValue(sessionId);
-    const admission = createDeferred<WizardNextResult>();
-    const original = new GatewayBrowserClient({ url: "ws://gateway-a.example.test" });
-    const replacement = new GatewayBrowserClient({ url: "ws://gateway-b.example.test" });
-    const originalRequest = vi
-      .spyOn(original, "request")
-      .mockReturnValueOnce(admission.promise)
-      .mockResolvedValue({ status: "cancelled" });
-    const replacementRequest = vi.spyOn(replacement, "request");
-    let client = original;
-    const getAgentId = vi.fn(() => "wrong-agent");
-    const runner = createRunner({ getClient: () => client, getAgentId });
-    const params = {
-      agentId: "research",
-      runtimeId: "acp-opencode",
-      configPatch: {
-        plugins: { entries: { acpx: { config: { nativeAgents: { opencode: true } } } } },
-      },
-    };
-    try {
-      const start = runner.startRuntime(params, "OpenCode");
-      expect(originalRequest).toHaveBeenCalledWith(
-        "openclaw.setup.runtime.start",
-        { ...params, sessionId },
-        { timeoutMs: null },
-      );
-      expect(getAgentId).not.toHaveBeenCalled();
-      client = replacement;
-      await runner.cancel();
-      admission.resolve({ done: false, status: "running" });
-      await expect(start).resolves.toBeNull();
-      expect(originalRequest).toHaveBeenCalledTimes(3);
-      expect(originalRequest.mock.calls.slice(1)).toEqual([
-        ["wizard.cancel", { sessionId, closeInput: true }, { timeoutMs: 30_000 }],
-        ["wizard.cancel", { sessionId, closeInput: true }, { timeoutMs: 30_000 }],
-      ]);
-      expect(replacementRequest).not.toHaveBeenCalled();
-      expect(runner.state).toEqual({ phase: "idle" });
-    } finally {
-      admission.resolve({ done: true, status: "cancelled" });
-      await runner.cancel();
-      originalRequest.mockRestore();
-      replacementRequest.mockRestore();
-      generateUUID.mockRestore();
-    }
-  });
-
-  it("cleans a late MCP admission on the captured client without replaying or selecting an agent", async () => {
-    const sessionId = "00000000-0000-4000-8000-000000000001";
-    const generateUUID = vi.spyOn(uuid, "generateUUID").mockReturnValue(sessionId);
-    const admission = createDeferred<WizardNextResult>();
-    const original = new GatewayBrowserClient({ url: "ws://gateway-a.example.test" });
-    const replacement = new GatewayBrowserClient({ url: "ws://gateway-b.example.test" });
-    const originalRequest = vi
-      .spyOn(original, "request")
-      .mockReturnValueOnce(admission.promise)
-      .mockResolvedValue({ status: "cancelled" });
-    const replacementRequest = vi.spyOn(replacement, "request");
-    let client = original;
-    const getAgentId = vi.fn(() => "selected-agent");
-    const onStart = vi.fn();
-    const runner = createRunner({ getClient: () => client, getAgentId, onStart });
-    try {
-      const start = runner.startMcpLogin("docs");
-      expect(originalRequest).toHaveBeenCalledWith(
-        "mcp.authLogin",
-        { sessionId, serverName: "docs" },
-        { timeoutMs: null },
-      );
-      expect(getAgentId).not.toHaveBeenCalled();
-      expect(onStart).toHaveBeenCalledWith("mcp.authLogin", undefined);
-
-      client = replacement;
-      await runner.cancel();
-      const cancellation = originalRequest.mock.calls[1];
-      expect(cancellation).toEqual([
-        "wizard.cancel",
-        { sessionId, closeInput: true },
-        { timeoutMs: 30_000 },
-      ]);
-      admission.resolve({ done: false, status: "running" });
-      await expect(start).resolves.toBeNull();
-      expect(originalRequest).toHaveBeenCalledTimes(3);
-      expect(originalRequest.mock.calls[2]).toEqual(cancellation);
-      expect(replacementRequest).not.toHaveBeenCalled();
-      expect(runner.state).toEqual({ phase: "idle" });
-    } finally {
-      admission.resolve({ done: true, status: "cancelled" });
-      await runner.cancel();
-      originalRequest.mockRestore();
-      replacementRequest.mockRestore();
-      generateUUID.mockRestore();
-    }
-  });
+  it.each(["runtime", "mcp"] as const)(
+    "binds %s admission to its captured client and cancels late admission without replay",
+    async (kind) => {
+      const sessionId =
+        kind === "runtime"
+          ? "00000000-0000-4000-8000-000000000002"
+          : "00000000-0000-4000-8000-000000000001";
+      const generateUUID = vi.spyOn(uuid, "generateUUID").mockReturnValue(sessionId);
+      const admission = createDeferred<WizardNextResult>();
+      const original = new GatewayBrowserClient({ url: "ws://gateway-a.example.test" });
+      const replacement = new GatewayBrowserClient({ url: "ws://gateway-b.example.test" });
+      const originalRequest = vi
+        .spyOn(original, "request")
+        .mockReturnValueOnce(admission.promise)
+        .mockResolvedValue({ status: "cancelled" });
+      const replacementRequest = vi.spyOn(replacement, "request");
+      let client = original;
+      const getAgentId = vi.fn(() => (kind === "runtime" ? "wrong-agent" : "selected-agent"));
+      const onStart = vi.fn();
+      const runner = createRunner({ getClient: () => client, getAgentId, onStart });
+      const params = {
+        agentId: "research",
+        runtimeId: "acp-opencode",
+        configPatch: {
+          plugins: { entries: { acpx: { config: { nativeAgents: { opencode: true } } } } },
+        },
+      };
+      try {
+        const start =
+          kind === "runtime"
+            ? runner.startRuntime(params, "OpenCode")
+            : runner.startMcpLogin("docs");
+        expect(originalRequest).toHaveBeenCalledWith(
+          kind === "runtime" ? "openclaw.setup.runtime.start" : "mcp.authLogin",
+          kind === "runtime" ? { ...params, sessionId } : { sessionId, serverName: "docs" },
+          { timeoutMs: null },
+        );
+        expect(getAgentId).not.toHaveBeenCalled();
+        if (kind === "mcp") {
+          expect(onStart).toHaveBeenCalledWith("mcp.authLogin", undefined);
+        }
+        client = replacement;
+        await runner.cancel();
+        const cancellation = [
+          "wizard.cancel",
+          { sessionId, closeInput: true },
+          { timeoutMs: 30_000 },
+        ];
+        expect(originalRequest.mock.calls[1]).toEqual(cancellation);
+        admission.resolve(running);
+        await expect(start).resolves.toBeNull();
+        expect(originalRequest).toHaveBeenCalledTimes(3);
+        expect(originalRequest.mock.calls.slice(1)).toEqual([cancellation, cancellation]);
+        expect(replacementRequest).not.toHaveBeenCalled();
+        expect(runner.state).toEqual({ phase: "idle" });
+      } finally {
+        admission.resolve({ done: true, status: "cancelled" });
+        await runner.cancel();
+        originalRequest.mockRestore();
+        replacementRequest.mockRestore();
+        generateUUID.mockRestore();
+      }
+    },
+  );
 
   it("shares a failed in-flight cancellation with teardown", async () => {
     const pending = createDeferred<unknown>();
     const request = vi.fn(async (method: string) => {
       if (method === "openclaw.setup.auth.start") {
-        return { done: false, status: "running" };
+        return running;
       }
       if (method === "wizard.cancel") {
         return await pending.promise;
       }
-      return { done: false, status: "running", step: { id: "key", type: "text" } };
+      return keyStep;
     });
     const terminal = vi.fn();
     const runner = createRunner({
@@ -151,17 +195,17 @@ describe("ModelSetupWizardRunner", () => {
     const oldCancellation = createDeferred<unknown>();
     const originalRequest = vi.fn(async (method: string) => {
       if (method === "openclaw.setup.auth.start") {
-        return { done: false, status: "running" };
+        return running;
       }
       if (method === "wizard.cancel") {
         return await oldCancellation.promise;
       }
-      return { done: false, status: "running", step: { id: "key", type: "text" } };
+      return keyStep;
     });
     let cancellations = 0;
     const replacementRequest = vi.fn(async (method: string) => {
       if (method === "wizard.next") {
-        return { done: false, status: "running", step: { id: "key", type: "text" } };
+        return keyStep;
       }
       if (method === "wizard.cancel") {
         cancellations += 1;
@@ -217,7 +261,7 @@ describe("ModelSetupWizardRunner", () => {
         return await lateReply.promise;
       }
       if (method === "wizard.next") {
-        return { done: false, status: "running", step: { id: "key", type: "text" } };
+        return keyStep;
       }
       if (method === "wizard.cancel") {
         return await lateReply.promise;
@@ -234,7 +278,7 @@ describe("ModelSetupWizardRunner", () => {
     const pending = runner.start("original-provider");
     runner.close({ retireOwner: true });
     const requestsAtRetirement = request.mock.calls.length;
-    lateReply.resolve({ done: false, status: "running" });
+    lateReply.resolve(running);
     await pending;
     expect(request).toHaveBeenCalledTimes(requestsAtRetirement);
     expect(onTerminal).not.toHaveBeenCalled();
@@ -246,11 +290,11 @@ describe("ModelSetupWizardRunner", () => {
     let nextCalls = 0;
     const originalRequest = vi.fn(async (method: string) => {
       if (method === "openclaw.setup.auth.start") {
-        return { done: false, status: "running" };
+        return running;
       }
       nextCalls += 1;
       if (nextCalls === 1) {
-        return { done: false, status: "running", step: { id: "key", type: "text" } };
+        return keyStep;
       }
       return interrupted.promise;
     });
@@ -296,10 +340,10 @@ describe("ModelSetupWizardRunner", () => {
     let nextCalls = 0;
     const request = vi.fn(async (method: string) => {
       if (method === "openclaw.setup.auth.start") {
-        return { done: false, status: "running" };
+        return running;
       }
       if (++nextCalls === 1) {
-        return { done: false, status: "running", step: { id: "key", type: "text" } };
+        return keyStep;
       }
       return terminalReply.promise;
     });
@@ -382,52 +426,8 @@ describe("ModelSetupWizardRunner", () => {
 
   it("releases a late admission after close so setup can restart", async () => {
     const method = "openclaw.setup.auth.start";
-    let runningSession: string | null = null;
-    let firstSessionId = "";
-    let resolveFirstStart: () => void = () => {
-      throw new Error("the first setup request did not start");
-    };
-    let startCount = 0;
-    const request = vi.fn(
-      async (
-        requestMethod: string,
-        params?: { sessionId?: string },
-        options?: { signal?: AbortSignal },
-      ) => {
-        if (requestMethod === method) {
-          const sessionId = params?.sessionId;
-          if (!sessionId) {
-            throw new Error("missing setup session");
-          }
-          if (startCount++ === 0) {
-            firstSessionId = sessionId;
-            return await new Promise((resolve, reject) => {
-              options?.signal?.addEventListener(
-                "abort",
-                () => reject(new Error("Gateway retired the aborted start request")),
-                { once: true },
-              );
-              resolveFirstStart = () => {
-                runningSession = sessionId;
-                resolve({ sessionId, done: false, status: "running" });
-              };
-            });
-          }
-          if (runningSession) {
-            throw new Error("wizard already running");
-          }
-          return { sessionId, done: true, status: "done" };
-        }
-        if (requestMethod === "wizard.cancel") {
-          if (runningSession !== params?.sessionId) {
-            throw new Error("wizard not found");
-          }
-          runningSession = null;
-          return { status: "cancelled" };
-        }
-        throw new Error(`unexpected request ${requestMethod}`);
-      },
-    );
+    const fixture = lateAdmission();
+    const { request } = fixture;
     const client = { request } as unknown as GatewayBrowserClient;
     const terminalResult = vi.fn();
     const runner = createRunner({
@@ -437,14 +437,14 @@ describe("ModelSetupWizardRunner", () => {
 
     const firstStart = runner.start("original", method);
     runner.close();
-    resolveFirstStart();
+    fixture.resolve();
     await firstStart;
 
-    expect(runningSession).toBeNull();
+    expect(fixture.session()).toBeNull();
     expect(terminalResult).toHaveBeenCalledWith({ done: true, status: "cancelled" });
     expect(request).toHaveBeenCalledWith(
       "wizard.cancel",
-      { sessionId: firstSessionId },
+      { sessionId: fixture.firstSession() },
       { timeoutMs: 30_000 },
     );
     await expect(runner.start("replacement", method)).resolves.toEqual({ startMethod: method });
@@ -460,68 +460,8 @@ describe("ModelSetupWizardRunner", () => {
       const terminal = status !== "running";
       vi.useFakeTimers();
       try {
-        let runningSession: string | null = null;
-        let firstSessionId = "";
-        let resolveFirstStart: () => void = () => {
-          throw new Error("the first setup request did not start");
-        };
-        let startCount = 0;
-        const request = vi.fn(
-          async (
-            requestMethod: string,
-            params?: { sessionId?: string },
-            options?: { signal?: AbortSignal; timeoutMs?: number | null },
-          ) => {
-            if (requestMethod === method) {
-              const sessionId = params?.sessionId;
-              if (!sessionId) {
-                throw new Error("missing setup session");
-              }
-              if (startCount++ === 0) {
-                firstSessionId = sessionId;
-                return await new Promise((resolve, reject) => {
-                  options?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
-                    once: true,
-                  });
-                  if (typeof options?.timeoutMs === "number") {
-                    setTimeout(
-                      () => reject(new Error("Gateway retired the timed-out request")),
-                      options.timeoutMs,
-                    );
-                  }
-                  resolveFirstStart = () => {
-                    if (status === "busy") {
-                      reject(
-                        new GatewayRequestError({
-                          code: "UNAVAILABLE",
-                          message: "Setup busy",
-                          details: { code: "SETUP_ADMISSION_BUSY" },
-                        }),
-                      );
-                      return;
-                    }
-                    if (!terminal) {
-                      runningSession = sessionId;
-                    }
-                    resolve({ sessionId, done: terminal, status });
-                  };
-                });
-              }
-              if (runningSession) {
-                throw new Error("wizard already running");
-              }
-              return { sessionId, done: true, status: "done" };
-            }
-            if (requestMethod === "wizard.cancel") {
-              if (runningSession !== params?.sessionId) {
-                throw new Error("wizard not found");
-              }
-              runningSession = null;
-              return { status: "cancelled" };
-            }
-            throw new Error(`unexpected request ${requestMethod}`);
-          },
-        );
+        const fixture = lateAdmission(status, true);
+        const { request } = fixture;
         const client = { request } as unknown as GatewayBrowserClient;
         const terminalResult = vi.fn();
         const runner = createRunner({
@@ -534,15 +474,15 @@ describe("ModelSetupWizardRunner", () => {
         await timedOutStart;
         expect(runner.state).toEqual({ phase: "error", message: "not responding" });
 
-        resolveFirstStart();
+        fixture.resolve();
         await vi.runAllTimersAsync();
-        expect(runningSession).toBeNull();
+        expect(fixture.session()).toBeNull();
         expect(terminalResult).toHaveBeenCalledOnce();
         const cancelCalls = request.mock.calls.filter(
           ([requestMethod]) => requestMethod === "wizard.cancel",
         );
         const lateCancelCalls = cancelCalls.filter(
-          ([, params]) => params?.sessionId === firstSessionId,
+          ([, params]) => params?.sessionId === fixture.firstSession(),
         );
         expect(lateCancelCalls).toHaveLength(terminal ? 1 : 2);
 

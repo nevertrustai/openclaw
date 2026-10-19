@@ -8,9 +8,16 @@ import { createDeferred } from "../../../../test/helpers/promise.js";
 import type { ModelAuthStatusResult } from "../../api/types.ts";
 import { waitForFast } from "../../test-helpers/wait-for.ts";
 import {
+  authButton,
+  pageButton,
+  mountDetection,
+  mockRequests,
+  runningStep,
+  callsFor,
+} from "./model-setup-first-run.test-support.ts";
+import {
   createContext,
   detection,
-  mountPage,
   type TestModelSetupPage,
 } from "./test-helpers/page.test-support.ts";
 
@@ -57,17 +64,33 @@ const configSnapshot = {
   valid: true,
   issues: [],
 };
+function configureRequests(
+  request: ReturnType<typeof createContext>["request"],
+  handlers: Parameters<typeof mockRequests>[1],
+) {
+  mockRequests(request, {
+    "models.authStatus": () => authStatus,
+    "config.get": () => configSnapshot,
+    "openclaw.setup.detect": () => setup,
+    ...handlers,
+  });
+}
+
+const signInMethod = (operation: "connect" | "setup") =>
+  operation === "connect" ? "models.authLogin" : "openclaw.setup.auth.start";
+const labelFor = (operation: "connect" | "setup") =>
+  operation === "connect" ? "Radius account" : "Setup-only account";
 
 async function startSignIn(page: TestModelSetupPage, operation: "connect" | "setup") {
   if (operation === "setup") {
-    page.querySelector<HTMLButtonElement>('[data-auth-choice="setup-only"] button')!.click();
+    authButton(page, "setup-only")!.click();
     return;
   }
-  page.querySelector<HTMLButtonElement>("[data-models-connect]")!.click();
+  pageButton(page, "[data-models-connect]")!.click();
   await waitForFast(() =>
     expect(page.querySelector("openclaw-modal-dialog")?.textContent).toContain("Radius account"),
   );
-  page.querySelector<HTMLButtonElement>('[data-models-login-provider="radius"]')!.click();
+  pageButton(page, '[data-models-login-provider="radius"]')!.click();
   await page.updateComplete;
   [...page.querySelectorAll<HTMLButtonElement>("[data-models-login-choice] button")]
     .find((button) => button.textContent?.includes("Radius account"))!
@@ -90,20 +113,8 @@ it.each(["connect", "setup"] as const)(
     const manual = new AbortController();
     let session: WizardSession | undefined;
     let verificationRuns = 0;
-    request.mockImplementation(async (method, params) => {
-      if (method === "models.authStatus") {
-        return authStatus;
-      }
-      if (method === "config.get") {
-        return configSnapshot;
-      }
-      if (method === "openclaw.setup.detect") {
-        return setup;
-      }
-      if (method === "models.authLogin" || method === "openclaw.setup.auth.start") {
-        expect(method).toBe(
-          operation === "connect" ? "models.authLogin" : "openclaw.setup.auth.start",
-        );
+    configureRequests(request, {
+      [signInMethod(operation)]: () => {
         session = new WizardSession(async (prompter, _signal, active) => {
           await prompter.note("Approve this account in your browser.", "Account access");
           await prompter.openUrl?.("https://example.invalid/authorize");
@@ -118,8 +129,8 @@ it.each(["connect", "setup"] as const)(
           }
         });
         return { done: false, status: "running" };
-      }
-      if (method === "wizard.next") {
+      },
+      "wizard.next": async (params) => {
         if (!session) {
           throw new Error("Expected registered wizard start");
         }
@@ -129,22 +140,15 @@ it.each(["connect", "setup"] as const)(
           await session.answer(answer.stepId, answer.value);
         }
         return session.next();
-      }
-      if (method === "wizard.cancel") {
+      },
+      "wizard.cancel": () => {
         session?.cancel();
         return { status: "cancelled" };
-      }
-      throw new Error(`Unexpected request: ${method}`);
+      },
     });
     try {
-      const { page } = await mountPage(context, {
-        state: { phase: "ready", result: setup },
-        client,
-        firstRun: false,
-      });
-      const setupButton = page.querySelector<HTMLButtonElement>(
-        '[data-auth-choice="setup-only"] button',
-      )!;
+      const { page } = await mountDetection(context, client, setup, false);
+      const setupButton = authButton(page, "setup-only")!;
       await startSignIn(page, operation);
       await waitForFast(() => {
         const signIn = page.querySelector(".wizard-step__sign-in");
@@ -152,7 +156,7 @@ it.each(["connect", "setup"] as const)(
         expect(signIn?.textContent).toContain("Waiting for approval in your browser…");
       });
       expect(page.querySelector(".model-setup-wizard h2")?.textContent?.trim()).toBe(
-        operation === "connect" ? "Radius account" : "Setup-only account",
+        labelFor(operation),
       );
       expect(verificationRuns).toBe(0);
       callback.resolve();
@@ -168,18 +172,14 @@ it.each(["connect", "setup"] as const)(
       expect(page.textContent).not.toContain("Approve this account in your browser.");
       expect(page.textContent).not.toContain("https://example.invalid/authorize");
       expect(setupButton.textContent?.trim()).toBe("Set up & verify");
-      expect(
-        request.mock.calls.some(([method]) => method === "openclaw.setup.activate.start"),
-      ).toBe(false);
+      expect(callsFor(request, "openclaw.setup.activate.start")).toHaveLength(0);
       if (operation === "connect") {
         expect(request).toHaveBeenCalledWith(
           "models.authLogin",
           expect.objectContaining({ authChoice: "radius/radius", agentId: "main" }),
           expect.anything(),
         );
-        expect(request.mock.calls.some(([method]) => method === "openclaw.setup.auth.start")).toBe(
-          false,
-        );
+        expect(callsFor(request, "openclaw.setup.auth.start")).toHaveLength(0);
       }
     } finally {
       callback.resolve();
@@ -196,25 +196,10 @@ it.each(["agent", "connection", "cancel"] as const)(
   async (change) => {
     const { context, client, request, runtimeConfig, snapshot } = createContext();
     const inventory = createDeferred<ModelAuthStatusResult>();
-    request.mockImplementation(async (method) => {
-      if (method === "models.authStatus") {
-        return inventory.promise;
-      }
-      if (method === "openclaw.setup.detect") {
-        return setup;
-      }
-      if (method === "config.get") {
-        return configSnapshot;
-      }
-      throw new Error(`Unexpected request: ${method}`);
-    });
+    configureRequests(request, { "models.authStatus": () => inventory.promise });
     try {
-      const { page } = await mountPage(context, {
-        state: { phase: "ready", result: setup },
-        client,
-        firstRun: false,
-      });
-      page.querySelector<HTMLButtonElement>("[data-models-connect]")!.click();
+      const { page } = await mountDetection(context, client, setup, false);
+      pageButton(page, "[data-models-connect]")!.click();
       await waitForFast(() =>
         expect(request.mock.calls.some(([method]) => method === "models.authStatus")).toBe(true),
       );
@@ -225,7 +210,7 @@ it.each(["agent", "connection", "cancel"] as const)(
         snapshot.hello = { ...snapshot.hello };
       }
       if (change === "cancel") {
-        page.querySelector<HTMLButtonElement>("openclaw-modal-dialog button")!.click();
+        pageButton(page, "openclaw-modal-dialog button")!.click();
       } else {
         page.routeData = { firstRun: false };
       }
@@ -256,66 +241,37 @@ it.each([
     const url = "https://example.invalid/authorize?code=synthetic";
     const authorization = `Open the authorization URL: ${url}`;
     let reads = 0;
-    request.mockImplementation(async (method) => {
-      if (method === "models.authStatus") {
-        return authStatus;
-      }
-      if (method === "openclaw.setup.detect") {
-        return setup;
-      }
-      if (method === "config.get") {
-        return configSnapshot;
-      }
-      if (method === "models.authLogin" || method === "openclaw.setup.auth.start") {
-        expect(method).toBe(
-          operation === "connect" ? "models.authLogin" : "openclaw.setup.auth.start",
-        );
-        return { done: false, status: "running" };
-      }
-      if (method === "wizard.next") {
+    configureRequests(request, {
+      [signInMethod(operation)]: () => ({ done: false, status: "running" }),
+      "wizard.next": async () => {
         reads += 1;
         if (reads <= 2) {
-          return {
-            done: false,
-            status: "running",
-            step: {
-              id: `note-${reads}`,
-              type: "note",
-              executor: "client",
-              message: reads === 1 ? guidance : authorization,
-            },
-          };
+          return runningStep({
+            id: `note-${reads}`,
+            type: "note",
+            executor: "client",
+            message: reads === 1 ? guidance : authorization,
+          });
         }
         if (reads === 3) {
-          return {
-            done: false,
-            status: "running",
-            step: {
-              id: "approval",
-              type: "progress",
-              executor: "gateway",
-              message: "Waiting for approval",
-              externalUrl: url,
-            },
-          };
+          return runningStep({
+            id: "approval",
+            type: "progress",
+            executor: "gateway",
+            message: "Waiting for approval",
+            externalUrl: url,
+          });
         }
         await finish.promise;
         if (failure === "request") {
           throw new Error(diagnostic);
         }
         return { done: true, status: "error", error: diagnostic };
-      }
-      if (method === "wizard.cancel") {
-        return { status: "cancelled" };
-      }
-      throw new Error(`Unexpected request: ${method}`);
+      },
+      "wizard.cancel": () => ({ status: "cancelled" }),
     });
     try {
-      const { page } = await mountPage(context, {
-        state: { phase: "ready", result: setup },
-        client,
-        firstRun: false,
-      });
+      const { page } = await mountDetection(context, client, setup, false);
       await startSignIn(page, operation);
       await waitForFast(() =>
         expect(page.querySelector(".wizard-step__sign-in")?.textContent).toContain(
@@ -323,7 +279,7 @@ it.each([
         ),
       );
       const modal = page.querySelector("openclaw-modal-dialog")!;
-      const label = operation === "connect" ? "Radius account" : "Setup-only account";
+      const label = labelFor(operation);
       expect(modal.querySelector("h2")?.textContent?.trim()).toBe(label);
       expect(modal.textContent).not.toContain(guidance);
       expect(modal.textContent).not.toContain(url);
@@ -342,9 +298,7 @@ it.each([
       expect(alert.querySelector<HTMLButtonElement>('button[aria-label="Copy"]')).not.toBeNull();
       expect(modal.querySelector("details")).toBeNull();
       expect(reads).toBe(4);
-      expect(
-        request.mock.calls.some(([method]) => method === "openclaw.setup.activate.start"),
-      ).toBe(false);
+      expect(callsFor(request, "openclaw.setup.activate.start")).toHaveLength(0);
     } finally {
       finish.resolve();
       runtimeConfig.dispose();
