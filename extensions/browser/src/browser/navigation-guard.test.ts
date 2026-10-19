@@ -46,7 +46,7 @@ describe("browser navigation guard", () => {
     ["about:srcdoc", InvalidBrowserNavigationUrlError],
     ["not a url", InvalidBrowserNavigationUrlError],
   ] as const)("rejects navigation to %s", async (url, error) => {
-    const lookupFn = createLookupFn("127.0.0.1");
+    const lookupFn = url === "https://example.com" ? createLookupFn("127.0.0.1") : undefined;
     await expect(assertBrowserNavigationAllowed({ url, lookupFn })).rejects.toBeInstanceOf(error);
   });
 
