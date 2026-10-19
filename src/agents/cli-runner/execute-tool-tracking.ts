@@ -671,12 +671,12 @@ export function createCliToolTracking(context: PreparedCliRunContext) {
   });
   return {
     beginGatewayCapture,
-    registerTurnInterrupt(interrupt: CliBackendTurnInterrupt | undefined) {
+    registerTurnInterrupt(this: void, interrupt: CliBackendTurnInterrupt | undefined) {
       turnInterrupt = interrupt;
       supportsTurnInterrupt ||= interrupt !== undefined;
       requestYieldInterrupt();
     },
-    async waitForTurnInterrupt() {
+    async waitForTurnInterrupt(this: void) {
       await yieldInterrupt;
     },
     shouldSuppressAssistantOutput,

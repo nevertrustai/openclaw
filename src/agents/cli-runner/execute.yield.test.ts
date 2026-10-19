@@ -108,6 +108,7 @@ it.each([true, false])(
       bindingFlushOk: true,
       usedHistoryPrompt: false,
       userTurnHandled: true,
+      sessionBindingDisabled: false,
       preparedContextAgentMeta: {},
     });
     if (interruptible) {
