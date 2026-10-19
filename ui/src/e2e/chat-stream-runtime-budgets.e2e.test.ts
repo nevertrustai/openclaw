@@ -807,16 +807,19 @@ suite.define(() => {
       // The first saved draft notifies presence subscribers. Drain that transition
       // before measuring edits to an already-present draft.
       await waitForCommittedComposerDraft(page, scopeKey, "seed", 0);
-      const scrollDuringWait = scrollAwayAndBack
-        ? (async () => {
+      const scroll = scrollAwayAndBack
+        ? await (async () => {
             const thread = page.locator(".chat-pane-cache__pane--active .chat-thread");
+            await thread.hover();
+            await waitForChatScrollIdle(page);
             const originalTop = await thread.evaluate((element) => element.scrollTop);
             // Real reader input retires end-follow; an 8 px offset is still at the end.
-            await thread.hover();
             await page.mouse.wheel(0, -100);
             await expect
               .poll(() => thread.evaluate((element) => element.scrollTop))
-              .toBe(originalTop - 100);
+              .toBeLessThan(originalTop - 8);
+            // Virtualizer measurements can adjust the wheel's final offset.
+            await waitForChatScrollIdle(page);
             const awayTop = await thread.evaluate((element) => element.scrollTop);
             await page.mouse.wheel(0, originalTop - awayTop);
             await expect
@@ -828,9 +831,9 @@ suite.define(() => {
               restoredTop: await thread.evaluate((element) => element.scrollTop),
             };
           })()
-        : Promise.resolve(null);
+        : null;
       // Finish startup scrolling before measuring steady-state composer invalidations.
-      const [, scroll] = await Promise.all([waitForChatScrollIdle(page), scrollDuringWait]);
+      await waitForChatScrollIdle(page);
       if (scroll) {
         expect(scroll.awayTop).toBeLessThan(scroll.originalTop);
         expect(scroll.restoredTop).toBe(scroll.originalTop);
