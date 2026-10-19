@@ -1,6 +1,5 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
-  createEffect,
   createMemo,
   createSignal,
   onCleanup,
@@ -34,6 +33,7 @@ import { parseYouTubeVideoUrl } from "../../../lib/chat/youtube-video.ts";
 import { cancelLayout, scheduleLayout } from "../../../lib/layout-frame.ts";
 import { t } from "../../../lib/reactive/i18n.ts";
 import { listen } from "../../../lib/reactive/listener.ts";
+import { createResizeObserver } from "../../../lib/reactive/observers.ts";
 import { ContentPresentation } from "../../../lib/solid/presentation.ts";
 import { showToast } from "../../../lib/toast.ts";
 import { postWidgetTheme, registerWidgetThemeFrame } from "../../../lib/widget-theme.ts";
@@ -512,53 +512,31 @@ function handleWidgetExportAction(
     });
 }
 
-function widgetActionsPlacementRef(
-  enabled: () => boolean,
-  options: () => WidgetCardOptions | undefined,
-) {
+function widgetActionsPlacementRef(enabled: () => boolean) {
   const presented = useContext(ContentPresentation);
   const active = createMemo(() => presented() && enabled());
-  let element: HTMLElement | undefined;
-  // Synchronize action placement with the transcript's DOM clipping geometry.
-  createEffect(
-    () => [active(), options()] as const,
-    ([isActive]) => {
-      if (!isActive || !element || typeof ResizeObserver === "undefined") {
+  let element!: HTMLElement;
+  const targets = () => {
+    if (!active()) {
+      return [];
+    }
+    const thread = element.closest<HTMLElement>(".chat-thread");
+    return thread ? [element, thread] : [];
+  };
+  // Keep observation stable through content updates; only geometry needs a new frame.
+  createResizeObserver(targets, () =>
+    scheduleLayout(element, () => {
+      const [target, thread] = targets();
+      if (!target || !thread) {
         return undefined;
       }
-      const target = element;
-      let thread: HTMLElement | null = null;
-      const placeActions = () => {
-        if (!thread) {
-          return undefined;
-        }
-        const clipRight =
-          thread.getBoundingClientRect().left + thread.clientLeft + thread.clientWidth;
-        const above = clipRight - target.getBoundingClientRect().right < 40;
-        return () => target.toggleAttribute("data-widget-actions-above", above);
-      };
-      const observer = new ResizeObserver(() => scheduleLayout(target, placeActions));
-      // Content updates can arrive during resize delivery. Reattach after insertion
-      // in the next frame so the shallower thread cannot become a skipped delivery.
-      scheduleLayout(target, () => {
-        const container = target.closest<HTMLElement>(".chat-thread");
-        if (!container) {
-          return undefined;
-        }
-        thread = container;
-        const place = placeActions();
-        return () => {
-          observer.observe(target);
-          observer.observe(container);
-          place?.();
-        };
-      });
-      return () => {
-        cancelLayout(target);
-        observer.disconnect();
-      };
-    },
+      const clipRight =
+        thread.getBoundingClientRect().left + thread.clientLeft + thread.clientWidth;
+      const above = clipRight - target.getBoundingClientRect().right < 40;
+      return () => element.toggleAttribute("data-widget-actions-above", above);
+    }),
   );
+  onSettled(() => () => cancelLayout(element));
   return (next: HTMLDivElement) => {
     element = next;
   };
@@ -605,7 +583,7 @@ function CanvasPreview(props: {
     t(pinned() ? "chat.toolCards.pinnedToDashboard" : "chat.toolCards.pinToDashboard");
   return (
     <div
-      ref={widgetActionsPlacementRef(hasActions, () => props.options)}
+      ref={widgetActionsPlacementRef(hasActions)}
       class="chat-tool-card__preview"
       data-content-kind={props.preview.mcpApp ? "mcp-app" : "canvas-html"}
       data-has-widget-actions={hasActions() ? "" : undefined}
