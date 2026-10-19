@@ -41,7 +41,8 @@ const mockState = vi.hoisted(() => ({
   acpOutputSinkError: null as Error | null,
   gateways: [] as MockGatewayClient[],
   gatewayOptions: [] as GatewayClientOptions[],
-  agentSideConnectionCtor: vi.fn(),
+  agentSideConnectionCtor:
+    vi.fn<(factory: (conn: unknown) => unknown, stream: MockAcpStream) => void>(),
   agentHandleGatewayEvent: vi.fn(async (_evt: unknown) => {}),
   agentShutdown: vi.fn(),
   routeLogsToStderr: vi.fn(),
@@ -268,15 +269,10 @@ describe("serveAcpGateway startup", () => {
 
   function getCapturedAcpStream(): MockAcpStream {
     const stream = mockState.agentSideConnectionCtor.mock.calls[0]?.[1];
-    if (
-      !stream ||
-      typeof stream !== "object" ||
-      !(stream as MockAcpStream).readable ||
-      !(stream as MockAcpStream).writable
-    ) {
+    if (!stream) {
       throw new Error("Expected AgentSideConnection stream");
     }
-    return stream as MockAcpStream;
+    return stream;
   }
 
   async function readCapturedAcpMessages(): Promise<unknown[]> {
@@ -555,7 +551,6 @@ describe("serveAcpGateway startup", () => {
   it("tears down the agent, Gateway, and state database when the outbound sink fails", async () => {
     await withRunningGateway(async (servePromise) => {
       await readCapturedAcpMessages();
-
       const stopAndWait = vi.spyOn(getMockGateway(), "stopAndWait");
       expect(mockState.closeOpenClawStateDatabaseAsync).not.toHaveBeenCalled();
 

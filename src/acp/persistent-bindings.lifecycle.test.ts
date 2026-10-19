@@ -27,13 +27,8 @@ let ensureConfiguredAcpBindingSession: typeof import("./persistent-bindings.life
 
 beforeEach(async () => {
   vi.resetModules();
-  managerMocks.resolveSessionAsync
-    .mockReset()
-    .mockImplementation(async ({ sessionKey }) => ({ kind: "none", sessionKey }));
-  managerMocks.closeSession.mockReset().mockResolvedValue({
-    runtimeClosed: true,
-    metaCleared: false,
-  });
+  managerMocks.resolveSessionAsync.mockReset();
+  managerMocks.closeSession.mockReset().mockResolvedValue(undefined);
   managerMocks.initializeSession.mockReset().mockResolvedValue(undefined);
   managerMocks.setSessionConfigOption.mockReset().mockResolvedValue(undefined);
   ({ ensureConfiguredAcpBindingSession } = await import("./persistent-bindings.lifecycle.js"));
