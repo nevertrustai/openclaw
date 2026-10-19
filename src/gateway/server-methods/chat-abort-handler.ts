@@ -48,7 +48,7 @@ import {
   resolveChatAbortTargetRejection,
   resolveChatAbortRequester,
 } from "./chat-abort-authorization.js";
-import { discardInterruptedClientInput, stopExactClientRun } from "./chat-abort-exact-run.js";
+import { stopExactClientRun } from "./chat-abort-exact-run.js";
 import {
   abortChatRunsForSessionKeyWithPartials,
   abortControlledSubagents,
@@ -359,16 +359,6 @@ export async function handleChatAbortRequestWithLifecycle(
   });
   let inputWithdrawn = false;
   if (discardPendingInput) {
-    if (!active && !reserved) {
-      return discardInterruptedClientInput({
-        context,
-        session: abortSession,
-        runId,
-        assertCurrent,
-        authorizeRunTarget,
-        respond,
-      });
-    }
     if (
       active &&
       !authorizeRunTarget({ ...getRpcSourceIdentity(active), requester: active.adapter.requester })

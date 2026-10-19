@@ -40,7 +40,7 @@ import {
   isOperatorUiClient,
 } from "../../utils/message-channel.js";
 import type { ChatAttachment } from "../chat-attachments.js";
-import { readChatInputRecoveryAdmission } from "../chat-input-recovery.js";
+import { readChatInputRecoveryAdmission } from "../chat-input-recovery-source.js";
 import { sanitizeChatSendMessageInput } from "../chat-input-sanitize.js";
 import { hasGatewayAdminScope } from "../operator-scopes.js";
 import { normalizeRpcAttachmentsToChatAttachments } from "./attachment-normalize.js";
@@ -108,7 +108,7 @@ export function normalizeChatSendRequest(params: {
     typeof params.params.idempotencyKey === "string"
       ? readChatInputRecoveryAdmission(params.params.idempotencyKey)
       : undefined;
-  const clientInfo = recoveredInput?.clientInfo ?? client?.connect?.client;
+  const clientInfo = client?.connect?.client;
   const supportsTaskSuggestions =
     isOperatorUiClient(clientInfo) &&
     params.client?.connect?.scopes?.includes("operator.admin") === true &&

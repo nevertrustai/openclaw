@@ -26,8 +26,10 @@ import {
 import type { UserTurnOriginalInputCommit } from "../../sessions/user-turn-transcript.types.js";
 import { extractTextFromChatContent } from "../../shared/chat-content.js";
 import { isBrowserOperatorUiClient } from "../../utils/message-channel.js";
-import { createChatInputRecovery } from "../chat-input-recovery-source.js";
-import { readChatInputRecoveryAdmission } from "../chat-input-recovery.js";
+import {
+  createChatInputRecovery,
+  readChatInputRecoveryAdmission,
+} from "../chat-input-recovery-source.js";
 import type { MentionInbox } from "../mention-inbox.types.js";
 import { hasGatewayAdminScope } from "../operator-scopes.js";
 import { captureWorkerTurnInputSource } from "../worker-environments/worker-turn-transcript-target.js";
@@ -91,12 +93,6 @@ export function createGatewayChatUserTurnController(params: {
   const sourceId = buildRunUserTurnIdempotencyKey(session.clientRunId);
   const recoveredInput = readChatInputRecoveryAdmission(session.clientRunId);
   const selectedMentions = recoveredInput?.message["__openclaw"]?.humanMentions ?? request.mentions;
-  const selectedMentionText = recoveredInput
-    ? (extractTextFromChatContent(recoveredInput.message.content, {
-        joinWith: "\n",
-        normalizeText: (value) => value,
-      }) ?? "")
-    : request.rawMessage;
   const recoveryEntry = admission.admittedSessionEntry ?? admission.initialSessionEntry;
   const recovery =
     recoveredInput || admission.restartSafeAdmission || !recoveryEntry
@@ -182,28 +178,23 @@ export function createGatewayChatUserTurnController(params: {
   const recorder: UserTurnTranscriptRecorder = createUserTurnTranscriptRecorder({
     onMessagePersisted: params.onMessagePersisted,
     ...(recoveredInput ? { message: recoveredInput.message } : {}),
-    ...(request.goalOperation
-      ? { pendingInputRequestFingerprint: request.goalOperation.requestFingerprint }
-      : {}),
-    ...(recoveredInput
-      ? { pendingInputRequestFingerprint: recoveredInput.requestFingerprint }
-      : sender?.id && !request.goalOperation
-        ? {
-            // Attribution and submitted bytes survive reconnect; display names, leaf
-            // cursors and generated media paths are not immutable request identity.
-            pendingInputRequestFingerprint: sha256Hex(
-              stableStringify([
-                {
-                  ...request.p,
-                  sessionId: getRpcSourceIdentity(admission.sourceRef).sessionId,
-                  expectedLeafEntryId: undefined,
-                },
-                sender.identity ?? sender.id,
-                hasGatewayAdminScope(params.client),
-              ]),
-            ),
-          }
-        : {}),
+    // Attribution and submitted bytes survive reconnect; generated state does not.
+    pendingInputRequestFingerprint:
+      recoveredInput?.requestFingerprint ??
+      request.goalOperation?.requestFingerprint ??
+      (sender?.id
+        ? sha256Hex(
+            stableStringify([
+              {
+                ...request.p,
+                sessionId: getRpcSourceIdentity(admission.sourceRef).sessionId,
+                expectedLeafEntryId: undefined,
+              },
+              sender.identity ?? sender.id,
+              hasGatewayAdminScope(params.client),
+            ]),
+          )
+        : undefined),
     ...(request.goalOperation
       ? {
           sessionTurnMutation: {
@@ -293,20 +284,22 @@ export function createGatewayChatUserTurnController(params: {
                 joinWith: "\n",
                 normalizeText: (value) => value,
               }) ?? "";
-            const retained = selectedMentions.filter(
-              (mention) =>
-                Array.isArray(stored) &&
-                stored.some((value) => {
-                  const span = asOptionalRecord(value);
-                  return (
-                    span?.profileId === mention.profileId &&
-                    span.start === mention.start &&
-                    span.end === mention.end &&
-                    text.slice(mention.start, mention.end) ===
-                      selectedMentionText.slice(mention.start, mention.end)
-                  );
-                }),
-            );
+            const retained = recoveredInput
+              ? selectedMentions
+              : selectedMentions.filter(
+                  (mention) =>
+                    Array.isArray(stored) &&
+                    stored.some((value) => {
+                      const span = asOptionalRecord(value);
+                      return (
+                        span?.profileId === mention.profileId &&
+                        span.start === mention.start &&
+                        span.end === mention.end &&
+                        text.slice(mention.start, mention.end) ===
+                          request.rawMessage.slice(mention.start, mention.end)
+                      );
+                    }),
+                );
             if (!retained.length) {
               params.warn(
                 "Human mentions skipped because the committed text no longer contains the selected tokens.",

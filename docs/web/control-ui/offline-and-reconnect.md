@@ -402,16 +402,13 @@ inputs accepted in the past 24 hours. Cancelled inputs never resume. Inputs that
 cannot resume stay visibly interrupted for review. The browser keeps the original
 submission ID when retrying, so reconnect cannot duplicate a recovered input.
 It does not resend interrupted inputs automatically: the server owns recovery order.
-If a saved input remains interrupted, its browser copy offers **Retry** and **Discard**.
-Retry rechecks the original receipt and uses the same submission ID; successful server
-recovery retires the browser copy when its consumption receipt arrives.
-Discard withdraws the saved interrupted input from the server before the browser
-releases its copy. A failed withdrawal keeps that copy visible for review.
+If a saved input remains interrupted, copy it and send again to continue.
 
 When the Gateway confirms that it holds the same pending input, the Control UI clears the
 uncertain-delivery warning without sending the message again. The browser keeps its retry
 payload until consumption or cancellation is confirmed. If delivery is still unknown,
-the review warning remains.
+the review warning remains. Confirmed server custody does not block later browser-queued
+messages, including when the accepted input is too old for automatic recovery.
 If the Gateway is holding that input for a later turn, it appears in the queue
 above the composer. Removing that row withdraws the exact queued message without
 stopping the active turn. Once cancellation is confirmed, the removed prompt and
@@ -488,8 +485,6 @@ commands keep their retry/discard queue controls.
 
 An ordinary message rejected by the Gateway stays in the conversation with a **Not sent**
 footer. Use **Retry** to try again or **Discard** to remove its pending browser copy.
-An accepted input interrupted before execution can also be retried with its original
-submission ID without restarting the Gateway.
 Discard stays effective after reloading the tab; it does not cancel Gateway work or
 remove messages already in the conversation history.
 

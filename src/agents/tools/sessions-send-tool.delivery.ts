@@ -55,7 +55,6 @@ export async function notifySessionsSendSession(params: {
   inputProvenance: InputProvenance;
   sessionKey: string;
   targetAgentId: string;
-  idempotencyKey: string;
   runId: string;
   displayKey: string;
   assertCurrent?: () => void;
@@ -69,7 +68,7 @@ export async function notifySessionsSendSession(params: {
       withSystemEventOwner(
         {
           sessionKey: params.sessionKey,
-          contextKey: `session-notify:${params.idempotencyKey}`,
+          contextKey: `session-notify:${params.runId}`,
         },
         params.targetAgentId,
       ),
@@ -167,7 +166,9 @@ const FALLBACK_STEER_REJECTIONS = new Set<
 export async function trySessionsSendActiveRunDelivery(
   params: SessionsSendDeliveryParams,
   ownChild: boolean,
-): Promise<SessionsSendStart | { fallbackSessionKey?: string; durableSteerFallback?: true }> {
+): Promise<
+  SessionsSendStart | { fallbackSessionKey?: string; callGateway?: AgentToolGatewayRequestCaller }
+> {
   const assertCaller = captureGatewayToolCallerAssertion();
   try {
     const selection = resolveGatewayToolOperatorSelection();
@@ -296,8 +297,11 @@ export async function trySessionsSendActiveRunDelivery(
         throw new Error(steer.errorMessage);
       }
       if (steer.reason === "transcript_commit_wait_unsupported") {
+        if (!params.callDurableGateway) {
+          throw new Error("The target cannot accept restart-durable steering from this caller.");
+        }
         // Capability rejection precedes injection, so the same input can safely queue once.
-        return { durableSteerFallback: true };
+        return { callGateway: params.callDurableGateway };
       }
       fallbackSessionKey = ownChild
         ? undefined
@@ -338,10 +342,7 @@ function resolveSendMutationGuards(
 }
 
 export async function startSessionsSendAgentRun(
-  params: SessionsSendDeliveryParams & {
-    fallbackSessionKey?: string;
-    durableSteerFallback?: true;
-  },
+  params: SessionsSendDeliveryParams & { fallbackSessionKey?: string },
 ): Promise<SessionsSendStart> {
   const { fallbackSessionKey } = params;
   let fallback:
@@ -367,13 +368,7 @@ export async function startSessionsSendAgentRun(
       : undefined;
     const assertSendCurrent = fallback?.assertCurrent ?? params.assertSendCurrent;
     assertSendCurrent?.();
-    const callGateway = params.durableSteerFallback
-      ? params.callDurableGateway
-      : (fallback?.callGateway ?? params.callGateway);
-    if (!callGateway) {
-      throw new Error("The target cannot accept restart-durable steering from this caller.");
-    }
-    const responsePromise = callGateway<{
+    const responsePromise = (fallback?.callGateway ?? params.callGateway)<{
       runId: string;
       admissionPending?: boolean;
     }>({

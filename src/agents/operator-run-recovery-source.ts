@@ -61,9 +61,6 @@ export function createRestartRecoveryOperatorSource(
   params: OperatorInputRecoverySourceParams & { inputProvenance?: InputProvenance },
 ): RestartRecoveryOperatorSource | undefined {
   const { entry, sessionKey } = params;
-  if (!params.authority) {
-    return undefined;
-  }
   const requesterSettle =
     params.inputProvenance?.kind === "inter_session" &&
     params.inputProvenance.sourceTool === "subagent_settle" &&
@@ -73,7 +70,6 @@ export function createRestartRecoveryOperatorSource(
   // Dashboard roots link to main for grouping; only execution lineage excludes
   // recovery. Treating parentSessionKey as delegation strips real operator turns.
   if (
-    entry.incognito ||
     entry.spawnedBy ||
     entry.subagentRole ||
     (entry.spawnDepth ?? 0) > 0 ||

@@ -21,7 +21,6 @@ import {
   scheduleStoredChatOutboxDrain,
 } from "./chat-outbox-drain.ts";
 import { chatOutboxOwner } from "./chat-outbox-owner.ts";
-import { getChatPendingInputs } from "./chat-pending-inputs.ts";
 import { chatProviderReviewRow } from "./chat-provider-review.ts";
 import { readQueuedMessageById, updateQueuedMessage } from "./chat-queue.ts";
 import type { ChatHost } from "./chat-send-contract.ts";
@@ -51,9 +50,9 @@ function hasUncertainChatDelivery(entry: ChatQueueItem): boolean {
 const resetRetryState = (
   entry: ChatQueueItem,
   sendState: ChatQueueItem["sendState"],
-  uncertain = hasUncertainChatDelivery(entry),
 ): ChatQueueItem => {
   // An ID-less post-clear review barrier has no transport attempt to preserve.
+  const uncertain = hasUncertainChatDelivery(entry);
   return {
     ...entry,
     // Local payload failure cannot erase an uncertain transport attempt. Keep its
@@ -64,7 +63,7 @@ const resetRetryState = (
     sendError: entry.sendState === "failed" ? entry.sendError : undefined,
     sendRequestStartedAtMs: uncertain ? entry.sendRequestStartedAtMs : undefined,
     sendRunId:
-      !uncertain && entry.sendState === "failed" && entry.queueMode !== "steer" && !entry.intent
+      entry.sendState === "failed" && entry.queueMode !== "steer" && !entry.intent
         ? generateUUID()
         : entry.sendRunId,
     sendState: uncertain ? "unconfirmed" : sendState,
@@ -192,17 +191,7 @@ export async function retryQueuedChatMessage(
     return;
   }
   const retriesFailedDelivery = item?.sendState === "failed" && !item.localCommandName;
-  const pendingInputs = getChatPendingInputs(host);
-  const retriesInterrupted = Boolean(
-    item &&
-    pendingInputs &&
-    (!item.sessionId || item.sessionId === pendingInputs.sessionId) &&
-    pendingInputs.page.items.some(
-      (input) => input.state === "interrupted" && input.runId === item.sendRunId,
-    ),
-  );
-  const retriesUnconfirmed =
-    item !== undefined && (hasUncertainChatDelivery(item) || retriesInterrupted);
+  const retriesUnconfirmed = item !== undefined && hasUncertainChatDelivery(item);
   if (isQueuedMessageBeingEdited(host, id)) {
     setChatError(host, QUEUED_MESSAGE_RETRY_CONFLICT_ERROR);
     return;
@@ -257,7 +246,7 @@ export async function retryQueuedChatMessage(
     }
   }
   const retry = updateQueuedMessage(host, id, (entry) =>
-    resetRetryState(entry, reconnectSafeQueuedSendState(host), retriesUnconfirmed),
+    resetRetryState(entry, reconnectSafeQueuedSendState(host)),
   );
   if (!retry) {
     setChatError(host, OFFLINE_QUEUE_STORAGE_ERROR);

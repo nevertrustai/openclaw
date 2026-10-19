@@ -1,4 +1,3 @@
-import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   CHAT_INPUT_RECEIPT_MAX_RUN_IDS,
   CHAT_INPUT_RUN_ID_MAX_CHARS,
@@ -8,7 +7,7 @@ import type {
   ChatPendingInputsPage,
 } from "../../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import { t } from "../../i18n/index.ts";
-import type { ChatItem, ChatQueueItem, ChatQueueDisplayItem } from "../../lib/chat/chat-types.ts";
+import type { ChatItem, ChatQueueDisplayItem } from "../../lib/chat/chat-types.ts";
 import { findChatSubmissionMessage } from "../../lib/chat/history-message-identity.ts";
 import { extractText } from "../../lib/chat/message-extract.ts";
 import { normalizeMessage } from "../../lib/chat/message-normalizer.ts";
@@ -91,7 +90,6 @@ export function buildPendingInputQueueItems(
 export function buildPendingInputItems(
   inputs: ChatPendingInputsPage["items"],
   searchQuery?: string,
-  browserInputs: readonly ChatQueueItem[] = [],
   workspaceSyncPendingRunIds: readonly string[] = [],
   workerSetupPending = false,
   messageRecovery?: ChatMessageRecovery,
@@ -105,45 +103,19 @@ export function buildPendingInputItems(
     ) {
       continue;
     }
-    const browserInput = input.runId
-      ? browserInputs.find((item) => item.sendRunId === input.runId)
-      : undefined;
-    const resubmitting =
-      browserInput?.sendState === "waiting-model" ||
-      browserInput?.sendState === "submitting" ||
-      browserInput?.sendState === "sending";
-    let pendingStatus: PendingInputStatus;
-    if (input.state === "queued") {
-      pendingStatus = "queued";
-      if (input.runId && (workerSetupPending || workspaceSyncPendingRunIds.includes(input.runId))) {
-        pendingStatus = workerSetupPending ? "waitingForWorkerSetup" : "waitingForWorkspaceSync";
-      }
-    } else {
-      pendingStatus =
-        input.state === "interrupted" && resubmitting
-          ? "resuming"
-          : input.state === "cancelled"
-            ? "cancelled"
-            : "interrupted";
+    let pendingStatus: PendingInputStatus =
+      input.state === "queued" || input.state === "cancelled" ? input.state : "interrupted";
+    if (
+      input.state === "queued" &&
+      input.runId &&
+      (workerSetupPending || workspaceSyncPendingRunIds.includes(input.runId))
+    ) {
+      pendingStatus = workerSetupPending ? "waitingForWorkerSetup" : "waitingForWorkspaceSync";
     }
-    const message = asOptionalRecord(input.message);
-    const displayMessage =
-      input.state === "interrupted" && browserInput && !resubmitting
-        ? {
-            ...message,
-            __openclaw: {
-              ...asOptionalRecord(message?.["__openclaw"]),
-              kind: "pending-send",
-              id: browserInput.id,
-              state: "unconfirmed",
-              ...(browserInput.sendError ? { error: browserInput.sendError } : {}),
-            },
-          }
-        : input.message;
     // Custody keeps submission correlation outside the message; use it for
     // presentation without inventing transcript or execution identity.
     items.push(
-      ...buildMessageItems([displayMessage], () =>
+      ...buildMessageItems([input.message], () =>
         input.runId ? `send:${input.runId}` : `pending-input:${input.id}`,
       ).flatMap((item) =>
         projectChatSystemNotice({ ...item, startsTurn: true }, undefined, {

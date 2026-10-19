@@ -1,7 +1,6 @@
 /* @vitest-environment jsdom */
 import { readSessionMessageIdentity } from "@openclaw/gateway-client/browser";
 import { expectDefined } from "@openclaw/normalization-core";
-import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { createEffect, createRoot, flush } from "solid-js";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type {
@@ -38,7 +37,6 @@ import { projectChatRun } from "./chat-run-projection.ts";
 import { retireDeliveredQueuedUserTurn } from "./chat-send-support.ts";
 import { handlePageGatewayEvent } from "./chat-state-events.ts";
 import { buildChatItems } from "./chat-thread-build.ts";
-import { readPendingSendStatus } from "./chat-thread-items.ts";
 import { resetChatThreadState } from "./chat-thread.ts";
 import { listStoredChatOutboxes, loadChatComposerState } from "./composer-persistence.ts";
 import {
@@ -154,49 +152,10 @@ describe("server-owned pending input display", () => {
     );
   });
 
-  it.each([
-    "held",
-    "failed",
-    "waiting-reconnect",
-    "waiting-idle",
-    "waiting-model",
-    "submitting",
-    "sending",
-  ] as const)("describes interrupted input with a %s browser owner accurately", (sendState) => {
-    const approved = { role: "user", content: "Approved input" };
-    const items = buildPendingInputItems(
-      [{ ...input, state: "interrupted", message: approved }],
-      undefined,
-      [
-        {
-          id: "retained-input",
-          text: "Retained input",
-          createdAt: 1,
-          sendRunId: input.runId,
-          sendState,
-        },
-      ],
-    );
-    expect(items.filter((item) => item.kind === "notice").map((item) => item.text)).toEqual([
-      sendState === "waiting-model" || sendState === "submitting" || sendState === "sending"
-        ? "Interrupted by a Gateway restart. This saved message will resume when the session is ready."
-        : "Interrupted before the agent started it. If it does not resume, retry it or copy it and send again.",
-    ]);
-    const message = items.find((item) => item.kind === "message");
-    expect(message?.kind === "message" && message.message).toMatchObject(approved);
-    if (message?.kind === "message") {
-      expect(readPendingSendStatus(message.message)).toEqual(
-        sendState === "waiting-model" || sendState === "submitting" || sendState === "sending"
-          ? null
-          : { id: "retained-input", state: "unconfirmed" },
-      );
-    }
-  });
-
   it("shows a durable receipt while an accepted input waits for workspace sync", () => {
     const queued = { ...input, state: "queued" as const };
 
-    const items = buildPendingInputItems([queued], undefined, [], ["run-queued"]);
+    const items = buildPendingInputItems([queued], undefined, ["run-queued"]);
 
     expect(items).toEqual(
       expect.arrayContaining([
@@ -214,12 +173,12 @@ describe("server-owned pending input display", () => {
       state: "interrupted",
       runId: "run-queued",
       notice:
-        "Interrupted before the agent started it. If it does not resume, retry it or copy it and send again.",
+        "Interrupted before the agent started it. If it does not resume, copy it and send again.",
     },
   ] as const)(
     "keeps $state custody out of the worker-setup notice without eligible execution",
     ({ state, runId, notice }) => {
-      const items = buildPendingInputItems([{ ...input, state, runId }], undefined, [], [], true);
+      const items = buildPendingInputItems([{ ...input, state, runId }], undefined, [], true);
 
       expect(items.filter((item) => item.kind === "notice").map((item) => item.text)).toEqual(
         notice ? [notice] : [],
@@ -918,30 +877,17 @@ describe("server-owned pending input display", () => {
         queue: host.chatQueue,
       });
       expect(items.filter((item) => item.kind === "group" && item.role === "user")).toHaveLength(1);
-      const group = expectDefined(
-        items.find((item) => item.kind === "group" && item.role === "user"),
-        "accepted input group",
+      expect(items).toContainEqual(
+        expect.objectContaining({
+          kind: "group",
+          role: "user",
+          messages: [expect.objectContaining({ message })],
+        }),
       );
-      if (group.kind !== "group") {
-        throw new Error("Expected accepted input group");
-      }
-      expect(group.messages).toHaveLength(1);
-      const displayed = group.messages[0]!.message;
-      const approved = expectDefined(asOptionalRecord(message), "accepted input message");
-      expect(displayed).toEqual({
-        ...approved,
-        __openclaw: {
-          ...asOptionalRecord(approved["__openclaw"]),
-          id: "outbox-1",
-          kind: "pending-send",
-          state: "unconfirmed",
-        },
-      });
-      expect(readPendingSendStatus(displayed)).toEqual({ id: "outbox-1", state: "unconfirmed" });
       expect(items).toContainEqual(
         expect.objectContaining({
           kind: "notice",
-          text: "Interrupted before the agent started it. If it does not resume, retry it or copy it and send again.",
+          text: "Interrupted before the agent started it. If it does not resume, copy it and send again.",
         }),
       );
       expect(host.request.mock.calls.some(([method]) => method === "chat.send")).toBe(false);

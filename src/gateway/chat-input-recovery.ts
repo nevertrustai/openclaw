@@ -1,42 +1,18 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { GatewayClientInfo } from "../../packages/gateway-protocol/src/client-info.js";
+import { readSessionEntryReadOnlyInWorker } from "../config/sessions/session-entry-read-runtime.js";
 import { MEDIA_ONLY_USER_TEXT } from "../sessions/user-turn-media.js";
-import type { PersistedUserTurnMessage } from "../sessions/user-turn-transcript.types.js";
 import { extractTextFromChatContent } from "../shared/chat-content.js";
-import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import {
+  chatInputRecoveryAdmission,
+  type ChatInputRecoveryTarget,
+} from "./chat-input-recovery-source.js";
 import type { GatewayMethodRegistry } from "./methods/registry.js";
+import { decodeGatewayOperatorRecoverySource } from "./operator-run-recovery-source.js";
+import { restoreGatewayOperatorSource } from "./operator-run-recovery.js";
+import { dispatchGatewayRequestInProcess } from "./server-in-process-dispatch.js";
 import type { GatewayRequestContext } from "./server-methods/types.js";
-
-export const CHAT_INPUT_RECOVERY_MAX_AGE_MS = 24 * 60 * 60_000;
-
-export type ChatInputRecoveryTarget = {
-  agentId: string;
-  storePath: string;
-  sessionKey: string;
-  sessionId: string;
-  inputId: string;
-  runId: string;
-};
-
-type ChatInputRecoveryAdmission = {
-  target: ChatInputRecoveryTarget;
-  message: PersistedUserTurnMessage;
-  requestFingerprint: string;
-  clientInfo?: GatewayClientInfo;
-  suppressCommandInterpretation: boolean;
-};
-const admission = resolveGlobalSingleton(
-  Symbol.for("openclaw.chatInputRecoveryAdmission"),
-  () => new AsyncLocalStorage<ChatInputRecoveryAdmission>(),
-);
-
-export function readChatInputRecoveryAdmission(
-  runId: string,
-): ChatInputRecoveryAdmission | undefined {
-  const current = admission.getStore();
-  return current?.target.runId === runId ? current : undefined;
-}
+import { createSyntheticPluginRuntimeClient } from "./server-plugin-runtime-client.js";
 
 /** Re-enter chat admission with exact durable custody and current operator authority. */
 export async function resumeChatInput(
@@ -45,42 +21,12 @@ export async function resumeChatInput(
   options: { signal: AbortSignal; assertCurrent: () => void },
   methodRegistry?: GatewayMethodRegistry,
 ): Promise<void> {
-  const [
-    { readSessionEntryReadOnlyInWorker },
-    { readPendingInputSource },
-    { parseSessionPendingInputMessage },
-    { restoreGatewayOperatorSource },
-    { decodeGatewayOperatorRecoverySource },
-    { dispatchGatewayRequestInProcess },
-    { createSyntheticPluginRuntimeClient },
-  ] = await Promise.all([
-    import("../config/sessions/session-entry-read-runtime.js"),
-    import("../config/sessions/session-pending-input-source.js"),
-    import("../config/sessions/session-pending-input-value.js"),
-    import("./operator-run-recovery.js"),
-    import("./operator-run-recovery-source.js"),
-    import("./server-in-process-dispatch.js"),
-    import("./server-plugin-runtime-client.js"),
-  ]);
   const assertCurrent = () => {
     options.signal.throwIfAborted();
     options.assertCurrent();
   };
   assertCurrent();
-  const retained = await readPendingInputSource(target, `${target.runId}:user`, true);
-  assertCurrent();
-  const row = retained?.snapshot.pending;
-  if (!retained?.snapshot.current || !row || row.consumed_event_id != null) {
-    return;
-  }
-  if (
-    row.state !== "interrupted" ||
-    row.input_id !== target.inputId ||
-    row.run_id !== target.runId
-  ) {
-    return;
-  }
-  const message = parseSessionPendingInputMessage(row.message_json);
+  const { message, requestHash } = target;
   const metadata = message["__openclaw"]?.chatInputRecovery;
   if (!isRecord(metadata) || metadata.version !== 1 || !isRecord(metadata.request)) {
     throw new Error("Interrupted chat input has no resumable operator source.");
@@ -92,21 +38,12 @@ export async function resumeChatInput(
     source.sessionKey !== target.sessionKey ||
     source.sessionId !== target.sessionId ||
     source.sourceRunId !== target.runId ||
-    !row.request_hash.startsWith("request:")
+    !requestHash.startsWith("request:")
   ) {
     throw new Error("Interrupted chat input does not match its original admission.");
   }
-  const assertAge = () => {
-    if (Date.now() - row.accepted_at > CHAT_INPUT_RECOVERY_MAX_AGE_MS) {
-      throw new Error("Interrupted chat input is older than the automatic recovery window.");
-    }
-  };
   const checkSource = async () => {
-    assertCurrent();
-    retained.assertCurrent();
-    assertAge();
     const entry = await readSessionEntryReadOnlyInWorker(target, assertCurrent);
-    assertCurrent();
     if (
       !entry ||
       entry.archivedAt ||
@@ -124,31 +61,23 @@ export async function resumeChatInput(
     prepareCurrent: checkSource,
   });
   try {
-    let accepted = false;
-    const guard = () => {
-      assertCurrent();
-      retained.assertCurrent();
-      if (!accepted) {
-        assertAge();
-      }
-      restored.authority.assertCurrent();
-    };
+    const guard = restored.authority.assertCurrent;
     const client = createSyntheticPluginRuntimeClient({
       authenticatedUserProfile: restored.authenticatedUserProfile,
       operatorRoleActor: { kind: "operator", profileId: restored.authority.profileId },
       operatorRunAuthority: restored.authority,
       scopes: [...restored.authority.scopes],
     });
+    if (isRecord(metadata.clientInfo)) {
+      client.connect.client = metadata.clientInfo as GatewayClientInfo; // SAFETY: Stored by chat admission.
+    }
     const text = extractTextFromChatContent(message.content, { joinWith: "\n" }) ?? "";
     guard();
-    await admission.run(
+    await chatInputRecoveryAdmission.run(
       {
         target,
         message,
-        requestFingerprint: row.request_hash.slice("request:".length),
-        clientInfo: isRecord(metadata.clientInfo)
-          ? (metadata.clientInfo as GatewayClientInfo) // SAFETY: Stored by chat admission.
-          : undefined,
+        requestFingerprint: requestHash.slice("request:".length),
         suppressCommandInterpretation: metadata.suppressCommandInterpretation === true,
       },
       () =>
@@ -166,7 +95,6 @@ export async function resumeChatInput(
             context,
             methodRegistry,
             signal: options.signal,
-            prepareDispatchCurrent: checkSource,
             assertPreparationCurrent: guard,
             sessionMutationCommitGuard: guard,
             hasCurrentClientAuthority: () => {
@@ -176,7 +104,6 @@ export async function resumeChatInput(
           },
         ),
     );
-    accepted = true;
   } finally {
     restored.release();
   }
