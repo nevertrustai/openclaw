@@ -344,6 +344,7 @@ export function createGatewayInstanceRuntime(
         return await agentTurns.dispatch<T>(payload, {
           controllerInput: dispatchOptions.controllerInput,
           assertAdmissionCurrent: assertRecoveryCurrent,
+          executionSource: dispatchOptions.executionSource,
           prepareDispatchCurrent: dispatchOptions.prepareDispatchCurrent,
           expectFinal: dispatchOptions.expectFinal,
           onAccepted: dispatchOptions.onAccepted,

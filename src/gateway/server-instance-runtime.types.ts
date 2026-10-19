@@ -2,6 +2,7 @@ import type { AgentWaitParams } from "../../packages/gateway-protocol/src/index.
 import type { AdmittedRunOperatorAuthority } from "../agents/admitted-run-context.js";
 import type { RuntimeContextFragment } from "../agents/internal-runtime-context.js";
 import type { SubagentCompletionToolHandoffRegistration } from "../agents/subagents/announce/subagent-announce-handoff.js";
+import type { SessionSourceAssertion } from "../config/sessions/session-source-authority.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { GatewayNativeApprovalRuntime } from "../infra/approval-gateway-runtime.types.js";
 import type { ChannelApprovalKind } from "../infra/approval-types.js";
@@ -24,6 +25,8 @@ export type GatewayInstanceAgentDispatchOptions = {
 
   restartRecoveryRequesterTarget?: import("./operator-run-recovery.js").OperatorRecoveryTarget;
   assertAdmissionCurrent?: () => void;
+  /** Live source permission retained by accepted execution, independently of its admission claim. */
+  executionSource?: SessionSourceAssertion;
   /** Refresh source facts immediately before dispatch; the accepted turn owns execution. */
   prepareDispatchCurrent?: () => Promise<void>;
   allowModelOverride?: boolean;
