@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { gatewayAuthTokenCommand } from "./gateway-auth-token.js";
 
@@ -44,97 +44,95 @@ async function expectRefusal(message: string, env: NodeJS.ProcessEnv = {}) {
   expect(runtime.writeStdout).not.toHaveBeenCalled();
 }
 
-describe("gatewayAuthTokenCommand", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    setConfig(tokenConfig);
-    setResolvedConfig({ gateway: { auth: { mode: "token", token: "resolved-value" } } });
+beforeEach(() => {
+  vi.clearAllMocks();
+  setConfig(tokenConfig);
+  setResolvedConfig({ gateway: { auth: { mode: "token", token: "resolved-value" } } });
+});
+
+it("prints only the resolved token for an interactive operator", async () => {
+  const env = { OPENCLAW_GATEWAY_TOKEN: "environment-value" };
+
+  await gatewayAuthTokenCommand(runtime, { env, interactive: true });
+
+  expect(mocks.resolveCommandSecretRefsViaGateway).toHaveBeenCalledWith({
+    config: tokenConfig,
+    commandName: "gateway auth-token",
+    targetIds: new Set(["gateway.auth.token"]),
+    mode: "enforce_resolved",
+    allowedPaths: new Set(["gateway.auth.token"]),
   });
+  expect(runtime.writeStdout).toHaveBeenCalledWith("resolved-value\n");
+  expect(runtime.log).not.toHaveBeenCalled();
+  expect(runtime.error).not.toHaveBeenCalled();
+});
 
-  it("prints only the resolved token for an interactive operator", async () => {
-    const env = { OPENCLAW_GATEWAY_TOKEN: "environment-value" };
+it("diagnoses a redaction marker returned by an older Gateway instead of revealing it", async () => {
+  setResolvedConfig({ gateway: { auth: { mode: "token", token: "__OPENCLAW_REDACTED__" } } });
+  await expect(gatewayAuthTokenCommand(runtime, { env: {}, interactive: true })).rejects.toThrow(
+    "openclaw doctor --fix",
+  );
+  expect(runtime.writeStdout).not.toHaveBeenCalled();
+});
 
-    await gatewayAuthTokenCommand(runtime, { env, interactive: true });
+it("refuses non-interactive output before reading config or secrets", async () => {
+  await expect(gatewayAuthTokenCommand(runtime, { interactive: false })).rejects.toThrow(
+    "outside an interactive terminal",
+  );
 
-    expect(mocks.resolveCommandSecretRefsViaGateway).toHaveBeenCalledWith({
-      config: tokenConfig,
-      commandName: "gateway auth-token",
-      targetIds: new Set(["gateway.auth.token"]),
-      mode: "enforce_resolved",
-      allowedPaths: new Set(["gateway.auth.token"]),
-    });
-    expect(runtime.writeStdout).toHaveBeenCalledWith("resolved-value\n");
-    expect(runtime.log).not.toHaveBeenCalled();
-    expect(runtime.error).not.toHaveBeenCalled();
+  expect(mocks.readConfigFileSnapshot).not.toHaveBeenCalled();
+  expect(mocks.resolveCommandSecretRefsViaGateway).not.toHaveBeenCalled();
+  expect(runtime.writeStdout).not.toHaveBeenCalled();
+});
+
+it("fails actionably when no configured token is available", async () => {
+  setConfig({ gateway: { auth: { mode: "token" } } });
+  setResolvedConfig({ gateway: { auth: { mode: "token" } } });
+
+  await expect(gatewayAuthTokenCommand(runtime, { env: {}, interactive: true })).rejects.toThrow(
+    "openclaw doctor --generate-gateway-token",
+  );
+
+  expect(runtime.writeStdout).not.toHaveBeenCalled();
+});
+
+it("does not fall back to ambient env when the configured SecretRef is unresolved", async () => {
+  mocks.resolveCommandSecretRefsViaGateway.mockRejectedValue(
+    new Error("gateway.auth.token SecretRef is unresolved"),
+  );
+
+  await expect(
+    gatewayAuthTokenCommand(runtime, {
+      interactive: true,
+      env: { OPENCLAW_GATEWAY_TOKEN: "ambient-fallback" },
+    }),
+  ).rejects.toThrow("gateway.auth.token SecretRef is unresolved");
+
+  expect(runtime.writeStdout).not.toHaveBeenCalled();
+});
+
+it("refuses an inactive token when auth mode is trusted-proxy", async () => {
+  setConfig({
+    gateway: {
+      auth: { mode: "trusted-proxy", token: "stale-token", password: "active-password" },
+    },
   });
+  await expectRefusal("Gateway auth mode is trusted-proxy");
+});
 
-  it("diagnoses a redaction marker returned by an older Gateway instead of revealing it", async () => {
-    setResolvedConfig({ gateway: { auth: { mode: "token", token: "__OPENCLAW_REDACTED__" } } });
-    await expect(gatewayAuthTokenCommand(runtime, { env: {}, interactive: true })).rejects.toThrow(
-      "openclaw doctor --fix",
-    );
-    expect(runtime.writeStdout).not.toHaveBeenCalled();
+it("requires an explicit mode when token and password are both configured", async () => {
+  setConfig({ gateway: { auth: { token: "candidate-token", password: "candidate-password" } } });
+  await expectRefusal("gateway.auth.mode");
+});
+
+it("does not reveal a configured token when an environment password selects password auth", async () => {
+  setConfig({ gateway: { auth: { token: "inactive-token" } } });
+  await expectRefusal("Gateway auth mode is password", {
+    OPENCLAW_GATEWAY_PASSWORD: "active-password",
   });
+});
 
-  it("refuses non-interactive output before reading config or secrets", async () => {
-    await expect(gatewayAuthTokenCommand(runtime, { interactive: false })).rejects.toThrow(
-      "outside an interactive terminal",
-    );
-
-    expect(mocks.readConfigFileSnapshot).not.toHaveBeenCalled();
-    expect(mocks.resolveCommandSecretRefsViaGateway).not.toHaveBeenCalled();
-    expect(runtime.writeStdout).not.toHaveBeenCalled();
-  });
-
-  it("fails actionably when no configured token is available", async () => {
-    setConfig({ gateway: { auth: { mode: "token" } } });
-    setResolvedConfig({ gateway: { auth: { mode: "token" } } });
-
-    await expect(gatewayAuthTokenCommand(runtime, { env: {}, interactive: true })).rejects.toThrow(
-      "openclaw doctor --generate-gateway-token",
-    );
-
-    expect(runtime.writeStdout).not.toHaveBeenCalled();
-  });
-
-  it("does not fall back to ambient env when the configured SecretRef is unresolved", async () => {
-    mocks.resolveCommandSecretRefsViaGateway.mockRejectedValue(
-      new Error("gateway.auth.token SecretRef is unresolved"),
-    );
-
-    await expect(
-      gatewayAuthTokenCommand(runtime, {
-        interactive: true,
-        env: { OPENCLAW_GATEWAY_TOKEN: "ambient-fallback" },
-      }),
-    ).rejects.toThrow("gateway.auth.token SecretRef is unresolved");
-
-    expect(runtime.writeStdout).not.toHaveBeenCalled();
-  });
-
-  it("refuses an inactive token when auth mode is trusted-proxy", async () => {
-    setConfig({
-      gateway: {
-        auth: { mode: "trusted-proxy", token: "stale-token", password: "active-password" },
-      },
-    });
-    await expectRefusal("Gateway auth mode is trusted-proxy");
-  });
-
-  it("requires an explicit mode when token and password are both configured", async () => {
-    setConfig({ gateway: { auth: { token: "candidate-token", password: "candidate-password" } } });
-    await expectRefusal("gateway.auth.mode");
-  });
-
-  it("does not reveal a configured token when an environment password selects password auth", async () => {
-    setConfig({ gateway: { auth: { token: "inactive-token" } } });
-    await expectRefusal("Gateway auth mode is password", {
-      OPENCLAW_GATEWAY_PASSWORD: "active-password",
-    });
-  });
-
-  it("refuses to recover credentials from a remote-client config", async () => {
-    setConfig({ gateway: { mode: "remote", auth: { mode: "token", token: "stale-local-token" } } });
-    await expectRefusal("must run on the Gateway host");
-  });
+it("refuses to recover credentials from a remote-client config", async () => {
+  setConfig({ gateway: { mode: "remote", auth: { mode: "token", token: "stale-local-token" } } });
+  await expectRefusal("must run on the Gateway host");
 });

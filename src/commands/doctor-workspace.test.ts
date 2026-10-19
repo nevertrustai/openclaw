@@ -1,16 +1,13 @@
-// Doctor workspace tests cover workspace path checks, repairs, and user-facing notes.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { withTestDir } from "../test-helpers/temp-dir.js";
 import { createDoctorPrompter, type DoctorPrompter } from "./doctor-prompter.js";
+import { createTestRuntime } from "./test-runtime-config-helpers.js";
 
 const note = vi.hoisted(() => vi.fn());
-
-vi.mock("../../packages/terminal-core/src/note.js", () => ({
-  note,
-}));
+vi.mock("../../packages/terminal-core/src/note.js", () => ({ note }));
 
 import {
   collectWorkspaceBackupTip,
@@ -22,36 +19,21 @@ import {
 const WORKSPACE_BACKUP_TIP =
   "- Tip: back up the agent workspace in a private git repo; keep ~/.openclaw out of git (credentials, sessions). Details: /concepts/agent-workspace#git-backup-recommended-private";
 
-describe("workspace backup tip", () => {
-  it("recognizes direct, deeply nested, and symlinked Git workspaces without duplicate tips", async () => {
-    await withTestDir({ prefix: "openclaw-doctor-workspace-git-" }, async (tempDir) => {
-      const repoRoot = path.join(tempDir, "repo");
-      const nestedWorkspace = path.join(repoRoot, "agents", "direct");
-      const deeplyNestedWorkspace = path.join(
-        repoRoot,
-        ...Array.from({ length: 12 }, (_, index) => `workspace-level-${index}`),
-      );
-      const linkedWorkspace = path.join(tempDir, "linked-workspace");
-      const outsideWorkspace = path.parse(tempDir).root;
-      const missingWorkspace = path.join(tempDir, "missing");
-      await fs.mkdir(path.join(repoRoot, ".git"), { recursive: true });
-      await fs.mkdir(nestedWorkspace, { recursive: true });
-      await fs.mkdir(deeplyNestedWorkspace, { recursive: true });
-      await fs.symlink(
-        nestedWorkspace,
-        linkedWorkspace,
-        process.platform === "win32" ? "junction" : "dir",
-      );
+it("recognizes direct, deeply nested, and symlinked Git workspaces without duplicate tips", async () => {
+  await withTestDir({ prefix: "openclaw-doctor-workspace-git-" }, async (tempDir) => {
+    const repoRoot = path.join(tempDir, "repo");
+    const nested = path.join(repoRoot, "agents", "direct");
+    const deep = path.join(repoRoot, ...Array<string>(12).fill("nested"));
+    const linked = path.join(tempDir, "linked-workspace");
+    await fs.mkdir(path.join(repoRoot, ".git"), { recursive: true });
+    await fs.mkdir(nested, { recursive: true });
+    await fs.mkdir(deep, { recursive: true });
+    await fs.symlink(nested, linked, process.platform === "win32" ? "junction" : "dir");
 
-      expect(collectWorkspaceBackupTip(repoRoot)).toBeNull();
-      expect(
-        [nestedWorkspace, deeplyNestedWorkspace, linkedWorkspace]
-          .map((workspaceDir) => collectWorkspaceBackupTip(workspaceDir))
-          .filter((tip) => tip !== null),
-      ).toEqual([]);
-      expect(collectWorkspaceBackupTip(outsideWorkspace)).toBe(WORKSPACE_BACKUP_TIP);
-      expect(collectWorkspaceBackupTip(missingWorkspace)).toBeNull();
-    });
+    const tips = [repoRoot, nested, deep, linked].map(collectWorkspaceBackupTip);
+    expect(tips).toEqual([null, null, null, null]);
+    expect(collectWorkspaceBackupTip(path.parse(tempDir).root)).toBe(WORKSPACE_BACKUP_TIP);
+    expect(collectWorkspaceBackupTip(path.join(tempDir, "missing"))).toBeNull();
   });
 });
 
@@ -75,10 +57,7 @@ describe("root memory repair", () => {
     canonicalPath = path.join(tmpDir, "MEMORY.md");
     legacyPath = path.join(tmpDir, "memory.md");
     scope = { agentId: "main", workspaceDir: tmpDir, labelAgent: false };
-    prompter = createDoctorPrompter({
-      runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
-      options: { yes: true },
-    });
+    prompter = createDoctorPrompter({ runtime: createTestRuntime(), options: { yes: true } });
     vi.spyOn(prompter, "confirmRuntimeRepair");
     note.mockClear();
   });
@@ -229,24 +208,18 @@ describe("root memory repair", () => {
     expect(canonical).toContain("# Canonical 合法 😀 �");
     expect(canonical).toContain("# Legacy 旧版 �");
     await expectPathMissing(legacyPath);
-    expect(note).toHaveBeenCalledTimes(1);
-    const repairNote = note.mock.calls[0];
-    const repairMessage = String(repairNote?.[0] ?? "");
-    const repairLines = repairMessage.split("\n");
-    expect(repairLines[0]).toBe("Workspace memory root merged:");
-    expect(repairLines).toEqual(
-      expect.arrayContaining([
+    const archive = await expectArchivedLegacyMemory();
+    expect(note).toHaveBeenCalledExactlyOnceWith(
+      [
+        "Workspace memory root merged:",
         `- current: ${canonicalPath}`,
+        `- backup: ${archive}`,
         `- merged legacy content from: ${legacyPath}`,
         `- removed legacy file: ${legacyPath}`,
-      ]),
+      ].join("\n"),
+      "Doctor changes",
     );
-    expect(repairNote?.[1]).toBe("Doctor changes");
-    const archiveLine = repairLines.find((line) => line.startsWith("- backup: "));
-    expect(archiveLine).toBeDefined();
-    await expect(fs.readFile(archiveLine!.slice("- backup: ".length), "utf8")).resolves.toBe(
-      "# Legacy 旧版 �\n",
-    );
+    await expect(fs.readFile(archive, "utf8")).resolves.toBe("# Legacy 旧版 �\n");
   });
 
   it("follows a symlinked AGENTS.md while keeping its target bounded", async () => {
@@ -261,47 +234,39 @@ describe("root memory repair", () => {
     await expect(shouldSuggestMemorySystem(tmpDir)).resolves.toBe(true);
   });
 
-  it("reports a skipped repair when a root memory file cannot be read", async () => {
-    const targetFile = path.join(tmpDir, "canonical-target.md");
-    await fs.writeFile(targetFile, "# Canonical\n", "utf8");
-    await fs.symlink(targetFile, canonicalPath);
-    await fs.writeFile(legacyPath, "# Legacy\n", "utf8");
-    if (!(await hasDistinctRootMemoryFiles(tmpDir))) {
-      return;
-    }
-
-    await repair();
-    expectSkipped("a file could not be read");
-    await expect(fs.readFile(targetFile, "utf8")).resolves.toBe("# Canonical\n");
-    await expect(fs.readFile(legacyPath, "utf8")).resolves.toBe("# Legacy\n");
-  });
-
-  it.each(["canonical", "legacy"])(
-    "preserves both files when %s memory is oversized",
-    async (oversized) => {
-      const canonical = "# Canonical\n".repeat(oversized === "canonical" ? 1_000_000 : 1);
-      const legacy = "# Legacy\n".repeat(oversized === "legacy" ? 1_000_000 : 1);
-      if (!(await seedMemory(canonical, legacy))) {
+  it.each(["symlink", "oversized canonical", "oversized legacy", "archive failure"])(
+    "preserves memory when repair is blocked by %s",
+    async (failure) => {
+      const canonical = "# Canonical\n".repeat(failure === "oversized canonical" ? 1_000_000 : 1);
+      const legacy = "# Legacy\n".repeat(failure === "oversized legacy" ? 1_000_000 : 1);
+      const target =
+        failure === "symlink" ? path.join(tmpDir, "canonical-target.md") : canonicalPath;
+      await fs.writeFile(target, canonical);
+      if (failure === "symlink") {
+        await fs.symlink(target, canonicalPath);
+      }
+      await fs.writeFile(legacyPath, legacy);
+      if (!(await hasDistinctRootMemoryFiles(tmpDir))) {
         return;
       }
+      if (failure === "archive failure") {
+        vi.spyOn(fs, "rename").mockRejectedValueOnce(
+          Object.assign(new Error("cross-device rename"), { code: "EXDEV" }),
+        );
+      }
       await repair();
-      expectSkipped("a file exceeded the safe read limit");
-      await expectPathMissing(path.join(tmpDir, ".openclaw-repair"));
-      await expect(fs.readFile(canonicalPath, "utf8")).resolves.toBe(canonical);
+      expectSkipped(
+        failure === "symlink"
+          ? "a file could not be read"
+          : failure === "archive failure"
+            ? "legacy memory could not be archived atomically"
+            : "a file exceeded the safe read limit",
+      );
+      if (failure.startsWith("oversized")) {
+        await expectPathMissing(path.join(tmpDir, ".openclaw-repair"));
+      }
+      await expect(fs.readFile(target, "utf8")).resolves.toBe(canonical);
       await expect(fs.readFile(legacyPath, "utf8")).resolves.toBe(legacy);
     },
   );
-
-  it("skips without mutation when legacy memory cannot be archived atomically", async () => {
-    if (!(await seedMemory())) {
-      return;
-    }
-    vi.spyOn(fs, "rename").mockRejectedValueOnce(
-      Object.assign(new Error("cross-device rename"), { code: "EXDEV" }),
-    );
-    await repair();
-    expectSkipped("legacy memory could not be archived atomically");
-    await expect(fs.readFile(canonicalPath, "utf8")).resolves.toBe("# Canonical\n");
-    await expect(fs.readFile(legacyPath, "utf8")).resolves.toBe("# Legacy\n");
-  });
 });
