@@ -173,7 +173,7 @@ async function main() {
         throw new Error("Measurement requires an agent database of at least 2 GiB");
       }
       if (values["refresh-proof"]) {
-        admission.invalidateSqliteDatabaseCleanClose(databasePath);
+        admission.revokeSqliteDatabaseAdmissionsForPath(databasePath);
       }
       const gates: Array<Record<string, string | number | boolean>> = [];
       const unsubscribe = diagnostics.onInternalDiagnosticEvent(
