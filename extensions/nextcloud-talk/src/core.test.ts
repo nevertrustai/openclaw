@@ -13,23 +13,22 @@ import {
   verifyNextcloudTalkSignature as verifySignature,
 } from "./signature.js";
 
+function signedPayload(generate = generateSignature) {
+  const payload = { body: JSON.stringify({ hello: "world" }), secret: "secret-123" };
+  return { ...payload, ...generate(payload) };
+}
+const sessionRoute = (target: string) =>
+  resolveSessionRoute({ cfg: {}, agentId: "main", accountId: "acct-1", target });
+
 describe("nextcloud talk core", () => {
   it("marks ambiguous room-token session routes as best-effort", () => {
-    const route = resolveSessionRoute({
-      cfg: {},
-      agentId: "main",
-      accountId: "acct-1",
-      target: "nextcloud-talk:room-123",
-    });
+    const route = sessionRoute("nextcloud-talk:room-123");
 
     expect(route).toEqual({
       sessionKey: "agent:main:nextcloud-talk:group:room-123",
       baseSessionKey: "agent:main:nextcloud-talk:group:room-123",
       recipientSessionExact: false,
-      peer: {
-        kind: "group",
-        id: "room-123",
-      },
+      peer: { kind: "group", id: "room-123" },
       chatType: "group",
       from: "nextcloud-talk:room:room-123",
       to: "nextcloud-talk:room-123",
@@ -37,14 +36,7 @@ describe("nextcloud talk core", () => {
   });
 
   it("returns null when the target cannot be normalized to a room id", () => {
-    expect(
-      resolveSessionRoute({
-        cfg: {},
-        agentId: "main",
-        accountId: "acct-1",
-        target: "",
-      }),
-    ).toBeNull();
+    expect(sessionRoute("")).toBeNull();
   });
 
   it("normalizes and recognizes supported room target formats", () => {
@@ -67,16 +59,11 @@ describe("nextcloud talk core", () => {
   });
 
   it("verifies generated signatures and extracts normalized headers", () => {
-    const body = JSON.stringify({ hello: "world" });
-    const secret = "secret-123";
-    const generated = generateSignature({ body, secret });
-    const signed = { ...generated, body, secret };
+    const signed = signedPayload();
 
-    expect(generated.random).toMatch(/^[0-9a-f]{64}$/);
-    expect(generated.signature).toMatch(/^[0-9a-f]{64}$/);
+    expect(signed.random).toMatch(/^[0-9a-f]{64}$/);
+    expect(signed.signature).toMatch(/^[0-9a-f]{64}$/);
     expect(verifySignature(signed)).toBe(true);
-    expect(verifySignature({ ...signed, signature: "" })).toBe(false);
-    expect(verifySignature({ ...signed, signature: "deadbeef" })).toBe(false);
 
     expect(
       extractHeaders({
@@ -84,11 +71,7 @@ describe("nextcloud talk core", () => {
         "x-nextcloud-talk-random": ["rand", "ignored"],
         "x-nextcloud-talk-backend": ["backend", "ignored"],
       }),
-    ).toEqual({
-      signature: "sig",
-      random: "rand",
-      backend: "backend",
-    });
+    ).toEqual({ signature: "sig", random: "rand", backend: "backend" });
     expect(
       extractHeaders({
         "X-Nextcloud-Talk-Signature": "sig",
@@ -96,25 +79,14 @@ describe("nextcloud talk core", () => {
     ).toBeNull();
   });
 
-  it("rejects tampered bodies, wrong secrets, and tampered signatures", () => {
-    const body = JSON.stringify({ hello: "world" });
-    const secret = "secret-123";
-    const generated = generateSignature({ body, secret });
-    const signed = { ...generated, body, secret };
-
-    expect(
-      verifySignature({
-        ...signed,
-        body: JSON.stringify({ hello: "tampered" }),
-      }),
-    ).toBe(false);
-    expect(verifySignature({ ...signed, secret: "wrong-secret" })).toBe(false);
-    expect(
-      verifySignature({
-        ...signed,
-        signature: "a".repeat(generated.signature.length),
-      }),
-    ).toBe(false);
+  it.each<[string, Partial<Parameters<typeof verifySignature>[0]>]>([
+    ["empty signature", { signature: "" }],
+    ["short signature", { signature: "deadbeef" }],
+    ["tampered body", { body: JSON.stringify({ hello: "tampered" }) }],
+    ["wrong secret", { secret: "wrong-secret" }],
+    ["tampered signature", { signature: "a".repeat(64) }],
+  ])("rejects %s", (_label, tampered) => {
+    expect(verifySignature({ ...signedPayload(), ...tampered })).toBe(false);
   });
 
   it("still runs timingSafeEqual when the supplied signature length mismatches", async () => {
@@ -134,33 +106,16 @@ describe("nextcloud talk core", () => {
     });
 
     try {
-      const {
-        generateNextcloudTalkSignature: generateNextcloudTalkSignatureLocal,
-        verifyNextcloudTalkSignature: verifyNextcloudTalkSignatureLocal,
-      } = await import("./signature.js");
-      const body = JSON.stringify({ hello: "world" });
-      const generated = generateNextcloudTalkSignatureLocal({
-        body,
-        secret: "secret-123",
-      });
-      const shortSignature = generated.signature.slice(0, 12);
-
-      expect(
-        verifyNextcloudTalkSignatureLocal({
-          signature: shortSignature,
-          random: generated.random,
-          body,
-          secret: "secret-123",
-        }),
-      ).toBe(false);
+      const { generateNextcloudTalkSignature: generate, verifyNextcloudTalkSignature: verify } =
+        await import("./signature.js");
+      const signed = signedPayload(generate);
+      expect(verify({ ...signed, signature: signed.signature.slice(0, 12) })).toBe(false);
 
       expect(timingSafeEqualMock).toHaveBeenCalledOnce();
       const [leftBuffer, rightBuffer] = expectDefined(
         timingSafeEqualMock.mock.calls[0],
         "timingSafeEqual call",
       );
-      expect(Buffer.isBuffer(leftBuffer)).toBe(true);
-      expect(Buffer.isBuffer(rightBuffer)).toBe(true);
       if (!Buffer.isBuffer(leftBuffer) || !Buffer.isBuffer(rightBuffer)) {
         throw new TypeError("Expected timingSafeEqual to receive Buffer arguments");
       }

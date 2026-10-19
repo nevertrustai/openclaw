@@ -13,52 +13,39 @@ import { handleNextcloudTalkInbound } from "./inbound.js";
 import { setNextcloudTalkRuntime } from "./runtime.js";
 import type { CoreConfig } from "./types.js";
 
-const {
-  createChannelPairingControllerMock,
-  resolveAllowlistProviderRuntimeGroupPolicyMock,
-  resolveDefaultGroupPolicyMock,
-  warnMissingProviderGroupPolicyFallbackOnceMock,
-} = vi.hoisted(() => {
-  return {
-    createChannelPairingControllerMock: vi.fn(),
-    resolveAllowlistProviderRuntimeGroupPolicyMock: vi.fn(),
-    resolveDefaultGroupPolicyMock: vi.fn(),
-    warnMissingProviderGroupPolicyFallbackOnceMock: vi.fn(),
-  };
-});
-
-const sendMessageNextcloudTalkMock = vi.hoisted(() => vi.fn());
-const resolveNextcloudTalkRoomKindMock = vi.hoisted(() => vi.fn());
+const mocks = vi.hoisted(() => ({
+  pairing: vi.fn(),
+  groupPolicy: vi.fn(),
+  defaultPolicy: vi.fn(),
+  warn: vi.fn(),
+  send: vi.fn(),
+  roomKind: vi.fn(),
+}));
 
 vi.mock("../runtime-api.js", async () => {
   const actual = await vi.importActual<typeof import("../runtime-api.js")>("../runtime-api.js");
   return {
     ...actual,
-    createChannelPairingController: createChannelPairingControllerMock,
-    resolveAllowlistProviderRuntimeGroupPolicy: resolveAllowlistProviderRuntimeGroupPolicyMock,
-    resolveDefaultGroupPolicy: resolveDefaultGroupPolicyMock,
-    warnMissingProviderGroupPolicyFallbackOnce: warnMissingProviderGroupPolicyFallbackOnceMock,
+    createChannelPairingController: mocks.pairing,
+    resolveAllowlistProviderRuntimeGroupPolicy: mocks.groupPolicy,
+    resolveDefaultGroupPolicy: mocks.defaultPolicy,
+    warnMissingProviderGroupPolicyFallbackOnce: mocks.warn,
   };
 });
 
 vi.mock("./send.js", () => ({
-  sendMessageNextcloudTalk: sendMessageNextcloudTalkMock,
+  sendMessageNextcloudTalk: mocks.send,
 }));
 
 vi.mock("./room-info.js", async () => {
   const actual = await vi.importActual<typeof import("./room-info.js")>("./room-info.js");
   return {
     ...actual,
-    resolveNextcloudTalkRoomKind: resolveNextcloudTalkRoomKindMock,
+    resolveNextcloudTalkRoomKind: mocks.roomKind,
   };
 });
 
-function installRuntime(params?: {
-  buildMentionRegexes?: () => RegExp[];
-  hasControlCommand?: (body: string) => boolean;
-  matchesMentionPatterns?: (body: string, regexes: RegExp[]) => boolean;
-  shouldHandleTextCommands?: () => boolean;
-}) {
+function installRuntime(mentionRegexes: RegExp[] = []) {
   const runtime = {
     channel: {
       inbound: {
@@ -69,34 +56,43 @@ function installRuntime(params?: {
         readAllowFromStore: vi.fn(async () => []),
         upsertPairingRequest: vi.fn(async () => ({ code: "123456", created: true })),
       },
-      commands: {
-        shouldHandleTextCommands: params?.shouldHandleTextCommands ?? vi.fn(() => false),
-      },
-      text: {
-        hasControlCommand: params?.hasControlCommand ?? vi.fn(() => false),
-      },
+      commands: { shouldHandleTextCommands: vi.fn(() => false) },
+      text: { hasControlCommand: vi.fn(() => false) },
       mentions: {
-        buildMentionRegexes: params?.buildMentionRegexes ?? vi.fn(() => []),
-        matchesMentionPatterns: params?.matchesMentionPatterns ?? vi.fn(() => false),
+        buildMentionRegexes: vi.fn(() => mentionRegexes),
+        matchesMentionPatterns: vi.fn(() => false),
       },
     },
   };
   setNextcloudTalkRuntime(runtime as unknown as PluginRuntime);
+}
+
+function installCommandRuntime(
+  hasControlCommand: (body?: string) => boolean,
+  mentions: Partial<PluginRuntime["channel"]["mentions"]> = {},
+) {
+  const runtime = createPluginRuntimeMock({
+    channel: {
+      text: { hasControlCommand },
+      commands: { shouldHandleTextCommands: vi.fn(() => true) },
+      mentions: { buildMentionRegexes: vi.fn(() => [/@openclaw/i]), ...mentions },
+    },
+  });
+  setNextcloudTalkRuntime(runtime);
   return runtime;
 }
 
-function createAccount(
-  config: ResolvedNextcloudTalkAccount["config"] = {},
-): ResolvedNextcloudTalkAccount {
+function createAccount(config: ResolvedNextcloudTalkAccount["config"] = {}) {
   return createFixtureAccount({ config: { ...createFixtureAccount().config, ...config } });
 }
 
 function installPairingController(readStoreForDmPolicy = vi.fn(), issueChallenge = vi.fn()) {
-  createChannelPairingControllerMock.mockReturnValue({ readStoreForDmPolicy, issueChallenge });
+  mocks.pairing.mockReturnValue({ readStoreForDmPolicy, issueChallenge });
 }
 
 const defaultConfig = { channels: { "nextcloud-talk": {} } } as CoreConfig;
-function inbound(overrides: Partial<Parameters<typeof handleNextcloudTalkInbound>[0]> = {}) {
+type InboundOptions = Parameters<typeof handleNextcloudTalkInbound>[0];
+function inbound(overrides: Partial<InboundOptions> = {}) {
   return handleNextcloudTalkInbound({
     message: createMessage(),
     account: createAccount(),
@@ -105,13 +101,16 @@ function inbound(overrides: Partial<Parameters<typeof handleNextcloudTalkInbound
     ...overrides,
   });
 }
-function installAllowedRuntime() {
+async function allowedInbound(overrides: Partial<InboundOptions> = {}) {
   const runtime = createPluginRuntimeMock();
   setNextcloudTalkRuntime(runtime);
   installPairingController(vi.fn(async () => []));
-  return runtime;
+  await inbound({
+    account: createAccount({ dmPolicy: "allowlist", allowFrom: ["user-1"] }),
+    ...overrides,
+  });
+  return dispatched(runtime);
 }
-const allowedAccount = () => createAccount({ dmPolicy: "allowlist", allowFrom: ["user-1"] });
 function dispatched(runtime: ReturnType<typeof createPluginRuntimeMock>) {
   return expectDefined(
     vi.mocked(runtime.channel.inbound.dispatchReply).mock.calls[0]?.[0],
@@ -123,26 +122,13 @@ describe("nextcloud-talk inbound behavior", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     installRuntime();
-    resolveNextcloudTalkRoomKindMock.mockResolvedValue("direct");
-    resolveDefaultGroupPolicyMock.mockReturnValue("allowlist");
-    resolveAllowlistProviderRuntimeGroupPolicyMock.mockReturnValue({
+    mocks.roomKind.mockResolvedValue("direct");
+    mocks.defaultPolicy.mockReturnValue("allowlist");
+    mocks.groupPolicy.mockReturnValue({
       groupPolicy: "allowlist",
       providerMissingFallbackApplied: false,
     });
-    warnMissingProviderGroupPolicyFallbackOnceMock.mockReturnValue(undefined);
-  });
-
-  it("logs the drop when an inbound message has an empty body", async () => {
-    const runtime = createRuntimeSpies();
-    await inbound({
-      message: createMessage({ text: "", mediaType: "application/pdf" }),
-      runtime,
-    });
-
-    expect(runtime.log).toHaveBeenCalledWith(
-      "nextcloud-talk: drop empty message body (mediaType=application/pdf) target=user-1",
-    );
-    expect(sendMessageNextcloudTalkMock).not.toHaveBeenCalled();
+    mocks.warn.mockReturnValue(undefined);
   });
 
   it("issues a DM pairing challenge and sends the challenge text", async () => {
@@ -152,7 +138,7 @@ describe("nextcloud-talk inbound behavior", () => {
       },
     );
     installPairingController(vi.fn(), issueChallenge);
-    sendMessageNextcloudTalkMock.mockResolvedValue(undefined);
+    mocks.send.mockResolvedValue(undefined);
 
     const statusSink = vi.fn();
     await inbound({
@@ -160,16 +146,17 @@ describe("nextcloud-talk inbound behavior", () => {
       statusSink,
     });
 
-    expect(requireFirstMockArg(issueChallenge, "Nextcloud Talk pairing challenge")).toMatchObject({
-      senderId: "user-1",
-      senderIdLine: "Your Nextcloud user id: user-1",
-      meta: { name: "Alice" },
-    });
-    expect(sendMessageNextcloudTalkMock).toHaveBeenCalledExactlyOnceWith(
-      "room-1",
-      "Pair with code 123456",
-      { cfg: defaultConfig, accountId: "default" },
+    expect(requireFirstMockArg(issueChallenge, "Nextcloud Talk pairing challenge")).toEqual(
+      expect.objectContaining({
+        senderId: "user-1",
+        senderIdLine: "Your Nextcloud user id: user-1",
+        meta: { name: "Alice" },
+      }),
     );
+    expect(mocks.send).toHaveBeenCalledExactlyOnceWith("room-1", "Pair with code 123456", {
+      cfg: defaultConfig,
+      accountId: "default",
+    });
     expect(statusSink).toHaveBeenCalledWith({ lastInboundAt: 1_736_380_800_000 });
     const outboundStatus = statusSink.mock.calls
       .map(([status]) => status as { lastOutboundAt?: unknown })
@@ -178,86 +165,61 @@ describe("nextcloud-talk inbound behavior", () => {
     expect(outboundStatus?.lastOutboundAt).toBeGreaterThanOrEqual(1_736_380_800_000);
   });
 
-  it("drops unmentioned group traffic before dispatch", async () => {
-    installRuntime({
-      buildMentionRegexes: vi.fn(() => [/@openclaw/i]),
-      matchesMentionPatterns: vi.fn(() => false),
-    });
-    installPairingController();
-    resolveNextcloudTalkRoomKindMock.mockResolvedValue("group");
-    const runtime = createRuntimeSpies();
-
-    await inbound({
-      message: createMessage({
-        roomToken: "room-group",
-        roomName: "Ops",
-        isGroupChat: true,
-      }),
-      account: createAccount({ groupAllowFrom: ["user-1"] }),
-      runtime,
-    });
-
-    expect(sendMessageNextcloudTalkMock).not.toHaveBeenCalled();
-    expect(runtime.log).toHaveBeenCalledWith("nextcloud-talk: drop room room-group (no mention)");
-  });
-
   it.each([
-    ["plain", "/help"],
-    ["structured", JSON.stringify({ message: "/help", parameters: {} })],
-  ])(
-    "blocks %s group commands when room access allows chat but command access does not",
-    async (_label, text) => {
-      const buildMentionRegexes = vi.fn(() => [/@openclaw/i]);
-      const coreRuntime = createPluginRuntimeMock({
-        channel: {
-          text: { hasControlCommand: vi.fn((body?: string) => body === "/help") },
-          commands: { shouldHandleTextCommands: vi.fn(() => true) },
-          mentions: { buildMentionRegexes },
-        },
-      });
-      setNextcloudTalkRuntime(coreRuntime);
-      installPairingController();
-      resolveNextcloudTalkRoomKindMock.mockResolvedValue("group");
-      const runtime = createRuntimeSpies();
-
-      await inbound({
-        message: createMessage({
-          roomToken: "room-group",
-          roomName: "Ops",
-          isGroupChat: true,
-          text,
-        }),
-        account: createAccount({
-          rooms: { "room-group": { allowFrom: ["user-1"], requireMention: false } },
-        }),
-        runtime,
-      });
-
-      expect(coreRuntime.channel.inbound.dispatchReply).not.toHaveBeenCalled();
-      expect(buildMentionRegexes).not.toHaveBeenCalled();
-      expect(runtime.log).toHaveBeenCalledWith(
-        "nextcloud-talk: drop control command (unauthorized) target=user-1",
-      );
+    {
+      message: { text: "", mediaType: "application/pdf" },
+      account: {},
+      command: false,
+      log: "nextcloud-talk: drop empty message body (mediaType=application/pdf) target=user-1",
     },
-  );
+    {
+      message: { isGroupChat: true },
+      account: { groupAllowFrom: ["user-1"] },
+      command: false,
+      log: "nextcloud-talk: drop room room-1 (no mention)",
+    },
+    {
+      message: { isGroupChat: true, text: "/help" },
+      account: { rooms: { "room-1": { allowFrom: ["user-1"], requireMention: false } } },
+      command: true,
+      log: "nextcloud-talk: drop control command (unauthorized) target=user-1",
+    },
+    {
+      message: { isGroupChat: true, text: JSON.stringify({ message: "/help", parameters: {} }) },
+      account: { rooms: { "room-1": { allowFrom: ["user-1"], requireMention: false } } },
+      command: true,
+      log: "nextcloud-talk: drop control command (unauthorized) target=user-1",
+    },
+  ])("drops before delivery: $log", async ({ message, account, command, log }) => {
+    let core: PluginRuntime | undefined;
+    if (message.isGroupChat) {
+      mocks.roomKind.mockResolvedValue("group");
+      installPairingController();
+      if (command) {
+        core = installCommandRuntime(vi.fn((body?: string) => body === "/help"));
+      } else {
+        installRuntime([/@openclaw/i]);
+      }
+    }
+    const runtime = createRuntimeSpies();
+    await inbound({ message: createMessage(message), account: createAccount(account), runtime });
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(runtime.log).toHaveBeenCalledWith(log);
+    if (core) {
+      expect(core.channel.inbound.dispatchReply).not.toHaveBeenCalled();
+      expect(core.channel.mentions.buildMentionRegexes).not.toHaveBeenCalled();
+    }
+  });
 
   it("keeps command and raw projections separate for structured group commands without mention", async () => {
     const text = '{"message":"/help","parameters":{}}';
     const command = "/help";
     const hasControlCommand = vi.fn((body?: string) => body?.startsWith("/") ?? false);
-    const coreRuntime = createPluginRuntimeMock({
-      channel: {
-        text: { hasControlCommand },
-        commands: { shouldHandleTextCommands: vi.fn(() => true) },
-        mentions: {
-          buildMentionRegexes: vi.fn(() => [/@openclaw/i]),
-          matchesMentionPatterns: vi.fn(() => false),
-        },
-      },
+    const coreRuntime = installCommandRuntime(hasControlCommand, {
+      matchesMentionPatterns: vi.fn(() => false),
     });
-    setNextcloudTalkRuntime(coreRuntime);
     installPairingController(vi.fn(async () => []));
-    resolveNextcloudTalkRoomKindMock.mockResolvedValue("group");
+    mocks.roomKind.mockResolvedValue("group");
     const account = createAccount({
       dmPolicy: "allowlist",
       allowFrom: ["user-1"],
@@ -274,22 +236,22 @@ describe("nextcloud-talk inbound behavior", () => {
 
     expect(hasControlCommand).toHaveBeenCalledWith(command, config);
     expect(coreRuntime.channel.inbound.dispatchReply).toHaveBeenCalledTimes(1);
-    const assembledRequest = dispatched(coreRuntime);
-    expect(assembledRequest.replyPipeline).toEqual({});
-    expect(assembledRequest.ctxPayload).toEqual(
+    expect(dispatched(coreRuntime)).toEqual(
       expect.objectContaining({
-        CommandBody: command,
-        BodyForCommands: command,
-        RawBody: text.trim(),
-        BodyForAgent: text.trim(),
-        CommandAuthorized: true,
-        WasMentioned: false,
+        replyPipeline: {},
+        ctxPayload: expect.objectContaining({
+          CommandBody: command,
+          BodyForCommands: command,
+          RawBody: text.trim(),
+          BodyForAgent: text.trim(),
+          CommandAuthorized: true,
+          WasMentioned: false,
+        }),
       }),
     );
   });
 
   it("binds durable ingress adoption into reply options", async () => {
-    const coreRuntime = installAllowedRuntime();
     const lifecycle = {
       abortSignal: new AbortController().signal,
       onAdopted: vi.fn(async () => {}),
@@ -298,39 +260,24 @@ describe("nextcloud-talk inbound behavior", () => {
       onAbandoned: vi.fn(async () => {}),
     };
 
-    await inbound({
-      account: allowedAccount(),
-      turnAdoptionLifecycle: lifecycle,
-    });
-
-    const request = dispatched(coreRuntime);
+    const request = await allowedInbound({ turnAdoptionLifecycle: lifecycle });
     expect(request.replyOptions?.turnAdoptionLifecycle).toEqual(
       expect.objectContaining({ admission: "exclusive", onAdopted: lifecycle.onAdopted }),
     );
   });
 
   it("sanitizes inbound replies before local delivery while preserving transport fields", async () => {
-    const coreRuntime = installAllowedRuntime();
-    sendMessageNextcloudTalkMock.mockResolvedValue(undefined);
-
-    await inbound({ account: allowedAccount() });
-
-    const assembledRequest = dispatched(coreRuntime) as {
-      delivery?: {
-        preparePayload?: (payload: OutboundReplyPayload) => OutboundReplyPayload;
-        deliver?: (payload: OutboundReplyPayload) => Promise<{ visibleReplySent: boolean }>;
-      };
-    };
-    const preparePayload = assembledRequest.delivery?.preparePayload;
-    const deliver = assembledRequest.delivery?.deliver;
-    if (!preparePayload || !deliver) {
-      throw new Error("expected Nextcloud Talk reply delivery hooks");
-    }
+    mocks.send.mockResolvedValue(undefined);
+    const { delivery } = await allowedInbound();
+    const preparePayload = expectDefined(delivery.preparePayload, "reply payload preparation");
+    const prepare = async (payload: OutboundReplyPayload) =>
+      expectDefined(await preparePayload(payload, { kind: "final" }), "prepared reply payload");
+    const deliver = (payload: OutboundReplyPayload) => delivery.deliver(payload, { kind: "final" });
 
     const mediaOnlyPayload = { mediaUrl: "https://example.com/a.png" };
-    expect(preparePayload(mediaOnlyPayload)).toBe(mediaOnlyPayload);
+    expect(await prepare(mediaOnlyPayload)).toBe(mediaOnlyPayload);
 
-    const preparedPayload = preparePayload({
+    const preparedPayload = await prepare({
       text: "Done.\n⚠️ 🛠️ `search repos (agent)` failed",
       mediaUrls: ["https://example.com/a.png"],
       replyToId: "reply-1",
@@ -342,17 +289,13 @@ describe("nextcloud-talk inbound behavior", () => {
     });
     await expect(deliver(preparedPayload)).resolves.toEqual({ visibleReplySent: true });
     await expect(
-      deliver(preparePayload({ text: "⚠️ 🛠️ `search repos (agent)` failed" })),
+      deliver(await prepare({ text: "⚠️ 🛠️ `search repos (agent)` failed" })),
     ).resolves.toEqual({ visibleReplySent: false });
 
-    expect(sendMessageNextcloudTalkMock).toHaveBeenCalledExactlyOnceWith(
+    expect(mocks.send).toHaveBeenCalledExactlyOnceWith(
       "room-1",
       "Done.\n\nAttachment: https://example.com/a.png",
-      {
-        cfg: defaultConfig,
-        accountId: "default",
-        replyTo: "reply-1",
-      },
+      { cfg: defaultConfig, accountId: "default", replyTo: "reply-1" },
     );
   });
 });

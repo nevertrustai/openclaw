@@ -1,4 +1,5 @@
 import http from "node:http";
+import { promisify } from "node:util";
 import {
   closeOpenClawStateDatabaseForTest,
   createChannelIngressQueueForTests,
@@ -7,18 +8,18 @@ import {
 import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import { withTempDir } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RuntimeEnv } from "../runtime-api.js";
-import type { ResolvedNextcloudTalkAccount } from "./accounts.js";
+import { createRuntimeSpies } from "../../test-support/runtime-spies.js";
+import { createAccount as fixtureAccount } from "./inbound-media.test-fixtures.js";
 import { handleNextcloudTalkInbound } from "./inbound.js";
 import { setNextcloudTalkRuntime } from "./runtime.js";
 import type { CoreConfig } from "./types.js";
 import { createNextcloudTalkWebhookSpool } from "./webhook-spool.js";
 
-type NextcloudTalkIngressQueue = NonNullable<
-  Parameters<typeof createNextcloudTalkWebhookSpool>[0]["queue"]
->;
-type NextcloudTalkIngressPayload = Parameters<NextcloudTalkIngressQueue["enqueue"]>[1];
+type Queue = NonNullable<Parameters<typeof createNextcloudTalkWebhookSpool>[0]["queue"]>;
+type Payload = Parameters<Queue["enqueue"]>[1];
 
+type Spool = ReturnType<typeof createNextcloudTalkWebhookSpool>;
+type Fixture = ReturnType<typeof createRuntime> & { queue: Queue; spool: Spool };
 type ProofServer = Awaited<ReturnType<typeof startRoomInfoServer>>;
 const servers: ProofServer[] = [];
 
@@ -44,32 +45,20 @@ async function startRoomInfoServer() {
   const proofServer = {
     baseUrl: `http://127.0.0.1:${address.port}`,
     requests,
-    stop: async () =>
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-          resolve();
-        });
-      }),
+    stop: promisify(server.close.bind(server)),
   };
   servers.push(proofServer);
   return proofServer;
 }
 
 function createRuntime() {
-  const dispatches = { count: 0 };
-  const logs: string[] = [];
+  const dispatches = vi.fn(async () => {});
   setNextcloudTalkRuntime({
     channel: {
       inbound: {
         ingress: createPluginRuntimeMock().channel.inbound.ingress,
         buildContext: (payload: unknown) => payload,
-        dispatch: async () => {
-          dispatches.count += 1;
-        },
+        dispatch: dispatches,
       },
       pairing: {
         readAllowFromStore: async () => [],
@@ -83,21 +72,14 @@ function createRuntime() {
       },
     },
   } as never);
-  const runtime: RuntimeEnv = {
-    error: (messageValue: unknown) => logs.push(String(messageValue)),
-    exit: () => {},
-    log: (messageValue: unknown) => logs.push(String(messageValue)),
-  };
-  return { dispatches, logs, runtime };
+  return { dispatches, runtime: createRuntimeSpies() };
 }
 
-function createAccount(baseUrl: string, allowPrivateNetwork = true): ResolvedNextcloudTalkAccount {
-  return {
+function createAccount(baseUrl: string, allowPrivateNetwork = true) {
+  return fixtureAccount({
     accountId: "proof",
-    enabled: true,
     baseUrl,
     secret: "bot-secret",
-    secretSource: "config",
     config: {
       apiUser: "bot",
       apiPassword: "secret",
@@ -107,21 +89,15 @@ function createAccount(baseUrl: string, allowPrivateNetwork = true): ResolvedNex
       groupAllowFrom: [],
       network: { dangerouslyAllowPrivateNetwork: allowPrivateNetwork },
     },
-  };
+  });
 }
 
-function createRawWebhookEvent(params?: { roomToken?: string }): string {
+function createRawWebhookEvent(roomToken: string): string {
   return JSON.stringify({
     type: "Create",
     actor: { type: "Person", id: "user-1", name: "Alice" },
-    object: {
-      type: "Note",
-      id: "msg-proof",
-      name: "hello",
-      content: "hello",
-      mediaType: "text/plain",
-    },
-    target: { type: "Collection", id: params?.roomToken ?? "room-direct", name: "Direct room" },
+    object: { type: "Note", id: "msg-proof", name: "hi", content: "hi", mediaType: "text/plain" },
+    target: { type: "Collection", id: roomToken, name: "Direct room" },
   });
 }
 
@@ -131,16 +107,11 @@ async function withSpool(
     allowPrivateNetwork?: boolean;
     config?: CoreConfig;
   },
-  run: (
-    fixture: ReturnType<typeof createRuntime> & {
-      queue: NextcloudTalkIngressQueue;
-      spool: ReturnType<typeof createNextcloudTalkWebhookSpool>;
-    },
-  ) => Promise<void>,
+  run: (fixture: Fixture) => Promise<void>,
 ) {
   const fixture = createRuntime();
   await withTempDir("openclaw-nextcloud-talk-room-info-", async (stateDir) => {
-    const queue = createChannelIngressQueueForTests<NextcloudTalkIngressPayload>({
+    const queue = createChannelIngressQueueForTests<Payload>({
       channelId: "nextcloud-talk",
       accountId: "proof",
       stateDir,
@@ -186,11 +157,11 @@ describe("nextcloud-talk inbound room-kind lookup retry", () => {
     // Advance the spool poll independently of the durable retry clock; HTTP stays real.
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const server = await startRoomInfoServer();
-    const { logs } = await withSpool(
+    const { runtime } = await withSpool(
       { serverBaseUrl: server.baseUrl },
       async ({ queue, spool, dispatches }) => {
         const completed = observeChannelIngressQueueWrite(queue, "complete", "msg-proof");
-        await spool.receive(createRawWebhookEvent({ roomToken: "room-durable-direct" }));
+        await spool.receive(createRawWebhookEvent("room-durable-direct"));
         await spool.waitForIdle();
         expect(await queue.listPending()).toEqual([
           expect.objectContaining({
@@ -201,67 +172,60 @@ describe("nextcloud-talk inbound room-kind lookup retry", () => {
           }),
         ]);
         expect(server.requests).toHaveLength(1);
-        expect(dispatches.count).toBe(0);
+        expect(dispatches).not.toHaveBeenCalled();
         expect(await queue.listClaims()).toEqual([]);
 
         clock += 999;
         await vi.advanceTimersByTimeAsync(10);
         await spool.waitForIdle();
         expect(server.requests).toHaveLength(1);
-        expect(dispatches.count).toBe(0);
+        expect(dispatches).not.toHaveBeenCalled();
 
         clock += 1;
         await vi.advanceTimersByTimeAsync(10);
         await expect(completed).resolves.toBe(true);
         await spool.waitForIdle();
 
-        expect(dispatches.count).toBe(1);
+        expect(dispatches).toHaveBeenCalledOnce();
         expect(server.requests).toHaveLength(2);
         expect(await queue.listClaims()).toEqual([]);
       },
     );
 
-    expect(logs).toContain(
+    expect(runtime.log).toHaveBeenCalledWith(
       "nextcloud-talk spooled update msg-proof failed; keeping for retry: Nextcloud Talk room lookup failed (503)",
     );
   });
 
-  it("keeps guarded-fetch policy blocks on the fallback path instead of durable retry", async () => {
-    const server = await startRoomInfoServer();
-    await withSpool(
-      { serverBaseUrl: server.baseUrl, allowPrivateNetwork: false },
-      async ({ queue, spool, dispatches }) => {
-        await spool.receive(createRawWebhookEvent({ roomToken: "room-policy-blocked" }));
-        await spool.waitForIdle();
+  it.each([
+    ["room-policy-blocked", false, 0],
+    ["room-invalid-url", true, 1],
+  ] as const)(
+    "keeps %s on the fallback path instead of durable retry",
+    async (roomToken, invalidUrl, expectedDispatches) => {
+      const server = await startRoomInfoServer();
+      await withSpool(
+        {
+          serverBaseUrl: invalidUrl ? "not-a-url" : server.baseUrl,
+          allowPrivateNetwork: invalidUrl,
+          config: invalidUrl
+            ? {
+                channels: {
+                  "nextcloud-talk": { rooms: { [roomToken]: { requireMention: false } } },
+                },
+              }
+            : undefined,
+        },
+        async ({ queue, spool, dispatches }) => {
+          await spool.receive(createRawWebhookEvent(roomToken));
+          await spool.waitForIdle();
 
-        expect(server.requests).toEqual([]);
-        expect(await queue.listPending({ limit: "all" })).toEqual([]);
-        expect(await queue.listClaims()).toEqual([]);
-        expect(dispatches.count).toBe(0);
-      },
-    );
-  });
-
-  it("keeps invalid room lookup URLs on the fallback path instead of durable retry", async () => {
-    const server = await startRoomInfoServer();
-    await withSpool(
-      {
-        serverBaseUrl: "not-a-url",
-        config: {
-          channels: {
-            "nextcloud-talk": { rooms: { "room-invalid-url": { requireMention: false } } },
-          },
-        } as CoreConfig,
-      },
-      async ({ queue, spool, dispatches }) => {
-        await spool.receive(createRawWebhookEvent({ roomToken: "room-invalid-url" }));
-        await spool.waitForIdle();
-
-        expect(dispatches.count).toBe(1);
-        expect(server.requests).toEqual([]);
-        expect(await queue.listPending({ limit: "all" })).toEqual([]);
-        expect(await queue.listClaims()).toEqual([]);
-      },
-    );
-  });
+          expect(dispatches).toHaveBeenCalledTimes(expectedDispatches);
+          expect(server.requests).toEqual([]);
+          expect(await queue.listPending({ limit: "all" })).toEqual([]);
+          expect(await queue.listClaims()).toEqual([]);
+        },
+      );
+    },
+  );
 });
