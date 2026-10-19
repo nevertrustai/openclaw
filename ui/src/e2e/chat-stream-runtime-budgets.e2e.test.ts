@@ -811,6 +811,8 @@ suite.define(() => {
         ? await (async () => {
             const thread = page.locator(".chat-pane-cache__pane--active .chat-thread");
             await thread.hover();
+            // Keep the saved offset inside the range when virtualizer measurements shrink it.
+            await page.mouse.wheel(0, -200);
             await waitForChatScrollIdle(page);
             const originalTop = await thread.evaluate((element) => element.scrollTop);
             // Real reader input retires end-follow; an 8 px offset is still at the end.
