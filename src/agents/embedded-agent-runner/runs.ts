@@ -931,7 +931,7 @@ export function attachActiveEmbeddedRun(
     EMBEDDED_RUN_FORCED_TERMINAL_SETTLEMENTS.delete(previousHandle);
   }
   try {
-    toolAuthority?.assertActive();
+    toolAuthority?.assertRegistrationActive();
   } catch (error) {
     revokeCompletionClaim(sessionId, handle.runId, completionTarget);
     throw error;
@@ -1023,7 +1023,8 @@ export function attachActiveEmbeddedRun(
   }
   if (operation) {
     if (toolAuthority?.sourceTurnId) {
-      getSessionControllerEntryForOperation(operation).sourceTurnId = toolAuthority.sourceTurnId;
+      // Native attempts may carry an execution ID; durable admission owns the logical source.
+      getSessionControllerEntryForOperation(operation).sourceTurnId ??= toolAuthority.sourceTurnId;
     }
     markReplyOperationExecutionStarted(operation);
     if (operation.phase === "queued") {
