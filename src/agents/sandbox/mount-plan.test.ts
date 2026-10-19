@@ -2,11 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { DOCKER_SANDBOX_ENGINE, execContainer } from "./container-engine.js";
+import { DOCKER_SANDBOX_ENGINE as engine, execContainer } from "./container-engine.js";
 import { resolveDockerSourceNamespace } from "./docker-mount-source.js";
 import {
   prepareSandboxMountPlan,
-  sandboxMountPlanMatchesContainer,
+  sandboxMountPlanMatchesContainer as matchesContainer,
   sandboxContainerShowsWorkspacePaths,
 } from "./mount-plan.js";
 
@@ -24,19 +24,14 @@ vi.mock("./docker-mount-source.js", async (importOriginal) => {
 });
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+type MountInput = Parameters<typeof prepareSandboxMountPlan>[0];
 let root: string;
-const bind = (Source: string, Destination: string, RW = true) => ({
-  Type: "bind",
-  Source,
-  Destination,
-  RW,
-});
-const namespaceBind = (source: string, destination: string, writable = true) => ({
-  type: "bind",
-  source,
-  destination,
-  writable,
-});
+function bind(Source: string, Destination: string, RW = true) {
+  return { Type: "bind", Source, Destination, RW };
+}
+function namespaceBind(source: string, destination: string, writable = true) {
+  return { type: "bind", source, destination, writable };
+}
 beforeEach(() => {
   vi.resetAllMocks();
   root = fs.realpathSync(tempDirs.make("openclaw-mount-plan-"));
@@ -58,12 +53,9 @@ beforeEach(() => {
   ]);
 });
 
-function prepare(
-  access: "none" | "ro" | "rw",
-  overrides: Partial<Parameters<typeof prepareSandboxMountPlan>[0]> = {},
-) {
+function prepare(access: "none" | "ro" | "rw", overrides: Partial<MountInput> = {}) {
   return prepareSandboxMountPlan({
-    engine: DOCKER_SANDBOX_ENGINE,
+    engine,
     workspaceDir: path.join(root, access === "rw" ? "agent" : "private"),
     agentWorkspaceDir: path.join(root, "agent"),
     skillsWorkspaceDir: path.join(root, "materialized"),
@@ -72,7 +64,7 @@ function prepare(
     ...overrides,
   });
 }
-const prepareEmpty = (overrides: Partial<Parameters<typeof prepareSandboxMountPlan>[0]> = {}) =>
+const prepareEmpty = (overrides: Partial<MountInput> = {}) =>
   prepare("none", { workspaceDir: path.join(root, "empty"), ...overrides });
 
 async function expectMounts(
@@ -86,13 +78,7 @@ async function expectMounts(
     stderr: "",
     code: 0,
   });
-  expect(
-    await sandboxMountPlanMatchesContainer({
-      engine: DOCKER_SANDBOX_ENGINE,
-      containerName: "retained",
-      plan,
-    }),
-  ).toBe(matches);
+  expect(await matchesContainer({ engine, containerName: "retained", plan })).toBe(matches);
 }
 
 describe("managed mount plan", () => {
@@ -115,19 +101,15 @@ describe("managed mount plan", () => {
   });
 
   it("rechecks the workspace owner after namespace lookup before creating scaffold directories", async () => {
-    let current = true;
+    const authority = new AbortController();
     vi.mocked(resolveDockerSourceNamespace).mockImplementationOnce(async () => {
-      current = false;
+      authority.abort(new Error("workspace retired"));
       return undefined;
     });
     await expect(
       prepare("rw", {
         workspaceSource: "managed-worktree",
-        assertCurrent: () => {
-          if (!current) {
-            throw new Error("workspace retired");
-          }
-        },
+        assertCurrent: () => authority.signal.throwIfAborted(),
       }),
     ).rejects.toThrow("workspace retired");
     expect(fs.existsSync(path.join(root, "agent/.openclaw"))).toBe(false);
@@ -222,7 +204,7 @@ describe("managed mount plan", () => {
   it.each(["ro", "rw"] as const)(
     "projects nested binds and protected skill descendants with %s permissions",
     async (access) => {
-      const namespace = await resolveDockerSourceNamespace(DOCKER_SANDBOX_ENGINE);
+      const namespace = await resolveDockerSourceNamespace(engine);
       vi.mocked(resolveDockerSourceNamespace).mockResolvedValue([
         ...namespace!,
         ...["private", "agent"].flatMap((workspace) => [
@@ -248,15 +230,10 @@ describe("managed mount plan", () => {
   );
 
   it("rejects visible nested non-bind storage but respects a custom subtree override", async () => {
-    const namespace = await resolveDockerSourceNamespace(DOCKER_SANDBOX_ENGINE);
+    const namespace = await resolveDockerSourceNamespace(engine);
     vi.mocked(resolveDockerSourceNamespace).mockResolvedValue([
       ...namespace!,
-      {
-        type: "volume",
-        source: "/private/storage",
-        destination: path.join(root, "private/data"),
-        writable: true,
-      },
+      { ...namespaceBind("/private/storage", path.join(root, "private/data")), type: "volume" },
       namespaceBind("/host/hidden", path.join(root, "private/data/nested")),
     ]);
     await expect(prepare("none")).rejects.toThrow("unsupported nested volume mount");
@@ -352,20 +329,8 @@ describe("retained mount identity", () => {
     },
   );
 
-  it("rejects a removed bind even on a pre-fix container", async () => {
-    const plan = await prepareEmpty();
-    await expectMounts(
-      plan,
-      [bind("/host/state/empty", "/workspace"), bind("/old/source", "/agent", false)],
-      null,
-      false,
-    );
-  });
-
   it("accepts an unchanged mount with a trailing-slash workdir and ignores unrelated image volumes", async () => {
-    const plan = await prepareEmpty({
-      workdir: "/workspace/",
-    });
+    const plan = await prepareEmpty({ workdir: "/workspace/" });
     expect(plan.binds).toEqual(["/host/state/empty:/workspace:z"]);
     await expectMounts(
       plan,
@@ -377,28 +342,18 @@ describe("retained mount identity", () => {
     );
   });
 
-  it.each(["source", "permission", "type", "tmpfs"])(
-    "rejects a stale custom bind %s",
-    async (change) => {
-      const plan = await prepareEmpty({
-        binds: ["/host/data:/workspace/data:ro"],
-      });
-      await expectMounts(
-        plan,
-        [
-          bind("/host/state/empty", "/workspace"),
-          {
-            Type: change === "type" ? "volume" : "bind",
-            Source: change === "source" ? "/old/data" : "/host/data",
-            Destination: "/workspace/data",
-            RW: change === "permission",
-          },
-        ],
-        change === "tmpfs" ? { "/workspace/data": "rw" } : null,
-        false,
-      );
-    },
-  );
+  it.each([
+    ["removed", bind("/old/source", "/agent", false), null],
+    ["source", bind("/old/data", "/workspace/data", false), null],
+    ["permission", bind("/host/data", "/workspace/data"), null],
+    ["type", { ...bind("/host/data", "/workspace/data", false), Type: "volume" }, null],
+    ["tmpfs", bind("/host/data", "/workspace/data", false), { "/workspace/data": "rw" }],
+  ] as const)("rejects a stale custom bind %s", async (change, mount, tmpfs) => {
+    const plan = await prepareEmpty({
+      binds: change === "removed" ? [] : ["/host/data:/workspace/data:ro"],
+    });
+    await expectMounts(plan, [bind("/host/state/empty", "/workspace"), mount], tmpfs, false);
+  });
 
   it("accepts intentional custom binds and case-insensitive Windows sources at managed destinations", async () => {
     vi.mocked(resolveDockerSourceNamespace).mockResolvedValue(undefined);
@@ -433,7 +388,7 @@ it.each([false, true])(
     });
     const read = () =>
       sandboxContainerShowsWorkspacePaths({
-        engine: DOCKER_SANDBOX_ENGINE,
+        engine,
         containerName: "owned",
         workspaceDir,
         containerRoot: "/workspace/",

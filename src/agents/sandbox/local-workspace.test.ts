@@ -74,20 +74,16 @@ it.runIf(process.platform !== "win32")(
   "keeps real bridge reads, path identity, and writes while checkpointing mutations",
   async () => {
     const root = dirs.make("openclaw-bound-local-bridge-");
-    let revoked = false;
+    let authority = new AbortController();
     let revokeDuringBuild = false;
     let waitForAdmission: Promise<void> | undefined;
     const checkpoint = vi.fn(async () => {});
     const finalized = vi.fn(async () => {});
-    const assertCurrent = () => {
-      if (revoked) {
-        throw new Error("revoked");
-      }
-    };
+    const assertCurrent = () => authority.signal.throwIfAborted();
     const { backend, bridge, bind } = createLocalSandbox(root, assertCurrent, {
       buildExecSpec: async () => {
         if (revokeDuringBuild) {
-          revoked = true;
+          authority.abort(new Error("revoked"));
         }
         return { argv: ["true"], env: {}, stdinMode: "pipe-closed", finalizeToken: "prepared" };
       },
@@ -107,7 +103,7 @@ it.runIf(process.platform !== "win32")(
     expect((await bridge.readFile({ filePath: "note.txt" })).toString()).toBe("bound write");
     expect(bridge.pathMappings?.length).toBeGreaterThan(0);
     const spec = await backend.buildExecSpec(execParams);
-    revoked = true;
+    authority.abort(new Error("revoked"));
     expect(() => spec.assertCurrent?.()).toThrow("revoked");
     await expect(bridge.writeFile({ filePath: "blocked.txt", data: "no" })).rejects.toThrow(
       "revoked",
@@ -115,7 +111,7 @@ it.runIf(process.platform !== "win32")(
     await expect(fs.stat(path.join(root, "blocked.txt"))).rejects.toMatchObject({
       code: "ENOENT",
     });
-    revoked = false;
+    authority = new AbortController();
     await backend.finalizeExec?.(finalization("completed", spec.finalizeToken));
     expect(finalized).toHaveBeenCalledOnce();
     expect(finalized).toHaveBeenCalledWith(finalization("completed", "prepared"));
@@ -125,12 +121,12 @@ it.runIf(process.platform !== "win32")(
     expect(finalized).toHaveBeenLastCalledWith(finalization("failed", "prepared"));
     expect(checkpoint).toHaveBeenCalledTimes(2);
     revokeDuringBuild = false;
-    revoked = false;
+    authority = new AbortController();
     const rejectAfterAdmission = async (start: () => Promise<unknown>[]) => {
       const admission = createDeferred();
       waitForAdmission = admission.promise;
       const pending = start();
-      revoked = true;
+      authority.abort(new Error("revoked"));
       admission.resolve();
       for (const operation of pending) {
         await expect(operation).rejects.toThrow("revoked");
@@ -143,7 +139,7 @@ it.runIf(process.platform !== "win32")(
     await expect(fs.stat(path.join(root, "blocked.txt"))).rejects.toMatchObject({
       code: "ENOENT",
     });
-    revoked = false;
+    authority = new AbortController();
     waitForAdmission = undefined;
     const stage = getSandboxInputStager(bridge)!;
     const stageInput = (prefix: string, content: string) =>
@@ -162,24 +158,17 @@ it.runIf(process.platform !== "win32")(
   "rejects a filesystem mutation when authority closes during path preparation",
   async () => {
     const root = dirs.make("openclaw-bound-revocation-");
-    let current = true;
-    let observedPreparation = false;
-    const assertCurrent = () => {
-      if (!current) {
-        throw new Error("revoked during preparation");
-      }
-    };
+    const authority = new AbortController();
+    const assertCurrent = () => authority.signal.throwIfAborted();
     const { bridge, bind } = createLocalSandbox(root, assertCurrent, {}, (params) => {
       if (params.stdin === undefined) {
-        observedPreparation = true;
-        current = false;
+        authority.abort(new Error("revoked during preparation"));
       }
     });
     bind();
     await expect(
       bridge.writeFile({ filePath: "late.txt", data: "must not write" }),
     ).rejects.toThrow("revoked during preparation");
-    expect(observedPreparation).toBe(true);
     await expect(fs.stat(path.join(root, "late.txt"))).rejects.toMatchObject({ code: "ENOENT" });
   },
 );

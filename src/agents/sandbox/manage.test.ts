@@ -6,24 +6,16 @@ import {
   removeSandboxBrowserContainer,
 } from "./manage.js";
 
-const configMocks = vi.hoisted(() => ({
-  getRuntimeConfig: vi.fn(),
-}));
-
-const registryMocks = vi.hoisted(() => ({
-  readBrowserRegistry: vi.fn(),
-  readRegistry: vi.fn(),
-  removeBrowserRegistryEntry: vi.fn(),
-  removeRegistryEntry: vi.fn(),
-}));
-
-const backendMocks = vi.hoisted(() => ({
-  describeRuntime: vi.fn(),
-  removeRuntime: vi.fn(),
-}));
-
-const bridgeMocks = vi.hoisted(() => ({
-  stopBrowserBridgeServer: vi.fn(async () => undefined),
+const { configMocks, registryMocks, backendMocks, bridgeMocks } = vi.hoisted(() => ({
+  configMocks: { getRuntimeConfig: vi.fn() },
+  registryMocks: {
+    readBrowserRegistry: vi.fn(),
+    readRegistry: vi.fn(),
+    removeBrowserRegistryEntry: vi.fn(),
+    removeRegistryEntry: vi.fn(),
+  },
+  backendMocks: { describeRuntime: vi.fn(), removeRuntime: vi.fn() },
+  bridgeMocks: { stopBrowserBridgeServer: vi.fn(async () => undefined) },
 }));
 
 vi.mock("../../config/config.js", () => configMocks);
@@ -79,22 +71,18 @@ it("lists browser image metadata with the BrowserImage label", async () => {
 });
 
 it("removes browser runtimes with BrowserImage config label kind", async () => {
-  const order: string[] = [];
   const cached = { containerName: "browser-1", bridge: { server: {} } as never };
   BROWSER_BRIDGES.set("agent:coder:main", cached);
-  bridgeMocks.stopBrowserBridgeServer.mockImplementationOnce(async () => {
-    order.push("bridge");
-  });
-  backendMocks.removeRuntime.mockImplementationOnce(async () => {
-    order.push("runtime");
-  });
-  registryMocks.removeBrowserRegistryEntry.mockImplementationOnce(async () => {
-    order.push("registry");
-  });
 
   await removeSandboxBrowserContainer("browser-1");
 
-  expect(order).toEqual(["bridge", "runtime", "registry"]);
+  const runtimeOrder = backendMocks.removeRuntime.mock.invocationCallOrder[0]!;
+  expect(bridgeMocks.stopBrowserBridgeServer.mock.invocationCallOrder[0]).toBeLessThan(
+    runtimeOrder,
+  );
+  expect(registryMocks.removeBrowserRegistryEntry.mock.invocationCallOrder[0]).toBeGreaterThan(
+    runtimeOrder,
+  );
   expect(BROWSER_BRIDGES.has("agent:coder:main")).toBe(false);
   expect(backendMocks.removeRuntime.mock.calls[0]?.[0]).toMatchObject({
     entry: {

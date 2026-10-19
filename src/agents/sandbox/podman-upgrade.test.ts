@@ -1,4 +1,3 @@
-// Exercise the released HOST-pinned registry through the real recreate and allocation owners.
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -55,19 +54,14 @@ it.each([false, true])(
       sentinel: await fs.readFile(sentinelPath, "utf8"),
     });
     const originalWorkspace = await snapshotWorkspace();
-    const config: OpenClawConfig = {
-      agents: {
-        defaults: {
-          sandbox: {
-            mode: "all",
-            backend: "podman",
-            scope: "session",
-            workspaceAccess: "rw",
-            docker: { image: "openclaw-sandbox:test", containerPrefix: "upgrade-" },
-          },
-        },
-      },
-    };
+    const sandbox = {
+      mode: "all",
+      backend: "podman",
+      scope: "session",
+      workspaceAccess: "rw",
+      docker: { image: "openclaw-sandbox:test", containerPrefix: "upgrade-" },
+    } as const;
+    const config: OpenClawConfig = { agents: { defaults: { sandbox } } };
     setRuntimeConfigSnapshot(config);
     const cfg = resolveSandboxConfigForAgent(config);
     const scopeKey = "agent:main:upgrade";
@@ -117,15 +111,13 @@ it.each([false, true])(
     spawnCommand.mockImplementation(async ([command, ...originalArgs]: string[]) => {
       expect(command).toBe("podman");
       calls.push(originalArgs);
-      const args = [...originalArgs];
-      let uri = process.env.CONTAINER_CONNECTION ? newUri : oldUri;
-      if (args[0] === "--url") {
-        uri = expectDefined(args[1], "Podman --url value");
-        args.splice(0, 2);
-        if (args.at(0) === "--identity") {
-          args.splice(0, 2);
-        }
-      }
+      const pinned = originalArgs[0] === "--url";
+      const uri = pinned
+        ? expectDefined(originalArgs[1], "Podman --url value")
+        : process.env.CONTAINER_CONNECTION
+          ? newUri
+          : oldUri;
+      const args = originalArgs.slice(pinned ? (originalArgs[2] === "--identity" ? 4 : 2) : 0);
       const containers = expectDefined(physical.get(uri), "selected Podman store");
       if (Object.hasOwn(metadata, args[0]!)) {
         return commandResult(metadata[args[0]!]);
@@ -201,36 +193,33 @@ it.each([false, true])(
         throw new Error(`Unexpected CLI exit: ${code}`);
       },
     };
-    const recreate = () =>
-      sandboxRecreateCommand(
-        { session: scopeKey, all: false, browser: false, force: true },
-        runtime,
-      );
-    const assertWorkspaceAndUnrelatedRuntimeUnchanged = async () => {
+    const recreateOptions = { session: scopeKey, all: false, browser: false, force: true };
+    const recreate = () => sandboxRecreateCommand(recreateOptions, runtime);
+    const expectUntouched = async () => {
       expect(await snapshotWorkspace()).toEqual(originalWorkspace);
       expect(await readRegistryEntry("unrelated-runtime")).toEqual(unrelatedEntry);
       expect(physical.get(newUri)?.get("unrelated-runtime")).toBe(unrelatedId);
     };
-    const assertRefusalPreservedBothRuntimes = async () => {
+    const expectRefusal = async () => {
       expect(await readRegistryEntry(containerName)).toEqual(releasedEntry);
       expect([...physical.get(oldUri)!]).toEqual([[containerName, oldId]]);
       expect(physical.get(newUri)?.size).toBe(1);
       expect(
         calls.some((args) => ["rm", "create", "start", "exec"].some((arg) => args.includes(arg))),
       ).toBe(false);
-      await assertWorkspaceAndUnrelatedRuntimeUnchanged();
+      await expectUntouched();
     };
     await expect(ensure()).rejects.toThrow("active Podman connection changed");
-    await assertRefusalPreservedBothRuntimes();
+    await expectRefusal();
     await expect(recreate()).rejects.toThrow("active Podman connection changed");
-    await assertRefusalPreservedBothRuntimes();
+    await expectRefusal();
     // Losing A's endpoint does not remove its container or make B its replacement.
     oldUnreachable = true;
     await expect(ensure()).rejects.toThrow("connection refused");
-    await assertRefusalPreservedBothRuntimes();
+    await expectRefusal();
     vi.stubEnv("CONTAINER_CONNECTION", undefined);
     await expect(recreate()).rejects.toThrow("connection refused");
-    await assertRefusalPreservedBothRuntimes();
+    await expectRefusal();
 
     // The operator restores the recorded endpoint; recreate does not rewrite or bypass its fence.
     oldUnreachable = false;
@@ -239,20 +228,17 @@ it.each([false, true])(
     expect(commands("rm")).toEqual([[...oldTarget.globalArgs, "rm", "-f", containerName]]);
     expect(physical.get(oldUri)?.size).toBe(0);
     expect(physical.get(newUri)?.size).toBe(1);
-    await assertWorkspaceAndUnrelatedRuntimeUnchanged();
+    await expectUntouched();
 
     vi.stubEnv("CONTAINER_CONNECTION", "new-machine");
     await ensure();
     expect(await readRegistryEntry(containerName)).toMatchObject({ backendTarget: newTarget });
-    const create = commands("create")[0]!;
-    expect(create.slice(0, newTarget.globalArgs.length + 1)).toEqual([
-      ...newTarget.globalArgs,
-      "create",
-    ]);
+    const createPrefix = commands("create")[0]!.slice(0, newTarget.globalArgs.length + 1);
+    expect(createPrefix).toEqual([...newTarget.globalArgs, "create"]);
     expect(commands("start")).toEqual([[...newTarget.globalArgs, "start", newId]]);
     expect(physical.get(newUri)?.get(containerName)).toBe(newId);
     expect(physical.get(newUri)?.size).toBe(2);
-    await assertWorkspaceAndUnrelatedRuntimeUnchanged();
+    await expectUntouched();
     expect(commands("rm")).toHaveLength(1);
   },
 );
