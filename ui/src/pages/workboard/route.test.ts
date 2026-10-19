@@ -1,5 +1,5 @@
 import type { RouteLocation, RouterHistory } from "@openclaw/uirouter";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { createApplicationRouter, startApplicationRouter, type RouteId } from "../../app-routes.ts";
 import type { ApplicationContext, ApplicationNavigationOptions } from "../../app/context.ts";
@@ -28,6 +28,7 @@ function routeFixture(
     },
   };
   const router = createApplicationRouter();
+  onTestFinished(() => router.stop());
   const loading = createDeferred();
   const component = createDeferred<{ renderSolid: () => null }>();
   router.getRoute("about")!.component = async () => ({ renderSolid: () => null });
@@ -79,6 +80,14 @@ function routeFixture(
     loading,
     redirects,
     started,
+    navigate(next: RouteLocation) {
+      return router.navigate("workboard", context, { history: "push" }, next);
+    },
+    async expectLocation(next: RouteLocation) {
+      await Promise.all(redirects);
+      expect(history.location()).toEqual(next);
+      expect(router.getState().location).toEqual(next);
+    },
     resolve() {
       metadata.resolve();
       component.resolve({ renderSolid: () => null });
@@ -105,89 +114,57 @@ describe("Workboard route navigation ownership", () => {
     };
     const fixture = routeFixture();
     await fixture.started;
-    try {
-      const oldNavigation = fixture.router.navigate(
-        "workboard",
-        fixture.context,
-        { history: "push" },
-        legacyBoardLocation,
-      );
-      await fixture.loading.promise;
-      const newNavigation = fixture.router.navigate(
-        "workboard",
-        fixture.context,
-        { history: "push" },
-        location,
-      );
-      fixture.resolve();
-      await Promise.all([oldNavigation, newNavigation]);
-      await Promise.all(fixture.redirects);
-      expect(fixture.history.location()).toEqual(location);
-      expect(fixture.router.getState().location).toEqual(location);
-      expect(fixture.router.getState().matches[0]?.routeId).toBe("workboard");
-    } finally {
-      fixture.router.stop();
-    }
+    const oldNavigation = fixture.navigate(legacyBoardLocation);
+    await fixture.loading.promise;
+    const newNavigation = fixture.navigate(location);
+    fixture.resolve();
+    await Promise.all([oldNavigation, newNavigation]);
+    await fixture.expectLocation(location);
+    expect(fixture.router.getState().matches[0]?.routeId).toBe("workboard");
   });
 
   it("preloads without navigation and canonicalizes the later visit to the cached board", async () => {
     const fixture = routeFixture();
     await fixture.started;
     const activeLocation = fixture.history.location();
-    try {
-      const preload = fixture.router.preloadLocation(legacyBoardLocation, fixture.context);
-      await fixture.loading.promise;
-      fixture.resolve();
-      await preload;
-      await Promise.all(fixture.redirects);
-      expect(fixture.history.location()).toEqual(activeLocation);
-      expect(fixture.router.getState().location).toEqual(activeLocation);
-      expect(fixture.router.getState().matches[0]?.routeId).toBe("about");
-      await fixture.router.navigate(
-        "workboard",
-        fixture.context,
-        { history: "push" },
-        legacyBoardLocation,
-      );
-      await Promise.all(fixture.redirects);
-      expect(fixture.history.location()).toEqual({
-        pathname: "/ui/workboard/ops",
-        search: "?agent=writer",
-        hash: "#original",
-      });
-      expect(fixture.router.getState().matches[0]?.data).toMatchObject({ boardFilter: "ops" });
-    } finally {
-      fixture.router.stop();
-    }
+    const preload = fixture.router.preloadLocation(legacyBoardLocation, fixture.context);
+    await fixture.loading.promise;
+    fixture.resolve();
+    await preload;
+    await fixture.expectLocation(activeLocation);
+    expect(fixture.router.getState().matches[0]?.routeId).toBe("about");
+    await fixture.navigate(legacyBoardLocation);
+    await fixture.expectLocation({
+      pathname: "/ui/workboard/ops",
+      search: "?agent=writer",
+      hash: "#original",
+    });
+    expect(fixture.router.getState().matches[0]?.data).toMatchObject({ boardFilter: "ops" });
   });
 
   it.each(["startup", "history"] as const)(
     "canonicalizes a %s alias before asynchronous route loading",
     async (entry) => {
       const fixture = routeFixture(entry === "startup" ? legacyBoardLocation : undefined);
-      try {
-        if (entry === "history") {
-          await fixture.started;
-          fixture.pop(legacyBoardLocation);
-        }
-        await fixture.loading.promise;
-        const canonicalLocation = {
-          pathname: "/ui/workboard/ops",
-          search: "?agent=writer",
-          hash: "#original",
-        };
-        expect.soft(fixture.history.location()).toEqual(canonicalLocation);
-        fixture.resolve();
+      if (entry === "history") {
         await fixture.started;
-        await Promise.all(fixture.redirects);
-        await vi.waitFor(() => {
-          expect(fixture.router.getState().status).toBe("success");
-          expect(fixture.router.getState().location).toEqual(canonicalLocation);
-        });
-        expect(fixture.router.getState().matches[0]?.data).toMatchObject({ boardFilter: "ops" });
-      } finally {
-        fixture.router.stop();
+        fixture.pop(legacyBoardLocation);
       }
+      await fixture.loading.promise;
+      const canonicalLocation = {
+        pathname: "/ui/workboard/ops",
+        search: "?agent=writer",
+        hash: "#original",
+      };
+      expect.soft(fixture.history.location()).toEqual(canonicalLocation);
+      fixture.resolve();
+      await fixture.started;
+      await Promise.all(fixture.redirects);
+      await vi.waitFor(() => {
+        expect(fixture.router.getState().status).toBe("success");
+        expect(fixture.router.getState().location).toEqual(canonicalLocation);
+      });
+      expect(fixture.router.getState().matches[0]?.data).toMatchObject({ boardFilter: "ops" });
     },
   );
 });

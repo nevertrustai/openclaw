@@ -57,6 +57,46 @@ function sessionsListResponse() {
   };
 }
 
+function installWorkboard(page: Page, extra: Parameters<typeof installMockGateway>[1] = {}) {
+  return installMockGateway(page, {
+    ...workboardUi,
+    ...extra,
+    methodResponses: {
+      "config.get": configSnapshot(true),
+      "sessions.list": sessionsListResponse(),
+      "workboard.boards.list": { boards },
+      "workboard.cards.list": { boards, cards: [], statuses: ["todo", "done"] },
+      ...extra.methodResponses,
+    },
+  });
+}
+
+async function capture(
+  page: Page,
+  artifactDir: string,
+  name: string,
+  content: Parameters<typeof takeControlUiViewportScreenshot>[2],
+) {
+  if (captureUiProofEnabled) {
+    await writeFile(
+      path.join(artifactDir, `${name}.png`),
+      await takeControlUiViewportScreenshot(page, page.locator(".shell"), content),
+    );
+  }
+}
+
+function boardEntry(page: Page) {
+  return page.locator("openclaw-app-sidebar .sidebar-pages__entry").filter({
+    has: page.locator('[data-sidebar-entry="plugin:workboard/board-ops"]'),
+  });
+}
+
+function pinnedBoard(page: Page) {
+  return page.locator(
+    'openclaw-app-sidebar .sidebar-rail [data-sidebar-entry="plugin:workboard/board-ops"] a',
+  );
+}
+
 async function newRecordedPage(
   artifactDir: string,
   label: string,
@@ -105,15 +145,7 @@ suite.define(() => {
     const recorded = await newRecordedPage(artifactDir, "routing");
     const { page } = recorded;
     try {
-      const gateway = await installMockGateway(page, {
-        ...workboardUi,
-        methodResponses: {
-          "config.get": configSnapshot(true),
-          "sessions.list": sessionsListResponse(),
-          "workboard.boards.list": { boards },
-          "workboard.cards.list": { boards, cards: [], statuses: ["todo", "done"] },
-        },
-      });
+      const gateway = await installWorkboard(page);
 
       const response = await page.goto(`${suite.server.baseUrl}workboard/ops?agent=main`);
       expect(response?.status()).toBe(200);
@@ -127,12 +159,7 @@ suite.define(() => {
       await filterTrigger.click();
       await page.getByRole("button", { name: /^Filter by board:/u }).waitFor();
       await filterTrigger.click();
-      if (captureUiProofEnabled) {
-        await writeFile(
-          path.join(artifactDir, "01-board-route.png"),
-          await takeControlUiViewportScreenshot(page, page.locator(".shell"), [headerGlyph]),
-        );
-      }
+      await capture(page, artifactDir, "01-board-route", [headerGlyph]);
 
       const sidebar = page.locator("openclaw-app-sidebar");
       await sidebar.getByRole("button", { name: "Pages", exact: true }).click();
@@ -147,20 +174,16 @@ suite.define(() => {
       expect(await pinnedWorkboard.locator(".nav-item__children, .nav-item--child").count()).toBe(
         0,
       );
-      const boardEntry = sidebar.locator(".sidebar-pages__entry").filter({
-        has: page.locator('[data-sidebar-entry="plugin:workboard/board-ops"]'),
-      });
-      await boardEntry.getByRole("link", { name: "Operations", exact: true }).waitFor();
-      await boardEntry.getByRole("button", { name: "Pin", exact: true }).click();
-      const pinnedBoard = sidebar.locator(
-        '.sidebar-rail [data-sidebar-entry="plugin:workboard/board-ops"] a',
+      const entry = boardEntry(page);
+      await entry.getByRole("link", { name: "Operations", exact: true }).waitFor();
+      await entry.getByRole("button", { name: "Pin", exact: true }).click();
+      const pinned = pinnedBoard(page);
+      await pinned.waitFor();
+      expect(await pinned.getAttribute("href")).toBe("/workboard/ops");
+      expect(await entry.getByRole("link", { name: "Operations", exact: true }).isVisible()).toBe(
+        true,
       );
-      await pinnedBoard.waitFor();
-      expect(await pinnedBoard.getAttribute("href")).toBe("/workboard/ops");
-      expect(
-        await boardEntry.getByRole("link", { name: "Operations", exact: true }).isVisible(),
-      ).toBe(true);
-      expect(await boardEntry.getByRole("button", { name: "Unpin", exact: true }).count()).toBe(1);
+      expect(await entry.getByRole("button", { name: "Unpin", exact: true }).count()).toBe(1);
       await expect
         .poll(() =>
           page.evaluate((key) => {
@@ -170,12 +193,7 @@ suite.define(() => {
         )
         .toContain("plugin:workboard/board-ops");
       expect(await gateway.getRequests("sessions.patch")).toHaveLength(0);
-      if (captureUiProofEnabled) {
-        await writeFile(
-          path.join(artifactDir, "02-pinned-board.png"),
-          await takeControlUiViewportScreenshot(page, page.locator(".shell"), [pinnedBoard]),
-        );
-      }
+      await capture(page, artifactDir, "02-pinned-board", [pinned]);
 
       await page.goto(`${suite.server.baseUrl}workboard?board=ops&agent=main`);
       await waitForControlUiRoute(page, {
@@ -187,21 +205,16 @@ suite.define(() => {
       expect(new URL(page.url()).searchParams.get("agent")).toBe("main");
 
       await page.reload();
-      await pinnedBoard.waitFor();
+      await pinned.waitFor();
       await page.locator(".workboard-page-title", { hasText: "Operations" }).waitFor();
-      expect(await pinnedBoard.getAttribute("href")).toBe("/workboard/ops");
+      expect(await pinned.getAttribute("href")).toBe("/workboard/ops");
       await pinnedWorkboard.getByRole("link", { name: "Workboard", exact: true }).waitFor();
       expect(await pinnedWorkboard.locator(".nav-item__children, .nav-item--child").count()).toBe(
         0,
       );
-      if (captureUiProofEnabled) {
-        await writeFile(
-          path.join(artifactDir, "03-legacy-normalized-and-persisted.png"),
-          await takeControlUiViewportScreenshot(page, page.locator(".shell"), [
-            page.locator(".workboard-page-title", { hasText: "Operations" }),
-          ]),
-        );
-      }
+      await capture(page, artifactDir, "03-legacy-normalized-and-persisted", [
+        page.locator(".workboard-page-title", { hasText: "Operations" }),
+      ]);
 
       const historyBeforeMissingBoard = await page.evaluate(() => history.length);
       await page.goto(`${suite.server.baseUrl}workboard/deleted?agent=main`);
@@ -238,8 +251,7 @@ suite.define(() => {
           updatedAt: 1,
         };
 
-        const gateway = await installMockGateway(page, {
-          ...workboardUi,
+        const gateway = await installWorkboard(page, {
           methodResponses: {
             "agents.list": {
               defaultId: "main",
@@ -250,10 +262,6 @@ suite.define(() => {
                 { id: "writer", name: "Writer" },
               ],
             },
-            "config.get": configSnapshot(true),
-            "sessions.list": sessionsListResponse(),
-            "workboard.boards.list": { boards },
-            "workboard.cards.list": { boards, cards: [], statuses: ["todo", "done"] },
           },
         });
         await page.goto(`${suite.server.baseUrl}workboard`);
@@ -323,26 +331,13 @@ suite.define(() => {
     await suite.withPage(
       { serviceWorkers: "block", viewport: { width: 1600, height: 1000 } },
       async ({ page }) => {
-        const gateway = await installMockGateway(page, {
-          ...workboardUi,
-          methodResponses: {
-            "config.get": configSnapshot(true),
-            "sessions.list": sessionsListResponse(),
-            "workboard.boards.list": { boards },
-            "workboard.cards.list": { boards, cards: [], statuses: ["todo", "done"] },
-          },
-        });
+        const gateway = await installWorkboard(page);
         await page.goto(`${suite.server.baseUrl}apps`);
         const sidebar = page.locator("openclaw-app-sidebar");
         await sidebar.getByRole("button", { name: "Pages", exact: true }).click();
-        const boardEntry = sidebar.locator(".sidebar-pages__entry").filter({
-          has: page.locator('[data-sidebar-entry="plugin:workboard/board-ops"]'),
-        });
-        await boardEntry.getByRole("button", { name: "Pin", exact: true }).click();
-        const pinnedBoard = sidebar.locator(
-          '.sidebar-rail [data-sidebar-entry="plugin:workboard/board-ops"] a',
-        );
-        await pinnedBoard.click();
+        await boardEntry(page).getByRole("button", { name: "Pin", exact: true }).click();
+        const pinned = pinnedBoard(page);
+        await pinned.click();
         await page.locator(".workboard-page-title", { hasText: "Operations" }).waitFor();
         await page.getByRole("button", { name: /New card/u }).click();
         await page.locator(".workboard-draft__title").fill("Keep this unfinished card");
@@ -363,7 +358,7 @@ suite.define(() => {
           epoch: "workboard-draft-navigation",
           revision: 1,
         });
-        await expect.poll(() => pinnedBoard.textContent()).toContain("Renamed operations");
+        await expect.poll(() => pinned.textContent()).toContain("Renamed operations");
 
         await page.goForward();
         await expect

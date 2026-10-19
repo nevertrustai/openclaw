@@ -57,6 +57,19 @@ const board = {
   byStatus: { todo: 1 },
 };
 
+const cardsResponse = (cards: WorkboardCard[]) => ({
+  boards: [board],
+  cards,
+  statuses: ["todo", "done"],
+});
+const button = (scope: Page | Locator, name: string) =>
+  scope.getByRole("button", { name, exact: true });
+const focused = (locator: Locator) =>
+  locator.evaluate((element) => element === document.activeElement);
+const expectFocus = async (locator: Locator) => {
+  await expect.poll(() => focused(locator)).toBe(true);
+};
+
 async function capture(
   page: Page,
   engine: (typeof engines)[number],
@@ -119,22 +132,14 @@ suite.define(() => {
               ...workboardUi,
               methodResponses: {
                 "workboard.boards.list": { boards: [board] },
-                "workboard.cards.list": {
-                  boards: [board],
-                  cards: [card],
-                  statuses: ["todo", "done"],
-                },
+                "workboard.cards.list": cardsResponse([card]),
               },
             });
             await page.goto(`${suite.server.baseUrl}workboard/ops`);
             const tile = page.locator(".workboard-card").filter({ hasText: card.title });
             await tile.waitFor();
-            expect((await gateway.waitForRequest("plugins.controlUi.report")).params).toMatchObject(
-              {
-                pluginId: "workboard",
-                status: "activated",
-              },
-            );
+            const report = await gateway.waitForRequest("plugins.controlUi.report");
+            expect(report.params).toMatchObject({ pluginId: "workboard", status: "activated" });
             expect([...requestedAssets].some((url) => url.endsWith("/index.js"))).toBe(true);
             const prefix = `${engine}-${view.name}-${theme}`;
             const heading = page.locator(".workboard-page-title");
@@ -149,11 +154,10 @@ suite.define(() => {
             }
             try {
               await tile.focus();
-              await gateway.setMethodResponse("workboard.cards.list", {
-                boards: [board],
-                cards: [{ ...card, labels: ["reviewed"], updatedAt: card.updatedAt + 1 }],
-                statuses: ["todo", "done"],
-              });
+              await gateway.setMethodResponse(
+                "workboard.cards.list",
+                cardsResponse([{ ...card, labels: ["reviewed"], updatedAt: card.updatedAt + 1 }]),
+              );
               await gateway.emitGatewayEvent("plugin.workboard.changed", {
                 epoch: "native-proof",
                 revision: 1,
@@ -164,9 +168,7 @@ suite.define(() => {
                   (element) => element === document.querySelector(".workboard-card"),
                 ),
               ).toBe(true);
-              expect(await tile.evaluate((element) => element === document.activeElement)).toBe(
-                true,
-              );
+              expect(await focused(tile)).toBe(true);
 
               await page.keyboard.press("Enter");
               const details = page.getByRole("dialog", { name: card.title, exact: true });
@@ -178,32 +180,23 @@ suite.define(() => {
               await capture(page, engine, `${prefix}-details`, details, [
                 detailContent.getByRole("tab", { name: "Overview", exact: true }),
               ]);
-              const actions = detailContent.getByRole("button", {
-                name: "Card actions",
-                exact: true,
-              });
+              const actions = button(detailContent, "Card actions");
               await actions.click();
-              const edit = detailContent.getByRole("button", { name: "Edit card", exact: true });
+              const edit = button(detailContent, "Edit card");
               await edit.waitFor();
               await edit.focus();
               await page.keyboard.press("Escape");
               expect(await details.isVisible()).toBe(true);
               await expect.poll(() => actions.getAttribute("aria-expanded")).toBe("false");
-              expect(await actions.evaluate((element) => element === document.activeElement)).toBe(
-                true,
-              );
+              expect(await focused(actions)).toBe(true);
               await page.keyboard.press("Escape");
               await details.waitFor({ state: "detached" });
-              await expect
-                .poll(() => tile.evaluate((element) => element === document.activeElement))
-                .toBe(true);
+              await expectFocus(tile);
             } finally {
               await retained.dispose();
             }
 
-            const create = page
-              .locator(".workboard-heading__actions")
-              .getByRole("button", { name: "New card", exact: true });
+            const create = button(page.locator(".workboard-heading__actions"), "New card");
             await create.focus();
             await page.keyboard.press("Enter");
             const modal = page.getByRole("dialog", { name: "New card", exact: true });
@@ -211,15 +204,11 @@ suite.define(() => {
               .locator(".workboard-card-draft")
               .getByLabel("Title", { exact: true });
             await title.waitFor();
-            await expect
-              .poll(() => title.evaluate((element) => element === document.activeElement))
-              .toBe(true);
+            await expectFocus(title);
             await capture(page, engine, `${prefix}-create`, modal, [title]);
             await page.keyboard.press("Escape");
             await modal.waitFor({ state: "detached" });
-            await expect
-              .poll(() => create.evaluate((element) => element === document.activeElement))
-              .toBe(true);
+            await expectFocus(create);
             expect(await gateway.getRequests("workboard.cards.create")).toEqual([]);
             expect(errors).toEqual([]);
           } finally {

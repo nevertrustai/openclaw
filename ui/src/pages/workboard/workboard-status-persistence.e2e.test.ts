@@ -1,29 +1,22 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-// Control UI tests cover workboard status persistence behavior.
 import { expectDefined } from "@openclaw/normalization-core";
 import type { WorkboardCard } from "@openclaw/workboard-contract";
-import { chromium, type Browser, type Locator, type Page } from "playwright";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { Browser, Locator, Page } from "playwright";
+import { expect, it } from "vitest";
+import { WORKBOARD_STATUSES as statuses } from "../../../../packages/workboard-contract/src/index.js";
 import { createRequireRecord } from "../../../../test/helpers/record.js";
+import { createControlUiE2eSuite } from "../../e2e/control-ui-e2e-suite.test-support.ts";
 import { createControlUiE2eArtifactDir } from "../../test-helpers/control-ui-e2e-artifacts.ts";
 import { takeControlUiViewportScreenshot } from "../../test-helpers/control-ui-e2e-screenshot.ts";
 import {
-  canRunPlaywrightChromium,
   installMockGateway,
-  resolvePlaywrightChromiumExecutablePath,
-  startControlUiE2eServer,
-  type ControlUiE2eServer,
   type MockGatewayControls,
   type MockGatewayRequest,
 } from "../../test-helpers/control-ui-e2e.ts";
 import { workboardUi } from "../../test-helpers/control-ui-workboard-fixture.ts";
 
-const chromiumExecutablePath = resolvePlaywrightChromiumExecutablePath(chromium.executablePath());
-const chromiumAvailable = canRunPlaywrightChromium(chromiumExecutablePath);
-const allowMissingChromium = process.env.OPENCLAW_UI_E2E_ALLOW_MISSING_CHROMIUM === "1";
 const captureUiProofEnabled = process.env.OPENCLAW_CAPTURE_UI_PROOF === "1";
-const describeControlUiE2e = chromiumAvailable || !allowMissingChromium ? describe : describe.skip;
 const artifactParent = path.join(
   process.cwd(),
   ".artifacts",
@@ -31,14 +24,65 @@ const artifactParent = path.join(
   "workboard-status-persistence",
 );
 
-let browser: Browser;
-let server: ControlUiE2eServer;
+const suite = createControlUiE2eSuite({
+  name: "Control UI Workboard status persistence E2E",
+  startServerBeforeBrowser: true,
+});
 
 const linkedSessionKey = "agent:main:workboard-linked-session";
 const manualTodoAt = 2_000;
 const editedAt = 2_500;
 const draggedRunningAt = 3_000;
 const staleCompletedSessionAt = 1_000;
+
+function runningCard(id: string, title: string, position: number): WorkboardCard {
+  return {
+    id,
+    title,
+    position,
+    status: "running",
+    priority: "normal",
+    labels: [],
+    createdAt: 900,
+    updatedAt: manualTodoAt,
+  };
+}
+
+function sessionList(label: string, status: "running" | "done", updatedAt: number) {
+  const model = { model: "gpt-5.5", modelProvider: "openai", contextTokens: null };
+  return {
+    count: 1,
+    defaults: model,
+    path: "",
+    ts: Date.now(),
+    sessions: [
+      {
+        ...model,
+        displayName: label,
+        label,
+        status,
+        updatedAt,
+        hasActiveRun: status === "running",
+        key: linkedSessionKey,
+        kind: "direct",
+        totalTokens: 0,
+      },
+    ],
+  };
+}
+
+function configSnapshot(hash: string) {
+  return { config: { plugins: { entries: { workboard: { enabled: true } } } }, hash };
+}
+
+function newContext(recordVideo?: Parameters<Browser["newContext"]>[0]) {
+  return suite.browser.newContext({
+    locale: "en-US",
+    serviceWorkers: "block",
+    viewport: { height: 900, width: 1280 },
+    ...recordVideo,
+  });
+}
 
 const initialCard = {
   id: "card-1",
@@ -64,26 +108,12 @@ const initialCard = {
 } satisfies WorkboardCard;
 
 const productRunningCard = {
-  id: "product-running-card",
-  title: "Product board running card",
-  status: "running",
-  priority: "normal",
-  labels: [],
-  position: 9_000,
-  createdAt: 900,
-  updatedAt: manualTodoAt,
+  ...runningCard("product-running-card", "Product board running card", 9_000),
   metadata: { automation: { boardId: "product" } },
 } satisfies WorkboardCard;
 
 const archivedDefaultRunningCard = {
-  id: "archived-default-running-card",
-  title: "Archived default board running card",
-  status: "running",
-  priority: "normal",
-  labels: [],
-  position: 3_000,
-  createdAt: 900,
-  updatedAt: manualTodoAt,
+  ...runningCard("archived-default-running-card", "Archived default board running card", 3_000),
   metadata: { archivedAt: 1_000 },
 } satisfies WorkboardCard;
 
@@ -206,22 +236,7 @@ async function waitForRequestCount(
   );
 }
 
-describeControlUiE2e("Control UI Workboard status persistence E2E", () => {
-  beforeAll(async () => {
-    if (!chromiumAvailable) {
-      throw new Error(
-        `Playwright Chromium is not installed at ${chromiumExecutablePath}. Run \`pnpm --dir ui exec playwright install chromium\`, set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH to a compatible browser, or set OPENCLAW_UI_E2E_ALLOW_MISSING_CHROMIUM=1 only when intentionally skipping this lane.`,
-      );
-    }
-    server = await startControlUiE2eServer();
-    browser = await chromium.launch({ executablePath: chromiumExecutablePath });
-  });
-
-  afterAll(async () => {
-    await browser?.close();
-    await server?.close();
-  });
-
+suite.define(() => {
   it("preserves an execution-owned session when editing a linked Workboard card", async () => {
     const executionLinkedCard: WorkboardCard = {
       ...initialCard,
@@ -245,70 +260,23 @@ describeControlUiE2e("Control UI Workboard status persistence E2E", () => {
       title: "Renamed without unlinking the execution",
       updatedAt: editedAt,
     };
-    const context = await browser.newContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-    });
+    const context = await newContext();
     const page = await context.newPage();
     const gateway = await installMockGateway(page, {
       ...workboardUi,
       methodResponses: {
-        "config.get": {
-          config: {
-            plugins: {
-              entries: {
-                workboard: { enabled: true },
-              },
-            },
-          },
-          hash: "execution-linked-workboard-e2e-config",
-        },
-        "sessions.list": {
-          count: 1,
-          defaults: {
-            contextTokens: null,
-            model: "gpt-5.5",
-            modelProvider: "openai",
-          },
-          path: "",
-          sessions: [
-            {
-              contextTokens: null,
-              displayName: "Execution linked session",
-              hasActiveRun: true,
-              key: linkedSessionKey,
-              kind: "direct",
-              label: "Execution linked session",
-              model: "gpt-5.5",
-              modelProvider: "openai",
-              status: "running",
-              totalTokens: 0,
-              updatedAt: manualTodoAt,
-            },
-          ],
-          ts: Date.now(),
-        },
+        "config.get": configSnapshot("execution-linked-workboard-e2e-config"),
+        "sessions.list": sessionList("Execution linked session", "running", manualTodoAt),
         "workboard.cards.list": {
           cards: [executionLinkedCard],
-          statuses: [
-            "triage",
-            "backlog",
-            "todo",
-            "scheduled",
-            "ready",
-            "running",
-            "review",
-            "blocked",
-            "done",
-          ],
+          statuses,
         },
         "workboard.cards.update": { card: updatedCard },
       },
     });
 
     try {
-      const response = await page.goto(`${server.baseUrl}workboard`);
+      const response = await page.goto(`${suite.server.baseUrl}workboard`);
       expect(response?.status()).toBe(200);
       const executionCard = page.locator(".workboard-card", {
         hasText: executionLinkedCard.title,
@@ -349,66 +317,20 @@ describeControlUiE2e("Control UI Workboard status persistence E2E", () => {
     const artifactDir = captureUiProofEnabled
       ? createControlUiE2eArtifactDir("workboard-status-persistence", artifactParent)
       : "";
-    const context = await browser.newContext({
-      locale: "en-US",
+    const context = await newContext({
       recordVideo: captureUiProofEnabled
         ? { dir: artifactDir, size: { height: 900, width: 1280 } }
         : undefined,
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
     });
     const page = await context.newPage();
     const gateway = await installMockGateway(page, {
       ...workboardUi,
       methodResponses: {
-        "config.get": {
-          config: {
-            plugins: {
-              entries: {
-                workboard: { enabled: true },
-              },
-            },
-          },
-          hash: "workboard-e2e-config",
-        },
-        "sessions.list": {
-          count: 1,
-          defaults: {
-            contextTokens: null,
-            model: "gpt-5.5",
-            modelProvider: "openai",
-          },
-          path: "",
-          sessions: [
-            {
-              contextTokens: null,
-              displayName: "Completed linked session",
-              hasActiveRun: false,
-              key: linkedSessionKey,
-              kind: "direct",
-              label: "Completed linked session",
-              model: "gpt-5.5",
-              modelProvider: "openai",
-              status: "done",
-              totalTokens: 0,
-              updatedAt: staleCompletedSessionAt,
-            },
-          ],
-          ts: Date.now(),
-        },
+        "config.get": configSnapshot("workboard-e2e-config"),
+        "sessions.list": sessionList("Completed linked session", "done", staleCompletedSessionAt),
         "workboard.cards.list": {
           cards: [initialCard, productRunningCard, archivedDefaultRunningCard],
-          statuses: [
-            "triage",
-            "backlog",
-            "todo",
-            "scheduled",
-            "ready",
-            "running",
-            "review",
-            "blocked",
-            "done",
-          ],
+          statuses,
         },
         "workboard.cards.move": {
           card: draggedRunningCard,
@@ -440,7 +362,7 @@ describeControlUiE2e("Control UI Workboard status persistence E2E", () => {
     });
 
     try {
-      const response = await page.goto(`${server.baseUrl}workboard`);
+      const response = await page.goto(`${suite.server.baseUrl}workboard`);
       expect(response?.status()).toBe(200);
       await workboardCard(page, "Todo", "Persist queue status").waitFor({ timeout: 10_000 });
       await workboardCard(page, "Running", productRunningCard.title).waitFor({
