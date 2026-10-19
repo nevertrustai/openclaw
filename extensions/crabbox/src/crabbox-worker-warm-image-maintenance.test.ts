@@ -3,8 +3,8 @@ import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { describe, expect, it, vi } from "vitest";
 import { openWarmImageStore } from "./crabbox-state.test-support.js";
+import { checkpointArgs, warmImage, warmRecord } from "./crabbox-warm-scenarios.test-support.js";
 import { destroyAndWait, commandResult } from "./crabbox-worker-provider.test-support.js";
-import type { WarmProfileRecord } from "./crabbox-worker-warm-image-store.js";
 import {
   createWarmProvider,
   managedBinary,
@@ -19,22 +19,22 @@ const captureUnsupported = (atMs: number) => ({
   provider: "hetzner",
   message: "Native capture is unsupported by this coordinator",
 });
-const retainedColdProfile = (atMs: number): WarmProfileRecord => ({
-  version: 3,
-  captureUnsupported: captureUnsupported(atMs),
-  allocations: {
-    cbx_retained: {
-      choice: { kind: "cold" },
-      machineClass: "standard",
-      phase: "pending",
-      preparationKey: null,
-      cacheKey: null,
-      purpose: null,
-      demandAtMs: null,
-      imageGeneration: null,
+const retainedColdProfile = (atMs: number) =>
+  warmRecord({
+    captureUnsupported: captureUnsupported(atMs),
+    allocations: {
+      cbx_retained: {
+        choice: { kind: "cold" },
+        machineClass: "standard",
+        phase: "pending",
+        preparationKey: null,
+        cacheKey: null,
+        purpose: null,
+        demandAtMs: null,
+        imageGeneration: null,
+      },
     },
-  },
-});
+  });
 const context = () => ({
   profiles: [PROFILE],
   signal: new AbortController().signal,
@@ -48,20 +48,14 @@ const mixedContext = () => ({
     { ...PROFILE, binary: "/opt/a/crabbox" },
   ],
 });
-const expiredImage = (id: string): WarmProfileRecord => ({
-  version: 3,
-  allocations: {},
-  image: {
-    checkpointId: id,
-    kind: "aws-ebs-snapshot",
-    state: "available",
-    createdAtMs: Date.now() - RETENTION_MS,
-    preparationKey: null,
-    cacheKey: null,
-    purpose: null,
-    lastDemandAtMs: Date.now() - RETENTION_MS,
-  },
-});
+const expiredImage = (id: string) =>
+  warmRecord({
+    image: warmImage(id, {
+      kind: "aws-ebs-snapshot",
+      createdAtMs: Date.now() - RETENTION_MS,
+      lastDemandAtMs: Date.now() - RETENTION_MS,
+    }),
+  });
 
 describe("Crabbox idle image maintenance", () => {
   it.each([REFRESH_MS - 1, REFRESH_MS])(
@@ -92,18 +86,13 @@ describe("Crabbox idle image maintenance", () => {
     const { provider, calls } = createWarmProvider();
     const store = openWarmImageStore();
     const held = retainedColdProfile(now - REFRESH_MS);
-    const active = {
-      version: 3 as const,
-      allocations: {},
-      captureUnsupported: captureUnsupported(now),
-    };
+    const active = warmRecord({ captureUnsupported: captureUnsupported(now) });
     store.register("retained", held);
     store.register("active", active);
-    store.register("expired", {
-      version: 3,
-      allocations: {},
-      captureUnsupported: captureUnsupported(now - REFRESH_MS),
-    });
+    store.register(
+      "expired",
+      warmRecord({ captureUnsupported: captureUnsupported(now - REFRESH_MS) }),
+    );
 
     await provider.maintain!(context());
 
@@ -124,20 +113,21 @@ describe("Crabbox idle image maintenance", () => {
       const { provider, calls } = createWarmProvider();
       const store = openWarmImageStore();
       for (let index = 0; index < 128; index += 1) {
-        store.register(`cold-only-${index}`, {
-          version: 3,
-          allocations: {},
-          captureUnsupported: captureUnsupported(now),
-          ...(withImage
-            ? {
-                image: {
-                  ...expiredImage(`chk_refused_${index}`).image!,
-                  createdAtMs: now - 3_600_000,
-                  lastDemandAtMs: now - 3_600_000,
-                },
-              }
-            : {}),
-        });
+        store.register(
+          `cold-only-${index}`,
+          warmRecord({
+            captureUnsupported: captureUnsupported(now),
+            ...(withImage
+              ? {
+                  image: {
+                    ...expiredImage(`chk_refused_${index}`).image!,
+                    createdAtMs: now - 3_600_000,
+                    lastDemandAtMs: now - 3_600_000,
+                  },
+                }
+              : {}),
+          }),
+        );
       }
 
       const lease = await provisionWarmProfile(provider);
@@ -251,16 +241,16 @@ describe("Crabbox idle image maintenance", () => {
   it("reports paused captures once per ownership snapshot without attempting capture", async () => {
     const { provider, calls, warn } = createWarmProvider();
     const store = openWarmImageStore();
-    const records = Array.from({ length: 4 }, (_, index): WarmProfileRecord => ({
-      version: 3,
-      allocations: {},
-      operation: {
-        type: "capture",
-        id: `capture-${index}`,
-        phase: "uncertain",
-        startedAtMs: Date.now() - 1_200_000,
-      },
-    }));
+    const pausedCapture = (id: string, startedAtMs = Date.now() - 1_200_000) =>
+      warmRecord({
+        operation: {
+          type: "capture",
+          id,
+          phase: "uncertain",
+          startedAtMs,
+        },
+      });
+    const records = Array.from({ length: 4 }, (_, index) => pausedCapture(`capture-${index}`));
     records.forEach((record, index) => store.register(`profile-${index}`, record));
 
     await provider.maintain!(context());
@@ -279,22 +269,11 @@ describe("Crabbox idle image maintenance", () => {
     }
     expect(calls).toEqual([]);
 
-    store.register("profile-0", {
-      version: 3,
-      allocations: {},
-      operation: {
-        type: "capture",
-        id: "replacement-capture",
-        phase: "uncertain",
-        startedAtMs: Date.now(),
-      },
-    });
+    store.register("profile-0", pausedCapture("replacement-capture", Date.now()));
     await provider.maintain!(context());
     expect(warn).toHaveBeenCalledTimes(2);
     expect(warn.mock.calls[1]?.[0]).toContain("replacement-capture");
-    records.forEach((_, index) =>
-      store.register(`profile-${index}`, { version: 3, allocations: {} }),
-    );
+    records.forEach((_, index) => store.register(`profile-${index}`, warmRecord()));
     await provider.maintain!(context());
     expect(warn).toHaveBeenCalledTimes(2);
     records.forEach((record, index) => store.register(`profile-${index}`, record));
@@ -339,7 +318,9 @@ describe("Crabbox idle image maintenance", () => {
         // Allocation has its own queue and must not wait on the pending deletion.
         await expect(
           provisionWarmProfile(provider, PROFILE, "during-maintenance"),
-        ).resolves.toMatchObject({ node: { deviceId: "device-1" } });
+        ).resolves.toMatchObject({
+          node: { deviceId: "device-1" },
+        });
         current = false;
         if (boundary !== "authority") {
           stopping = provider.dispose().then(() => {
@@ -358,7 +339,7 @@ describe("Crabbox idle image maintenance", () => {
         type: "retire",
         checkpointId: "chk_expired",
       });
-      expect(calls.filter(({ argv }) => argv[2] === "delete").map(({ argv }) => argv)).toEqual([
+      expect(checkpointArgs(calls, "delete")).toEqual([
         ["/opt/a/crabbox", "checkpoint", "delete", "chk_expired"],
       ]);
       await closeOpenClawStateDatabaseAsync();
@@ -464,11 +445,10 @@ describe("Crabbox idle image maintenance", () => {
       });
       const store = openWarmImageStore();
       store.register("expired", expiredImage("chk_expired"));
-      store.register("expired-cold-only", {
-        version: 3,
-        allocations: {},
-        captureUnsupported: captureUnsupported(now - REFRESH_MS),
-      });
+      store.register(
+        "expired-cold-only",
+        warmRecord({ captureUnsupported: captureUnsupported(now - REFRESH_MS) }),
+      );
 
       try {
         await provider.maintain!(mixedContext());

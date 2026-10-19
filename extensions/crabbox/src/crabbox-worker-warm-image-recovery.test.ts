@@ -1,13 +1,16 @@
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { describe, expect, it, vi } from "vitest";
 import { crabboxState, openWarmImageStore } from "./crabbox-state.test-support.js";
-import { destroyAndWait, commandResult } from "./crabbox-worker-provider.test-support.js";
 import {
-  listCrabboxWarmImages,
-  recoverCrabboxWarmImageCapture,
-} from "./crabbox-worker-warm-image-store.js";
+  checkpointArgs,
+  closeWarmState,
+  commandArgs,
+  firstWarmImage,
+  updateWarmImage,
+  warmEntry,
+} from "./crabbox-warm-scenarios.test-support.js";
+import { destroyAndWait, commandResult } from "./crabbox-worker-provider.test-support.js";
+import { recoverCrabboxWarmImageCapture } from "./crabbox-worker-warm-image-store.js";
 import {
   captureWarmImage,
   checkpointResult,
@@ -53,47 +56,39 @@ describe("Crabbox capture recovery", () => {
       const now = Date.now();
       const clock = vi.spyOn(Date, "now").mockReturnValue(now);
       const store = openWarmImageStore();
-      const image = store.entries()[0]!;
-      store.register(image.key, {
-        ...image.value,
-        image: { ...image.value.image!, createdAtMs: now - DAY_MS },
-      });
+      const image = updateWarmImage({ createdAtMs: now - DAY_MS });
       block = true;
       const stopping = destroyAndWait(initial.provider, {
         leaseId: first.leaseId,
         profile: PROFILE,
       });
       await entered.promise;
-      const selector = (await listCrabboxWarmImages(crabboxState))[0]?.capture?.selector;
+      const selector = (await firstWarmImage())?.capture?.selector;
       try {
         // Neither the former stale threshold nor image retention transfers capture ownership.
         clock.mockReturnValue(now + 15 * DAY_MS);
         await destroyAndWait(initial.provider, { leaseId: second.leaseId, profile: PROFILE });
-        expect((await listCrabboxWarmImages(crabboxState))[0]?.capture).toMatchObject({
+        expect((await firstWarmImage())?.capture).toMatchObject({
           selector,
           stale: true,
         });
         expect(store.lookup(image.key)?.image?.checkpointId).toBe(CHECKPOINT_ID);
         const reused = await provisionWarmProfile(initial.provider, PROFILE, "while-capturing");
-        expect(initial.calls.findLast(({ argv }) => argv[2] === "fork")?.argv[3]).toBe(
-          CHECKPOINT_ID,
-        );
+        expect(checkpointArgs(initial.calls, "fork").at(-1)?.[3]).toBe(CHECKPOINT_ID);
         await destroyAndWait(initial.provider, { leaseId: reused.leaseId, profile: PROFILE });
-        expect(initial.calls.filter(({ argv }) => argv[2] === "create")).toHaveLength(
-          phase === "create" ? 2 : 1,
-        );
+        expect(checkpointArgs(initial.calls, "create")).toHaveLength(phase === "create" ? 2 : 1);
       } finally {
         release.resolve();
       }
       await stopping;
-      expect(initial.calls.some(({ argv }) => argv[1] === "stop")).toBe(true);
+      expect(commandArgs(initial.calls, "stop").length).toBeGreaterThan(0);
       if (!fails) {
         expect(initial.calls.at(-1)?.argv[2]).toBe("delete");
       }
       expect(store.lookup(image.key)?.image?.checkpointId).toBe(
         fails ? CHECKPOINT_ID : "chk_after_delay",
       );
-      expect((await listCrabboxWarmImages(crabboxState))[0]?.capture?.selector).toBe(
+      expect((await firstWarmImage())?.capture?.selector).toBe(
         fails && phase === "create" ? selector : undefined,
       );
     },
@@ -111,20 +106,18 @@ describe("Crabbox capture recovery", () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(now + DAY_MS);
     failCreate = true;
     await captureWarmImage(initial.provider, PROFILE, "uncertain");
-    const selector = (await listCrabboxWarmImages(crabboxState))[0]!.capture!.selector;
-    await initial.provider.dispose();
-    await closeOpenClawStateDatabaseAsync();
-    resetPluginStateStoreForTests();
+    const selector = (await firstWarmImage())!.capture!.selector;
+    await closeWarmState(initial.provider);
     clock.mockReturnValue(now + 2 * DAY_MS);
     const restarted = createWarmProvider(undefined, initial.stateDir);
     await captureWarmImage(restarted.provider, PROFILE, "after-restart");
-    expect(restarted.calls.some(({ argv }) => argv[2] === "create")).toBe(false);
-    expect(restarted.calls.find(({ argv }) => argv[2] === "fork")?.argv[3]).toBe(CHECKPOINT_ID);
-    expect((await listCrabboxWarmImages(crabboxState))[0]?.capture?.selector).toBe(selector);
+    expect(checkpointArgs(restarted.calls, "create")).toEqual([]);
+    expect(checkpointArgs(restarted.calls, "fork")[0]?.[3]).toBe(CHECKPOINT_ID);
+    expect((await firstWarmImage())?.capture?.selector).toBe(selector);
     await recoverCrabboxWarmImageCapture(crabboxState, selector, true);
-    expect((await listCrabboxWarmImages(crabboxState))[0]?.checkpointId).toBe(CHECKPOINT_ID);
+    expect((await firstWarmImage())?.checkpointId).toBe(CHECKPOINT_ID);
     await captureWarmImage(restarted.provider, PROFILE, "after-recovery");
-    expect(restarted.calls.filter(({ argv }) => argv[2] === "create")).toHaveLength(1);
+    expect(checkpointArgs(restarted.calls, "create")).toHaveLength(1);
   });
 
   it.each([false, true])(
@@ -144,11 +137,7 @@ describe("Crabbox capture recovery", () => {
       });
       await captureWarmImage(provider);
       const store = openWarmImageStore();
-      const image = store.entries()[0]!;
-      store.register(image.key, {
-        ...image.value,
-        image: { ...image.value.image!, createdAtMs: Date.now() - DAY_MS },
-      });
+      const image = updateWarmImage({ createdAtMs: Date.now() - DAY_MS });
       const lease = await provisionWarmProfile(provider, PROFILE, "closed-scrub");
       block = true;
       const stopping = destroyAndWait(provider, { leaseId: lease.leaseId, profile: PROFILE });
@@ -157,7 +146,7 @@ describe("Crabbox capture recovery", () => {
         // Simulates the ownership handoff; a closed scrub must never issue create.
         await recoverCrabboxWarmImageCapture(
           crabboxState,
-          (await listCrabboxWarmImages(crabboxState))[0]!.capture!.selector,
+          (await firstWarmImage())!.capture!.selector,
           true,
         );
         store.update?.(
@@ -179,18 +168,18 @@ describe("Crabbox capture recovery", () => {
         release.resolve();
       }
       await stopping;
-      expect(calls.filter(({ argv }) => argv[2] === "create")).toHaveLength(1);
-      expect((await listCrabboxWarmImages(crabboxState))[0]?.capture?.selector).toBe(
-        "replacement-generation",
-      );
-      expect((await listCrabboxWarmImages(crabboxState))[0]?.checkpointId).toBe(CHECKPOINT_ID);
+      expect(checkpointArgs(calls, "create")).toHaveLength(1);
+      expect(await firstWarmImage()).toMatchObject({
+        capture: { selector: "replacement-generation" },
+        checkpointId: CHECKPOINT_ID,
+      });
     },
   );
   it("reclaims an idle image rather than a capture-owned last-good image at capacity", async () => {
     const { provider, calls } = createWarmProvider();
     await captureWarmImage(provider);
     const store = openWarmImageStore();
-    const image = store.entries()[0]!;
+    const image = warmEntry();
     const now = Date.now();
     const retained = {
       ...image.value,
@@ -213,10 +202,8 @@ describe("Crabbox capture recovery", () => {
     }
     calls.length = 0;
     await captureWarmImage(provider, { ...PROFILE, class: "fast" }, "different-profile");
-    expect(calls.filter(({ argv }) => argv[2] === "delete").map(({ argv }) => argv[3])).toEqual([
-      "chk_idle_0",
-    ]);
-    expect(calls.filter(({ argv }) => argv[2] === "create")).toHaveLength(1);
+    expect(checkpointArgs(calls, "delete").map((argv) => argv[3])).toEqual(["chk_idle_0"]);
+    expect(checkpointArgs(calls, "create")).toHaveLength(1);
     expect(store.lookup(image.key)).toEqual(retained);
     expect(store.entries()).toHaveLength(128);
   });

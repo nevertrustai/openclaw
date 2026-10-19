@@ -12,6 +12,7 @@ import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as managedBinary from "./crabbox-managed-binary.js";
 import { crabboxState } from "./crabbox-state.test-support.js";
+import { warmImage, warmRecord } from "./crabbox-warm-scenarios.test-support.js";
 import type { WarmProfileRecord } from "./crabbox-worker-warm-image-store.js";
 import {
   CRABBOX_CLOUD_WORKER_PROFILE_CHECK_ID,
@@ -22,6 +23,8 @@ import {
 const OPENCLAW_ROOT = path.resolve(path.sep, "workspace", "openclaw");
 const CRABBOX_SETUP_SECRETS_CHECK_ID = "crabbox/setup-secrets";
 const CRABBOX_WARM_IMAGES_CHECK_ID = "crabbox/warm-images";
+const runtime = () => ({ log: vi.fn(), error: vi.fn(), exit: vi.fn() });
+const protectedSecret = (id: string, provider = "default") => ({ source: "store", provider, id });
 const listPluginStateEntries: CrabboxDoctorRegistrationHost["listPluginStateEntries"] = <T>(
   options: OpenKeyedStoreOptions,
 ) => crabboxState.openKeyedStoreV2<T>(options).entries();
@@ -53,7 +56,7 @@ describe("Crabbox worker doctor", () => {
   afterEach(() => vi.restoreAllMocks());
   const context = (target = "linux"): HealthRepairContext => ({
     mode: "fix",
-    runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+    runtime: runtime(),
     cfg: {
       cloudWorkers: {
         profiles: {
@@ -197,10 +200,7 @@ describe("Crabbox worker doctor", () => {
       .spyOn(managedBinary, "ensureManagedCrabboxBinary")
       .mockImplementation(async (options = {}) => {
         const { binary } = options;
-        return {
-          binary: binary ?? "crabbox",
-          version: managedBinary.CRABBOX_MIN_VERSION,
-        };
+        return { binary: binary ?? "crabbox", version: managedBinary.CRABBOX_MIN_VERSION };
       });
     const check = captureCrabboxDoctorCheck();
     const findings = [{ checkId: CRABBOX_CLOUD_WORKER_PROFILE_CHECK_ID }] as never;
@@ -248,53 +248,38 @@ describe("Crabbox warm-image doctor", () => {
         env,
       });
       const now = Date.now();
-      const record: WarmProfileRecord = {
-        version: 3,
+      const record = warmRecord({
         profileId: "linux-development",
         backend: "aws",
         machineClass: "standard",
         os: "linux",
         projectLabel: "github.com/example/project",
-        allocations: {},
-        image: {
-          checkpointId: "chk_last_good",
-          kind: "native",
-          state: "available",
-          createdAtMs: now,
-          preparationKey: null,
-          cacheKey: null,
-          purpose: null,
-          lastDemandAtMs: now,
-        },
-        ...(operation === "unsupported"
-          ? {
-              captureUnsupported: {
-                atMs: now,
+        image: warmImage("chk_last_good", { createdAtMs: now, lastDemandAtMs: now }),
+      });
+      if (operation === "unsupported") {
+        record.captureUnsupported = {
+          atMs: now,
+          provider: "aws",
+          message: "Native capture is unsupported by this coordinator.",
+        };
+      } else {
+        record.operation =
+          operation === "retire"
+            ? { type: "retire", checkpointId: "chk_predecessor" }
+            : {
+                type: "capture",
+                id: "capture-selector",
+                leaseId: "cbx_capture",
                 provider: "aws",
-                message: "Native capture is unsupported by this coordinator.",
-              },
-            }
-          : operation
-            ? {
-                operation:
-                  operation === "retire"
-                    ? { type: "retire" as const, checkpointId: "chk_predecessor" }
-                    : {
-                        type: "capture" as const,
-                        id: "capture-selector",
-                        startedAtMs: now - (operation === "stale-scrub" ? 1_200_000 : 0),
-                        leaseId: "cbx_capture",
-                        provider: "aws",
-                        phase:
-                          operation === "uncertain"
-                            ? ("uncertain" as const)
-                            : operation === "stale-scrub"
-                              ? ("scrubbing" as const)
-                              : ("creating" as const),
-                      },
-              }
-            : {}),
-      };
+                startedAtMs: now - (operation === "stale-scrub" ? 1_200_000 : 0),
+                phase:
+                  operation === "uncertain"
+                    ? "uncertain"
+                    : operation === "stale-scrub"
+                      ? "scrubbing"
+                      : "creating",
+              };
+      }
       store.register("profile", record);
       const probe = vi.spyOn(managedBinary, "probeCrabboxVersion");
       const command = vi
@@ -305,30 +290,26 @@ describe("Crabbox warm-image doctor", () => {
         cfg: {},
         env,
         mode: "fix",
-        runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+        runtime: runtime(),
       };
 
       const findings = await check.detect(context);
 
-      expect(findings).toEqual(
-        severity
-          ? [
-              expect.objectContaining({
-                checkId: CRABBOX_WARM_IMAGES_CHECK_ID,
-                target: "profile",
-                severity,
-                message: expect.stringContaining(
-                  "linux-development · aws · standard · linux · github.com/example/project",
-                ),
-                fixHint: expect.stringContaining(
-                  operation === "unsupported"
-                    ? "settings.warmImage: false"
-                    : "openclaw crabbox warm-images",
-                ),
-              }),
-            ]
-          : [],
-      );
+      expect(findings).toEqual([
+        expect.objectContaining({
+          checkId: CRABBOX_WARM_IMAGES_CHECK_ID,
+          target: "profile",
+          severity,
+          message: expect.stringContaining(
+            "linux-development · aws · standard · linux · github.com/example/project",
+          ),
+          fixHint: expect.stringContaining(
+            operation === "unsupported"
+              ? "settings.warmImage: false"
+              : "openclaw crabbox warm-images",
+          ),
+        }),
+      ]);
       if (operation === "unsupported") {
         expect(findings[0]?.message).toContain(record.captureUnsupported!.message);
         expect(findings[0]?.fixHint).toContain("otherwise provision cold");
@@ -358,7 +339,7 @@ describe("Crabbox setup secret migration", () => {
   const context = (settings: Record<string, unknown>): HealthRepairContext => ({
     cfg: { cloudWorkers: { profiles: { worker: { provider: "crabbox", settings } } } },
     mode: "fix",
-    runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+    runtime: runtime(),
   });
   const ready: CrabboxDoctorRegistrationHost["inspectSetupSecrets"] = async (names) =>
     names.map((name) => ({ name, status: "ready" }));
@@ -373,7 +354,7 @@ describe("Crabbox setup secret migration", () => {
         {},
         base.cfg,
         context({
-          setupSecrets: { TOKEN: { source: "store", provider: "default", id: "TOKEN" } },
+          setupSecrets: { TOKEN: protectedSecret("TOKEN") },
         }).cfg,
         context({ setupEnv: [] }).cfg,
       ]) {
@@ -405,8 +386,8 @@ describe("Crabbox setup secret migration", () => {
       setup: "install",
       class: "standard",
       setupSecrets: {
-        TOKEN: { source: "store", provider: "default", id: "TOKEN" },
-        PASSWORD: { source: "store", provider: "default", id: "PASSWORD" },
+        TOKEN: protectedSecret("TOKEN"),
+        PASSWORD: protectedSecret("PASSWORD"),
       },
     });
     expect(ctx.cfg).toEqual(before);
@@ -433,7 +414,7 @@ describe("Crabbox setup secret migration", () => {
     const check = captureCrabboxDoctorCheck(CRABBOX_SETUP_SECRETS_CHECK_ID, ready);
     const ctx = context({
       setupEnv: ["TOKEN"],
-      setupSecrets: { TOKEN: { source: "store", provider: "default", id: "OTHER" } },
+      setupSecrets: { TOKEN: protectedSecret("OTHER") },
     });
     ctx.cfg.cloudWorkers!.profiles!.other = { provider: "crabbox", settings: { setupEnv: [] } };
     const result = await check.repair!(ctx, []);
@@ -449,12 +430,12 @@ describe("Crabbox setup secret migration", () => {
     const check = captureCrabboxDoctorCheck(CRABBOX_SETUP_SECRETS_CHECK_ID, ready);
     const ctx = context({
       setupEnv: ["TOKEN"],
-      setupSecrets: { TOKEN: { source: "store", provider: "protected", id: "TOKEN" } },
+      setupSecrets: { TOKEN: protectedSecret("TOKEN", "protected") },
     });
     ctx.cfg.secrets = { defaults: { store: "protected" } };
     const result = await check.repair!(ctx, []);
     expect(result.config?.cloudWorkers?.profiles?.worker?.settings).toEqual({
-      setupSecrets: { TOKEN: { source: "store", provider: "protected", id: "TOKEN" } },
+      setupSecrets: { TOKEN: protectedSecret("TOKEN", "protected") },
     });
   });
 });
