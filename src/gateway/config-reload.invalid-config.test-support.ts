@@ -19,7 +19,7 @@ export function registerInvalidConfigReloadTests(tempDirs: { make(prefix: string
   it("skips schema-invalid saves using the Gateway's prepared plugin metadata", async () => {
     const root = tempDirs.make("openclaw-invalid-reload-");
     const configPath = path.join(root, "openclaw.json");
-    const initialConfig: OpenClawConfig = { gateway: { reload: { debounceMs: 0 } } };
+    const initialConfig: OpenClawConfig = { gateway: { reload: {} } };
     const io = createConfigIO({
       configPath,
       env: {
