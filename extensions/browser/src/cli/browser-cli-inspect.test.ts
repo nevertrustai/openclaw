@@ -2,14 +2,13 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command } from "commander";
-import { defaultRuntime } from "openclaw/plugin-sdk/runtime-env";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { createCliRuntimeCapture } from "../../test-support.js";
 import type { SnapshotResult } from "../browser/client.js";
+import { createBrowserCliCapture } from "./browser-cli-extension.test-support.js";
 import * as browserCliSharedModule from "./browser-cli-shared.js";
 
-const { defaultRuntime: runtime, resetRuntimeCapture } = createCliRuntimeCapture();
+const { runtime, installRuntime, resetRuntimeCapture } = createBrowserCliCapture();
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 const configMocks = vi.hoisted(() => ({
@@ -40,10 +39,7 @@ function installInspectSpies() {
   vi.spyOn(browserCliSharedModule, "callBrowserRequest").mockImplementation(
     sharedMocks.callBrowserRequest,
   );
-  vi.spyOn(defaultRuntime, "log").mockImplementation(runtime.log);
-  vi.spyOn(defaultRuntime, "writeJson").mockImplementation(runtime.writeJson);
-  vi.spyOn(defaultRuntime, "error").mockImplementation(runtime.error);
-  vi.spyOn(defaultRuntime, "exit").mockImplementation(runtime.exit);
+  installRuntime();
 }
 
 describe("browser cli snapshot defaults", () => {
@@ -132,49 +128,27 @@ describe("browser cli snapshot defaults", () => {
     },
   );
 
-  it("uses config snapshot defaults when mode is not provided", async () => {
-    configMocks.getRuntimeConfig.mockReturnValue({
+  it.each([
+    {
+      args: [],
       browser: { snapshotDefaults: { mode: "efficient" } },
-    });
-
-    const params = await runSnapshot([]);
-    expect(params).toMatchObject({ path: "/snapshot", query: { format: "ai", mode: "efficient" } });
+      query: { format: "ai", mode: "efficient" },
+    },
+    { args: ["--efficient"], browser: {}, query: { format: "ai", mode: "efficient" } },
+    { args: ["--urls"], browser: {}, query: { format: "ai", urls: true } },
+    { args: ["--limit", "+10", "--depth", "+0"], browser: {}, query: { limit: 10, depth: 0 } },
+  ])("builds snapshot query $query for $args", async ({ args, browser, query }) => {
+    configMocks.getRuntimeConfig.mockReturnValue({ browser });
+    expect(await runSnapshot(args)).toMatchObject({ path: "/snapshot", query });
   });
 
-  it("applies explicit efficient mode without config defaults", async () => {
-    const params = await runSnapshot(["--efficient"]);
-    expect(params?.query).toMatchObject({ format: "ai", mode: "efficient" });
-  });
-
-  it("passes URL expansion for snapshots", async () => {
-    const params = await runSnapshot(["--urls"]);
-    expect(params?.query).toMatchObject({ format: "ai", urls: true });
-  });
-
-  it("rejects non-integer snapshot numeric options before dispatch", async () => {
-    await expect(runSnapshot(["--limit", "1e3"])).rejects.toThrow("__exit__:1");
-    expect(runtime.error.mock.calls.at(-1)?.[0]).toContain(
-      "Invalid --limit: must be an integer >= 1",
-    );
-
-    resetRuntimeCapture();
-    await expect(runSnapshot(["--depth", "-1"])).rejects.toThrow("__exit__:1");
-    expect(runtime.error.mock.calls.at(-1)?.[0]).toContain(
-      "Invalid --depth: must be an integer >= 0",
-    );
-
-    expect(sharedMocks.callBrowserRequest).not.toHaveBeenCalled();
-  });
-
-  it("accepts signed decimal snapshot numeric options", async () => {
-    const params = await runSnapshot(["--limit", "+10", "--depth", "+0"]);
-    expect(params?.query).toMatchObject({ limit: 10, depth: 0 });
-  });
-
-  it("rejects unsupported snapshot mode before dispatch", async () => {
-    await expect(runBrowserInspect(["snapshot", "--mode", "full"])).rejects.toThrow("__exit__:1");
-
-    expect(runtime.error.mock.calls.at(-1)?.[0]).toContain("Invalid --mode: expected efficient");
+  it.each([
+    ["--limit", "1e3", "Invalid --limit: must be an integer >= 1"],
+    ["--depth", "-1", "Invalid --depth: must be an integer >= 0"],
+    ["--mode", "full", "Invalid --mode: expected efficient"],
+  ])("rejects snapshot %s %s before dispatch", async (option, value, message) => {
+    await expect(runSnapshot([option, value])).rejects.toThrow("__exit__:1");
+    expect(runtime.error.mock.calls.at(-1)?.[0]).toContain(message);
     expect(sharedMocks.callBrowserRequest).not.toHaveBeenCalled();
   });
 

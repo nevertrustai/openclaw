@@ -102,21 +102,14 @@ function requireTrailingCommand(args: unknown[], label: string): Command {
 }
 
 describe("registerBrowserCli lazy browser subcommands", () => {
-  it("declares default JSON output for session storage", () => {
-    expect(machineOutput("storage", "session", "get", "key")).toBe(true);
-  });
-
-  it("declares explicit JSON output for extension uninstall-host", () => {
-    expect(machineOutput("extension", "uninstall-host", "--json")).toBe(true);
-  });
-
-  it("keeps human browser commands out of machine-output mode", () => {
-    expect(machineOutput("status")).toBe(false);
-    expect(machineOutput("cookies", "set")).toBe(false);
-  });
-
-  it("accepts supported root options after browser", () => {
-    expect(machineOutput("--log-level", "debug", "evaluate")).toBe(true);
+  it.each([
+    { args: ["storage", "session", "get", "key"], machine: true },
+    { args: ["extension", "uninstall-host", "--json"], machine: true },
+    { args: ["status"], machine: false },
+    { args: ["cookies", "set"], machine: false },
+    { args: ["--log-level", "debug", "evaluate"], machine: true },
+  ])("detects machine=$machine output for $args", ({ args, machine }) => {
+    expect(machineOutput(...args)).toBe(machine);
   });
 
   beforeEach(() => {

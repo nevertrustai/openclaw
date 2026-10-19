@@ -22,25 +22,14 @@ function mockBrowserResponses(
   });
 }
 
-function makeStatus(overrides: Partial<BrowserStatus> = {}): BrowserStatus {
+function makeStatus(overrides: Partial<BrowserStatus> = {}) {
   return {
     enabled: true,
     profile: "chrome-live",
-    driver: "existing-session",
-    transport: "chrome-mcp",
+    driver: "existing-session" as const,
+    transport: "chrome-mcp" as const,
     running: true,
-    cdpReady: true,
-    cdpHttp: true,
-    pid: 4321,
-    cdpPort: null,
-    cdpUrl: null,
-    chosenBrowser: null,
-    userDataDir: null,
-    color: "#00AA00",
     headless: false,
-    noSandbox: false,
-    executablePath: null,
-    attachOnly: true,
     ...overrides,
   };
 }
@@ -53,18 +42,11 @@ function mockResponse(path: string, response: Record<string, unknown>) {
   mockBrowserResponses({ [path]: response }, {});
 }
 
-function makeProfile(overrides: Partial<ProfileStatus> = {}): ProfileStatus {
+function makeProfile(overrides: Partial<ProfileStatus> = {}) {
   return {
     name: "chrome-live",
-    driver: "existing-session",
-    transport: "chrome-mcp",
-    running: true,
     tabCount: 2,
-    isDefault: false,
-    isRemote: false,
-    cdpPort: null,
-    cdpUrl: null,
-    color: "#00AA00",
+    ...makeStatus(),
     ...overrides,
   };
 }
@@ -236,13 +218,9 @@ describe("browser manage output", () => {
     "redacts cdpUrl after creating a $transport profile",
     async ({ profile, transport, driver }) => {
       mockResponse("/profiles/create", {
-        ok: true,
         profile,
         transport,
-        cdpPort: null,
         cdpUrl: secretUrl,
-        userDataDir: null,
-        color: "#00AA00",
         isRemote: true,
       });
       await run(["create-profile", "--name", profile, ...driver, "--cdp-url", secretUrl]);
@@ -325,13 +303,9 @@ describe("browser manage output", () => {
   });
 
   it("rejects unsupported profile drivers before creating a profile", async () => {
-    const program = createBrowserManageProgram();
-
-    await expect(
-      program.parseAsync(["browser", "create-profile", "--name", "test", "--driver", "chromium"], {
-        from: "user",
-      }),
-    ).rejects.toThrow("__exit__:1");
+    await expect(run(["create-profile", "--name", "test", "--driver", "chromium"])).rejects.toThrow(
+      "__exit__:1",
+    );
 
     expect(getBrowserCliRuntimeCapture().runtimeErrors.at(-1)).toContain(
       "--driver must be openclaw or existing-session",
@@ -390,27 +364,14 @@ describe("browser manage output", () => {
           profile: "openclaw",
           driver: "openclaw",
           transport: "cdp",
-          cdpPort: 18792,
-          cdpUrl: "http://127.0.0.1:18792",
-          chosenBrowser: "chrome",
-          attachOnly: false,
           graphics: graphics({
             acceleration: "software",
             renderer: "ANGLE (Google, SwiftShader Device)",
-            vendor: "Google Inc.",
             backend: "(gl=angle,angle=swiftshader)",
           }),
         }),
       },
-      [
-        {
-          targetId: "abc",
-          tabId: "t1",
-          suggestedTargetId: "t1",
-          title: "Example",
-          url: "https://example.com",
-        },
-      ],
+      [{ suggestedTargetId: "t1" }],
     );
 
     await run(["doctor"]);
