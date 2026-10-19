@@ -1,6 +1,6 @@
-// Draft stream loop tests cover incremental draft updates while channel replies stream.
 import { setImmediate as nextMacrotask } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { createDraftStreamLoop } from "./draft-stream-loop.js";
 
 const flushMicrotasks = async () => {
@@ -8,9 +8,19 @@ const flushMicrotasks = async () => {
   await Promise.resolve();
 };
 
-const flushMacrotask = async () => {
-  await nextMacrotask();
-};
+function createLoop<T = string>(
+  sendOrEditStreamMessage: Parameters<
+    typeof createDraftStreamLoop<T>
+  >[0]["sendOrEditStreamMessage"],
+  overrides: Partial<Parameters<typeof createDraftStreamLoop<T>>[0]> = {},
+) {
+  return createDraftStreamLoop<T>({
+    throttleMs: 0,
+    isStopped: () => false,
+    sendOrEditStreamMessage,
+    ...overrides,
+  });
+}
 
 async function waitForBackgroundFlushError(
   onBackgroundFlushError: ReturnType<typeof vi.fn<(err: unknown) => void>>,
@@ -23,10 +33,7 @@ async function waitForBackgroundFlushError(
   }
 }
 
-async function captureUnhandledRejections(
-  run: (rejections: unknown[]) => Promise<void>,
-  settle: () => Promise<void> = flushMacrotask,
-) {
+async function captureUnhandledRejections(run: (rejections: unknown[]) => Promise<void>) {
   const rejections: unknown[] = [];
   const onUnhandledRejection = (reason: unknown) => {
     rejections.push(reason);
@@ -34,7 +41,7 @@ async function captureUnhandledRejections(
   process.on("unhandledRejection", onUnhandledRejection);
   try {
     await run(rejections);
-    await settle();
+    await nextMacrotask();
   } finally {
     process.off("unhandledRejection", onUnhandledRejection);
   }
@@ -46,15 +53,12 @@ describe("createDraftStreamLoop", () => {
     async (outcome) => {
       vi.useFakeTimers();
       vi.setSystemTime(10_000);
-      let releaseFirst!: () => void;
-      const first = new Promise<void>((resolve) => {
-        releaseFirst = resolve;
-      });
+      const first = createDeferred();
       const error = new Error("send rejected");
       const onBackgroundFlushError = vi.fn();
       const send = vi.fn(async () => {
         if (send.mock.calls.length === 1) {
-          await first;
+          await first.promise;
           if (outcome === "rejected") {
             throw error;
           }
@@ -62,16 +66,14 @@ describe("createDraftStreamLoop", () => {
         }
         return true;
       });
-      const loop = createDraftStreamLoop({
+      const loop = createLoop(send, {
         throttleMs: 1_000,
         coalesceInFlight: true,
-        isStopped: () => false,
-        sendOrEditStreamMessage: send,
         onBackgroundFlushError,
       });
       loop.update("First snapshot");
       loop.update("New milestone");
-      releaseFirst();
+      first.resolve();
       if (outcome === "rejected") {
         await expect(loop.waitForInFlight()).rejects.toBe(error);
         await waitForBackgroundFlushError(onBackgroundFlushError);
@@ -89,25 +91,20 @@ describe("createDraftStreamLoop", () => {
   it("coalesces updates arriving during a send without delaying explicit attention flushes", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(10_000);
-    let releaseFirst!: () => void;
-    const first = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
+    const first = createDeferred();
     const send = vi.fn(async () => {
       if (send.mock.calls.length === 1) {
-        await first;
+        await first.promise;
       }
     });
-    const loop = createDraftStreamLoop({
+    const loop = createLoop(send, {
       throttleMs: 1_000,
       coalesceInFlight: true,
-      isStopped: () => false,
-      sendOrEditStreamMessage: send,
     });
     loop.update("First milestone");
     loop.update("Second milestone");
     loop.update("Latest milestone");
-    releaseFirst();
+    first.resolve();
     await loop.waitForInFlight();
     await vi.advanceTimersByTimeAsync(999);
     expect(send).toHaveBeenCalledTimes(1);
@@ -134,19 +131,12 @@ describe("createDraftStreamLoop", () => {
   it("takes the latest queued text without interrupting the in-flight send", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
-    let releaseSend: (() => void) | undefined;
-    const sendPending = new Promise<void>((resolve) => {
-      releaseSend = resolve;
-    });
+    const sendPending = createDeferred();
     const sendOrEditStreamMessage = vi.fn(async () => {
-      await sendPending;
+      await sendPending.promise;
       return true;
     });
-    const loop = createDraftStreamLoop({
-      throttleMs: 0,
-      isStopped: () => false,
-      sendOrEditStreamMessage,
-    });
+    const loop = createLoop(sendOrEditStreamMessage);
 
     loop.update("in flight");
     await flushMicrotasks();
@@ -157,7 +147,7 @@ describe("createDraftStreamLoop", () => {
     expect(loop.takePending()).toBe("queued latest");
     expect(vi.getTimerCount()).toBe(0);
 
-    releaseSend?.();
+    sendPending.resolve();
     await loop.waitForInFlight();
     await flushMicrotasks();
 
@@ -175,16 +165,11 @@ describe("createDraftStreamLoop", () => {
         })
         .mockResolvedValueOnce(true);
 
-      const loop = createDraftStreamLoop({
-        throttleMs: 0,
-        isStopped: () => false,
-        sendOrEditStreamMessage,
-        onBackgroundFlushError,
-      });
+      const loop = createLoop(sendOrEditStreamMessage, { onBackgroundFlushError });
 
       loop.update("hello");
       await waitForBackgroundFlushError(onBackgroundFlushError);
-      await flushMacrotask();
+      await nextMacrotask();
       await loop.flush();
 
       expect(rejections).toStrictEqual([]);
@@ -198,30 +183,24 @@ describe("createDraftStreamLoop", () => {
     type Update = { text: string; blocks: string[] };
     const initial = { text: "initial", blocks: ["initial-blocks"] };
     const latest = { text: "latest", blocks: ["latest-blocks"] };
-    let releaseFirst: (() => void) | undefined;
-    const firstSend = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
+    const firstSend = createDeferred();
     const sendOrEditStreamMessage = vi
       .fn<(update: Update) => Promise<boolean>>()
       .mockImplementationOnce(async () => {
-        await firstSend;
+        await firstSend.promise;
         return false;
       })
       .mockResolvedValueOnce(false)
       .mockResolvedValueOnce(true);
-    const loop = createDraftStreamLoop<Update>({
-      throttleMs: 0,
-      isStopped: () => false,
+    const loop = createLoop<Update>(sendOrEditStreamMessage, {
       emptyValue: { text: "", blocks: [] },
       isEmpty: (update) => !update.text,
-      sendOrEditStreamMessage,
     });
 
     loop.update(initial);
     await flushMicrotasks();
     loop.update(latest);
-    releaseFirst?.();
+    firstSend.resolve();
     await loop.flush();
     await loop.flush();
 

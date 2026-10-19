@@ -1,6 +1,21 @@
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import type { ChannelStreamingProgressConfig } from "../config/types.base.js";
 import { createChannelProgressDraftCompositor } from "./progress-draft-compositor.js";
 import type { ChannelProgressDraftCompositorParams } from "./progress-draft-compositor.types.js";
+
+function entry(progress: ChannelStreamingProgressConfig) {
+  return { streaming: { mode: "progress" as const, progress } };
+}
+const createUpdate = () =>
+  vi.fn<NonNullable<ChannelProgressDraftCompositorParams["update"]>>(() => true);
+function expectText(text: string, included: string[], excluded: string[] = []) {
+  for (const value of included) {
+    expect(text).toContain(value);
+  }
+  for (const value of excluded) {
+    expect(text).not.toContain(value);
+  }
+}
 
 function createProgress(overrides: Partial<ChannelProgressDraftCompositorParams> = {}) {
   const progress = createChannelProgressDraftCompositor({
@@ -8,12 +23,7 @@ function createProgress(overrides: Partial<ChannelProgressDraftCompositorParams>
     mode: "progress",
     seed: "snapshot",
     preparedItems: true,
-    entry: {
-      streaming: {
-        mode: "progress",
-        progress: { label: false, commentary: true, toolProgress: true, maxLines: 8 },
-      },
-    },
+    entry: entry({ label: false, commentary: true, toolProgress: true, maxLines: 8 }),
     update: () => true,
     ...overrides,
   });
@@ -28,15 +38,10 @@ describe("progress draft snapshot continuation", () => {
 
   it("preserves public progress in rendering and snapshot capture", async () => {
     const secret = `sk-test-${"a".repeat(48)}`;
-    const update = vi.fn<NonNullable<ChannelProgressDraftCompositorParams["update"]>>(() => true);
+    const update = createUpdate();
     const progress = createProgress({
       update,
-      entry: {
-        streaming: {
-          mode: "progress",
-          progress: { label: `Account ${secret}`, commentary: true, toolProgress: true },
-        },
-      },
+      entry: entry({ label: `Account ${secret}`, commentary: true, toolProgress: true }),
     });
     await progress.start();
     await progress.pushPlanProgress([{ step: `Check account ${secret}`, status: "in_progress" }], {
@@ -79,7 +84,7 @@ describe("progress draft snapshot continuation", () => {
         statusHeadlineFormat: "plain" as const,
         preparedBlocks: [{ text: "Old transport markup", format: "markdown" as const }],
       };
-      const update = vi.fn<NonNullable<ChannelProgressDraftCompositorParams["update"]>>(() => true);
+      const update = createUpdate();
       const progress = createProgress({
         initialSnapshot,
         update: mode === "live" ? update : undefined,
@@ -99,12 +104,11 @@ describe("progress draft snapshot continuation", () => {
       expect(progress.isVisible).toBe(mode === "live");
       expect(vi.getTimerCount()).toBe(0);
       const text = progress.getText();
-      expect(text).toContain("Parent label");
-      expect(text).toContain("Parent note");
-      expect(text).toContain("Inspect");
-      expect(text).toContain("Repair");
-      expect(text).toContain("Transferred \\*headline\\*");
-      expect(text).not.toContain("Old transport markup");
+      expectText(
+        text,
+        ["Parent label", "Parent note", "Inspect", "Repair", "Transferred \\*headline\\*"],
+        ["Old transport markup"],
+      );
       expect(
         progress
           .getSnapshot()
@@ -121,8 +125,7 @@ describe("progress draft snapshot continuation", () => {
         expect.objectContaining({ id: "child" }),
       );
       await progress.pushNarrationProgress("Child status");
-      expect(progress.getText()).toContain("Child status");
-      expect(progress.getText()).not.toContain("Transferred");
+      expectText(progress.getText(), ["Child status"], ["Transferred"]);
       expect(progress.getSnapshot().statusHeadlineFormat).toBeUndefined();
       await progress.pushNarrationProgress("");
       expect(progress.getText()).toContain("Checking \\*literal\\* input");
@@ -146,16 +149,11 @@ describe("progress draft snapshot continuation", () => {
     });
     const initialSnapshot = parent.getSnapshot();
     parent.cancel();
-    const update = vi.fn<NonNullable<ChannelProgressDraftCompositorParams["update"]>>(() => true);
+    const update = createUpdate();
     const progress = createProgress({
       initialSnapshot,
       update,
-      entry: {
-        streaming: {
-          mode: "progress",
-          progress: { label: false, commentary: true, toolProgress: false, maxLines: 2 },
-        },
-      },
+      entry: entry({ label: false, commentary: true, toolProgress: false, maxLines: 2 }),
     });
     await progress.noteActivity({ startImmediately: true });
     await progress.pushItemEvent({ itemId: "private", hideFromChannelProgress: true });
@@ -173,14 +171,10 @@ describe("progress draft snapshot continuation", () => {
     );
     await progress.pushCommentaryProgress("Child note", { itemId: "child" });
     const text = update.mock.lastCall?.[0] ?? "";
-    expect(text).toContain("Allow repair");
-    expect(text).toContain("Parent checklist");
-    expect(text).not.toContain("Sensitive row");
-    expect(text).not.toContain("failed");
+    expectText(text, ["Allow repair", "Parent checklist"], ["Sensitive row", "failed"]);
     expect(text.split("\n").filter(Boolean)).toHaveLength(2);
     await progress.pushApprovalEvent({ phase: "resolved", approvalId: "approval" });
-    expect(update.mock.lastCall?.[0]).not.toContain("Allow repair");
-    expect(update.mock.lastCall?.[0]).toContain("Child note");
+    expectText(update.mock.lastCall?.[0] ?? "", ["Child note"], ["Allow repair"]);
   });
 
   it("retains known mutation totals without inventing cross-owner file uniqueness", async () => {

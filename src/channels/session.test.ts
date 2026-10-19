@@ -22,20 +22,33 @@ type SessionModule = typeof import("./session.js");
 let recordInboundSession: SessionModule["recordInboundSession"];
 
 describe("recordInboundSession", () => {
+  const sessionKey = "agent:main:demo-channel:1234:thread:42";
+  const route = { sessionKey: "agent:main:main", channel: "demo-channel", to: "demo-channel:1234" };
   const ctx: MsgContext = {
     Provider: "demo-channel",
     From: "demo-channel:1234",
-    SessionKey: "agent:main:demo-channel:1234:thread:42",
+    SessionKey: sessionKey,
     OriginatingTo: "demo-channel:1234",
   };
 
-  function record(overrides: Partial<Parameters<SessionModule["recordInboundSession"]>[0]>) {
+  function record(overrides: Partial<Parameters<SessionModule["recordInboundSession"]>[0]> = {}) {
     return recordInboundSession({
       storePath: "/tmp/openclaw-session-store.json",
-      sessionKey: "agent:main:demo-channel:1234:thread:42",
+      sessionKey,
       ctx,
       onRecordError: vi.fn(),
       ...overrides,
+    });
+  }
+
+  async function admissionFailure(pending: boolean) {
+    const { AgentDatabaseAdmissionError } = await import("../state/agent-database-admission.js");
+    return new AgentDatabaseAdmissionError({
+      agentId: "main",
+      paths: ["/tmp/openclaw-agent.sqlite"],
+      code: pending ? "agent-database-inspection-pending" : "agent-database-inspection-failed",
+      reason: pending ? "Startup preparation is pending" : "Startup preparation failed",
+      repairHint: pending ? "Wait for startup preparation to finish" : "Run openclaw doctor --fix",
     });
   }
 
@@ -56,7 +69,7 @@ describe("recordInboundSession", () => {
       return writer.promise;
     });
     const returned = vi.fn();
-    const work = record({}).then(returned);
+    const work = record().then(returned);
     try {
       await started.promise;
       await Promise.resolve();
@@ -98,14 +111,7 @@ describe("recordInboundSession", () => {
   });
 
   it("rejects pending database admission before dispatch even when reporting fails", async () => {
-    const { AgentDatabaseAdmissionError } = await import("../state/agent-database-admission.js");
-    const failure = new AgentDatabaseAdmissionError({
-      agentId: "main",
-      paths: ["/tmp/openclaw-agent.sqlite"],
-      code: "agent-database-inspection-pending",
-      reason: "Startup preparation is pending",
-      repairHint: "Wait for startup preparation to finish",
-    });
+    const failure = await admissionFailure(true);
     const onRecordError = vi.fn(() => {
       throw new Error("reporting failed");
     });
@@ -118,11 +124,7 @@ describe("recordInboundSession", () => {
         trackSessionMetaTask: (task) => {
           trackedTask = task;
         },
-        updateLastRoute: {
-          sessionKey: "agent:main:demo-channel:1234:thread:42",
-          channel: "demo-channel",
-          to: "demo-channel:1234",
-        },
+        updateLastRoute: { ...route, sessionKey },
       }),
     ).rejects.toBe(failure);
 
@@ -133,14 +135,7 @@ describe("recordInboundSession", () => {
   });
 
   it("keeps terminal database admission metadata errors best effort", async () => {
-    const { AgentDatabaseAdmissionError } = await import("../state/agent-database-admission.js");
-    const failure = new AgentDatabaseAdmissionError({
-      agentId: "main",
-      paths: ["/tmp/openclaw-agent.sqlite"],
-      code: "agent-database-inspection-failed",
-      reason: "Startup preparation failed",
-      repairHint: "Run openclaw doctor --fix",
-    });
+    const failure = await admissionFailure(false);
     const onRecordError = vi.fn();
     recordSessionMetaFromInboundMock.mockRejectedValueOnce(failure);
 
@@ -150,13 +145,15 @@ describe("recordInboundSession", () => {
 
   it("preserves Signal group ids before recording and route updates", async () => {
     const mixedGroupId = "VWATodkf2hc8zdOS76q9Tb0+5Bi522E03qLdaQ/9ypg=";
+    const group = `signal:group:${mixedGroupId}`;
+    const key = `agent:main:${group}`;
     const signalCtx: MsgContext = {
       Provider: "signal",
       ChatType: "group",
-      From: `signal:group:${mixedGroupId}`,
-      To: `signal:group:${mixedGroupId}`,
-      SessionKey: `agent:main:signal:group:${mixedGroupId}`,
-      OriginatingTo: `signal:group:${mixedGroupId}`,
+      From: group,
+      To: group,
+      SessionKey: key,
+      OriginatingTo: group,
     };
 
     await record({
@@ -165,16 +162,14 @@ describe("recordInboundSession", () => {
       updateLastRoute: {
         sessionKey: `Agent:Main:Signal:Group:${mixedGroupId}`,
         channel: "signal",
-        to: `signal:group:${mixedGroupId}`,
+        to: group,
       },
     });
 
-    expect(recordSessionMetaFromInboundMock.mock.calls[0]?.[0].sessionKey).toBe(
-      `agent:main:signal:group:${mixedGroupId}`,
-    );
-    const route = updateLastRouteMock.mock.calls[0]?.[0];
-    expect(route?.sessionKey).toBe(`agent:main:signal:group:${mixedGroupId}`);
-    expect(route?.ctx).toBe(signalCtx);
+    expect(recordSessionMetaFromInboundMock.mock.calls[0]?.[0].sessionKey).toBe(key);
+    const recordedRoute = updateLastRouteMock.mock.calls[0]?.[0];
+    expect(recordedRoute?.sessionKey).toBe(key);
+    expect(recordedRoute?.ctx).toBe(signalCtx);
   });
 
   it("skips last-route updates when main DM owner pin mismatches sender", async () => {
@@ -182,9 +177,7 @@ describe("recordInboundSession", () => {
 
     await record({
       updateLastRoute: {
-        sessionKey: "agent:main:main",
-        channel: "demo-channel",
-        to: "demo-channel:1234",
+        ...route,
         mainDmOwnerPin: {
           ownerRecipient: "1234",
           senderRecipient: "9999",
@@ -203,16 +196,13 @@ describe("recordInboundSession", () => {
   it("forwards session creation policy to last-route updates", async () => {
     await record({
       createIfMissing: false,
-      updateLastRoute: {
-        sessionKey: "agent:main:main",
-        channel: "demo-channel",
-        to: "demo-channel:1234",
-      },
+      updateLastRoute: route,
     });
 
     expect(recordSessionMetaFromInboundMock.mock.calls[0]?.[0].createIfMissing).toBe(false);
-    const route = updateLastRouteMock.mock.calls[0]?.[0];
-    expect(route?.sessionKey).toBe("agent:main:main");
-    expect(route?.createIfMissing).toBe(false);
+    expect(updateLastRouteMock.mock.calls[0]?.[0]).toMatchObject({
+      sessionKey: route.sessionKey,
+      createIfMissing: false,
+    });
   });
 });

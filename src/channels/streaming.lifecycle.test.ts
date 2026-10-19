@@ -4,9 +4,9 @@ import {
   buildChannelProgressDraftLine,
   createChannelProgressDraftGate,
   formatChannelProgressDraftLine,
-  formatChannelProgressDraftText,
+  formatChannelProgressDraftText as formatText,
   isChannelProgressDraftWorkToolName,
-  mergeChannelProgressDraftLine,
+  mergeChannelProgressDraftLine as mergeLine,
   resolveChannelProgressDraftMaxLineChars,
   resolveChannelProgressDraftMaxLines,
   resolveChannelStreamingBlockCoalesce,
@@ -20,6 +20,12 @@ import {
 } from "./streaming.js";
 
 const DEFAULT_PROGRESS_DRAFT_INITIAL_DELAY_MS = 1_500;
+const commentary = (text: string) => ({
+  kind: "item" as const,
+  text,
+  label: "Commentary",
+  prefix: false,
+});
 
 describe("channel-streaming", () => {
   afterEach(() => {
@@ -43,26 +49,26 @@ describe("channel-streaming", () => {
       },
     } as const;
 
-    expect(resolveChannelStreamingChunkMode(entry)).toBe("newline");
-    expect(resolveChannelStreamingNativeTransport(entry)).toBe(true);
-    expect(
-      resolveChannelStreamingBlockEnabled(entry, {
+    expect({
+      mode: resolveChannelStreamingChunkMode(entry),
+      native: resolveChannelStreamingNativeTransport(entry),
+      block: resolveChannelStreamingBlockEnabled(entry, {
         previewAvailable: true,
         blockStreamingDefault: "off",
       }),
-    ).toBe(true);
-    expect(resolveChannelStreamingBlockCoalesce(entry)).toEqual({
-      minChars: 40,
-      maxChars: 80,
-      idleMs: 250,
+      coalesce: resolveChannelStreamingBlockCoalesce(entry),
+      chunk: resolveChannelStreamingPreviewChunk(entry),
+      toolProgress: resolveChannelStreamingPreviewToolProgress(entry),
+      commandText: resolveChannelStreamingPreviewCommandText(entry),
+    }).toEqual({
+      mode: "newline",
+      native: true,
+      block: true,
+      coalesce: { minChars: 40, maxChars: 80, idleMs: 250 },
+      chunk: { minChars: 10, maxChars: 20, breakPreference: "sentence" },
+      toolProgress: false,
+      commandText: "status",
     });
-    expect(resolveChannelStreamingPreviewChunk(entry)).toEqual({
-      minChars: 10,
-      maxChars: 20,
-      breakPreference: "sentence",
-    });
-    expect(resolveChannelStreamingPreviewToolProgress(entry)).toBe(false);
-    expect(resolveChannelStreamingPreviewCommandText(entry)).toBe("status");
   });
 
   it("keeps progress-only tool progress config out of normal preview modes", () => {
@@ -92,22 +98,22 @@ describe("channel-streaming", () => {
   });
 
   it("suppresses standalone tool progress for active preview drafts", () => {
+    const partial = { streaming: { mode: "partial", preview: { toolProgress: false } } };
     expect(
       resolveChannelStreamingSuppressDefaultToolProgressMessages({
         streaming: { mode: "progress", progress: { toolProgress: false } },
       }),
     ).toBe(true);
     expect(
-      resolveChannelStreamingSuppressDefaultToolProgressMessages(
-        { streaming: { mode: "partial", preview: { toolProgress: false } } },
-        { draftStreamActive: true },
-      ),
+      resolveChannelStreamingSuppressDefaultToolProgressMessages(partial, {
+        draftStreamActive: true,
+      }),
     ).toBe(true);
     expect(
-      resolveChannelStreamingSuppressDefaultToolProgressMessages(
-        { streaming: { mode: "partial", preview: { toolProgress: false } } },
-        { draftStreamActive: true, previewToolProgressEnabled: true },
-      ),
+      resolveChannelStreamingSuppressDefaultToolProgressMessages(partial, {
+        draftStreamActive: true,
+        previewToolProgressEnabled: true,
+      }),
     ).toBe(true);
     expect(
       resolveChannelStreamingSuppressDefaultToolProgressMessages(
@@ -118,16 +124,16 @@ describe("channel-streaming", () => {
   });
 
   it("renders automatic and configured progress labels through the public formatter", () => {
-    expect(formatChannelProgressDraftText({ lines: [], random: () => 0 })).toBe("Working");
+    expect(formatText({ lines: [], random: () => 0 })).toBe("Working");
     expect(
-      formatChannelProgressDraftText({
+      formatText({
         entry: { streaming: { progress: { label: " AUTO " } } },
         lines: [],
         random: () => 0,
       }),
     ).toBe("Working");
     expect(
-      formatChannelProgressDraftText({
+      formatText({
         entry: { streaming: { progress: { label: "auto", labels: ["Pearling"] } } },
         lines: [],
         narration: "Counting files.",
@@ -151,45 +157,28 @@ describe("channel-streaming", () => {
     expect(resolveChannelProgressDraftMaxLines(entry)).toBe(2);
     expect(resolveChannelProgressDraftMaxLineChars(entry)).toBe(80);
     expect(
-      formatChannelProgressDraftText({
+      formatText({
         entry,
         lines: [" tool: read ", "patch applied", "tests done"],
         formatLine: (line) => `\`${line}\``,
       }),
     ).toBe("• `patch applied`\n• `tests done`");
+    expect(formatText({ entry, lines: [patch, "plain update"] })).toBe(
+      "• 1 modified; /tmp/demo/index.html\n• plain update",
+    );
     expect(
-      formatChannelProgressDraftText({
-        entry,
-        lines: [patch, "plain update"],
-      }),
-    ).toBe("• 1 modified; /tmp/demo/index.html\n• plain update");
-    expect(
-      formatChannelProgressDraftText({
+      formatText({
         entry: { streaming: { progress: { label: false } } },
-        lines: [
-          {
-            kind: "item",
-            text: "_Checking source data before summarizing._",
-            label: "Commentary",
-            prefix: false,
-          },
-        ],
+        lines: [commentary("_Checking source data before summarizing._")],
       }),
     ).toBe("_Checking source data before summarizing._");
   });
 
   it("falls back to plain commentary when compaction drops the closing italic marker", () => {
     expect(
-      formatChannelProgressDraftText({
+      formatText({
         entry: { streaming: { progress: { label: false, maxLineChars: 32 } } },
-        lines: [
-          {
-            kind: "item",
-            text: `_${"x".repeat(80)}_`,
-            label: "Commentary",
-            prefix: false,
-          },
-        ],
+        lines: [commentary(`_${"x".repeat(80)}_`)],
       }),
     ).toBe(`${"x".repeat(30)}…`);
   });
@@ -207,7 +196,7 @@ describe("channel-streaming", () => {
       { detailMode: "raw", commandText: "raw" },
     );
 
-    const text = formatChannelProgressDraftText({
+    const text = formatText({
       entry: { streaming: { progress: { label: "Shelling" } } },
       lines: line ? [line] : [],
     });
@@ -242,9 +231,8 @@ describe("channel-streaming", () => {
       throw new Error("expected preamble progress lines");
     }
 
-    const initialLines: Array<string | typeof first> = ["Exec"];
-    const lines = mergeChannelProgressDraftLine(initialLines, first, { maxLines: 4 });
-    const updated = mergeChannelProgressDraftLine(lines, second, { maxLines: 4 });
+    const lines = mergeLine(["Exec"], first, { maxLines: 4 });
+    const updated = mergeLine(lines, second, { maxLines: 4 });
 
     expect(updated).toHaveLength(2);
     expect(updated.at(-1)).toMatchObject({
@@ -252,7 +240,7 @@ describe("channel-streaming", () => {
       text: "Checking the app-server stream",
     });
     expect(
-      formatChannelProgressDraftText({
+      formatText({
         lines: updated,
         entry: { streaming: { progress: { label: false } } },
       }),
