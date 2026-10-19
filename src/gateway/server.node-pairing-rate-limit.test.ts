@@ -1,5 +1,3 @@
-// Node pairing rate-limit tests protect repeated pairing attempts, pending
-// request cleanup, and protocol error details for node clients.
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
@@ -39,6 +37,35 @@ const NODE_CLIENT = {
   deviceFamily: "Mac",
 };
 
+function setPairingLimit(maxAttempts = 3, exemptLoopback = false) {
+  testState.gatewayAuth = {
+    mode: "token",
+    token: "secret",
+    rateLimit: { maxAttempts, windowMs: 60_000, lockoutMs: 60_000, exemptLoopback },
+  };
+}
+
+async function closeWs(ws: WebSocket) {
+  ws.close();
+  await new Promise<void>((resolve) => {
+    if (ws.readyState === WebSocket.CLOSED) {
+      resolve();
+    } else {
+      ws.once("close", () => resolve());
+    }
+  });
+}
+
+function requestDevice(identity: ReturnType<typeof loadOrCreateDeviceIdentity>) {
+  return requestDevicePairing({
+    deviceId: identity.deviceId,
+    publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
+    role: "node",
+    roles: ["node"],
+    scopes: [],
+  });
+}
+
 async function openWs(port: number) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}`);
   trackConnectChallengeNonce(ws);
@@ -65,29 +92,14 @@ async function attemptNodePairing(
       ...(surface.caps ? { caps: surface.caps } : {}),
     });
   } finally {
-    ws.close();
-    await new Promise<void>((resolve) => {
-      if (ws.readyState === WebSocket.CLOSED) {
-        resolve();
-        return;
-      }
-      ws.once("close", () => resolve());
-    });
+    await closeWs(ws);
   }
 }
 
 async function approveNodeIdentity(params: { identityPath: string; caps: string[] }) {
   const identity = loadOrCreateDeviceIdentity({ path: params.identityPath });
-  // Node surfaces attach to paired devices, so device pairing comes first.
-  // The stored key must match what the reconnect presents or the handshake
-  // restarts pairing and burns the rate-limit budget under test.
-  const devicePairing = await requestDevicePairing({
-    deviceId: identity.deviceId,
-    publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
-    role: "node",
-    roles: ["node"],
-    scopes: [],
-  });
+  // Pair the reconnect's exact key before approving its node surface.
+  const devicePairing = await requestDevice(identity);
   await approveDevicePairing(devicePairing.request.requestId, { callerScopes: [] });
   const request = await requestNodePairing({
     nodeId: identity.deviceId,
@@ -123,14 +135,7 @@ describe("node pairing rate limit", () => {
         await withGatewayServer(async ({ port }) => {
           const identityPath = path.join(identityDir, "identity.sqlite");
           if (approveDevice) {
-            const identity = loadOrCreateDeviceIdentity({ path: identityPath });
-            const pairing = await requestDevicePairing({
-              deviceId: identity.deviceId,
-              publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
-              role: "node",
-              roles: ["node"],
-              scopes: [],
-            });
+            const pairing = await requestDevice(loadOrCreateDeviceIdentity({ path: identityPath }));
             await approveDevicePairing(pairing.request.requestId, { callerScopes: [] });
           }
           const response = await attemptNodePairing(
@@ -157,16 +162,7 @@ describe("node pairing rate limit", () => {
   );
 
   test("limits concurrent first-time node pairing requests before the pairing lock", async () => {
-    testState.gatewayAuth = {
-      mode: "token",
-      token: "secret",
-      rateLimit: {
-        maxAttempts: 3,
-        windowMs: 60_000,
-        lockoutMs: 60_000,
-        exemptLoopback: false,
-      },
-    };
+    setPairingLimit();
     await withGatewayServer(async ({ port }) => {
       const identityPrefix = path.join(os.tmpdir(), `openclaw-node-pairing-${randomUUID()}`);
 
@@ -183,9 +179,7 @@ describe("node pairing rate limit", () => {
           details.authReason === "rate_limited"
         );
       });
-      const connected = responses.filter((res) => res.ok);
-
-      expect(connected).toHaveLength(3);
+      expect(responses.filter((res) => res.ok)).toHaveLength(3);
       expect(rateLimited).toHaveLength(5);
       const pairing = await listNodePairing();
       expect(pairing.pending).toHaveLength(0);
@@ -194,16 +188,7 @@ describe("node pairing rate limit", () => {
   });
 
   test("records paired reconnect reapproval despite first-time pairing limits", async () => {
-    testState.gatewayAuth = {
-      mode: "token",
-      token: "secret",
-      rateLimit: {
-        maxAttempts: 3,
-        windowMs: 60_000,
-        lockoutMs: 60_000,
-        exemptLoopback: false,
-      },
-    };
+    setPairingLimit();
     await withGatewayServer(async ({ port }) => {
       const identityPrefix = path.join(
         os.tmpdir(),
@@ -235,14 +220,7 @@ describe("node pairing rate limit", () => {
         });
         expect(reconnect.ok).toBe(true);
       } finally {
-        ws.close();
-        await new Promise<void>((resolve) => {
-          if (ws.readyState === WebSocket.CLOSED) {
-            resolve();
-            return;
-          }
-          ws.once("close", () => resolve());
-        });
+        await closeWs(ws);
       }
 
       const pending = (await listNodePairing()).pending;
@@ -255,16 +233,7 @@ describe("node pairing rate limit", () => {
   });
 
   test("reuses identical paired reapproval without rejecting the node", async () => {
-    testState.gatewayAuth = {
-      mode: "token",
-      token: "secret",
-      rateLimit: {
-        maxAttempts: 1,
-        windowMs: 60_000,
-        lockoutMs: 60_000,
-        exemptLoopback: true,
-      },
-    };
+    setPairingLimit(1, true);
     await withGatewayServer(async ({ port }) => {
       const identityPath = path.join(
         os.tmpdir(),

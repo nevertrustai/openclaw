@@ -29,6 +29,19 @@ const execFileAsync = promisify(execFile);
 
 afterEach(() => drainGlobalSingletonLifecycleState());
 
+async function archiveFixture(draft: string) {
+  const fixture = await createArchiveWorktreeFixture();
+  const { key, sessionId, storePath, worktree } = fixture;
+  const draftPath = path.join(worktree.path, "draft.txt");
+  await fs.writeFile(draftPath, draft);
+  return {
+    ...fixture,
+    draftPath,
+    target: { key, expectedSessionId: sessionId },
+    entry: () => loadSessionEntry({ storePath, sessionKey: key }),
+  };
+}
+
 async function pendingWorkerCleanup(sessionId: string, key: string) {
   const placements = createWorkerSessionPlacementStore();
   const requested = await placements.startDispatch({ sessionId, sessionKey: key, agentId: "main" });
@@ -65,10 +78,8 @@ async function pendingWorkerCleanup(sessionId: string, key: string) {
 }
 
 test("failed worker cleanup does not block archive, reopen, or Undo, and retains recoverable work", async () => {
-  const fixture = await createArchiveWorktreeFixture();
-  const { key, sessionId, storePath, worktree } = fixture;
-  const scope = { storePath, sessionKey: key };
-  await fs.writeFile(path.join(worktree.path, "draft.txt"), "retained worker work\n");
+  const fixture = await archiveFixture("retained worker work\n");
+  const { key, sessionId, storePath, worktree, target, entry, draftPath } = fixture;
   const checkpoint = "refs/openclaw/worker-results/archive-cleanup";
   await execFileAsync("git", ["-C", worktree.path, "update-ref", checkpoint, "HEAD"]);
   const checkpointBefore = (
@@ -84,18 +95,14 @@ test("failed worker cleanup does not block archive, reopen, or Undo, and retains
   } = await pendingWorkerCleanup(sessionId, key);
   let context = initialContext;
   const patch = (archived: boolean) =>
-    directSessionReq(
-      "sessions.patch",
-      { key, expectedSessionId: sessionId, archived },
-      { context },
-    );
+    directSessionReq("sessions.patch", { ...target, archived }, { context });
   expect(await patch(true)).toMatchObject({ ok: true });
   await disposeSessionReadContexts();
   await closeOpenClawAgentDatabasesAsync(path.dirname(storePath));
   closeOpenClawAgentDatabasesForTest(path.dirname(storePath));
   // Reopening uses a fresh projection binding while retaining the same worker services.
   context = { ...context };
-  expect(loadSessionEntry(scope)).toMatchObject({
+  expect(entry()).toMatchObject({
     sessionId,
     archivedAt: expect.any(Number),
     worktree: { id: worktree.id },
@@ -105,15 +112,9 @@ test("failed worker cleanup does not block archive, reopen, or Undo, and retains
   const config = (await getGatewayConfigModule()).getRuntimeConfig();
   const policy = createManagedWorktreeOwnerPolicy(config);
   expect(policy.readOwnerState("session", key)).toBe("active");
-  expect(await managedWorktrees.gc(policy)).toMatchObject({
-    removed: [],
-  });
+  expect(await managedWorktrees.gc(policy)).toMatchObject({ removed: [] });
   expect(getRegistryWorktree(process.env, worktree.id)?.removedAt).toBeUndefined();
-  const deleted = await directSessionReq(
-    "sessions.delete",
-    { key, expectedSessionId: sessionId },
-    { context },
-  );
+  const deleted = await directSessionReq("sessions.delete", target, { context });
   expect(deleted.ok).toBe(false);
   expect(reclaim).toHaveBeenCalledOnce();
   const restore = vi.spyOn(ManagedWorktreeService.prototype, "restore");
@@ -123,13 +124,11 @@ test("failed worker cleanup does not block archive, reopen, or Undo, and retains
   } finally {
     restore.mockRestore();
   }
-  expect(loadSessionEntry(scope)?.archivedAt).toBeUndefined();
+  expect(entry()?.archivedAt).toBeUndefined();
   expect(placements.get(sessionId)).toEqual(failed);
   expect(reclaim).toHaveBeenCalledOnce();
   expect(environment).toMatchObject({ state: "destroying", leaseId: "retained-lease" });
-  await expect(fs.readFile(path.join(worktree.path, "draft.txt"), "utf8")).resolves.toBe(
-    "retained worker work\n",
-  );
+  await expect(fs.readFile(draftPath, "utf8")).resolves.toBe("retained worker work\n");
   expect((await execFileAsync("git", ["-C", worktree.path, "rev-parse", checkpoint])).stdout).toBe(
     checkpointBefore,
   );
@@ -149,43 +148,26 @@ test("failed worker cleanup does not block archive, reopen, or Undo, and retains
 });
 
 test("failed worker cleanup keeps worktree reconstruction blocked until the worker is gone", async () => {
-  const { key, sessionId, storePath, worktree, cleanupWorktrees } =
-    await createArchiveWorktreeFixture();
-  await fs.writeFile(path.join(worktree.path, "draft.txt"), "restore this work\n");
-  expect(
-    await directSessionReq("sessions.patch", {
-      key,
-      expectedSessionId: sessionId,
-      archived: true,
-    }),
-  ).toMatchObject({ ok: true });
+  const { key, sessionId, worktree, cleanupWorktrees, target, entry, draftPath } =
+    await archiveFixture("restore this work\n");
+  expect(await directSessionReq("sessions.patch", { ...target, archived: true })).toMatchObject({
+    ok: true,
+  });
   await cleanupWorktrees();
   expect(getRegistryWorktree(process.env, worktree.id)?.removedAt).toEqual(expect.any(Number));
   const { environment, reclaim, context } = await pendingWorkerCleanup(sessionId, key);
   const restore = vi.spyOn(ManagedWorktreeService.prototype, "restore");
   const unarchive = () =>
-    directSessionReq(
-      "sessions.patch",
-      {
-        key,
-        expectedSessionId: sessionId,
-        archived: false,
-      },
-      { context },
-    );
+    directSessionReq("sessions.patch", { ...target, archived: false }, { context });
   try {
     expect((await unarchive()).ok).toBe(false);
     expect(restore).not.toHaveBeenCalled();
     expect(reclaim).not.toHaveBeenCalled();
-    expect(loadSessionEntry({ storePath, sessionKey: key })?.archivedAt).toEqual(
-      expect.any(Number),
-    );
+    expect(entry()?.archivedAt).toEqual(expect.any(Number));
     environment.state = "destroyed";
     expect(await unarchive()).toMatchObject({ ok: true });
     expect(restore).toHaveBeenCalledOnce();
-    await expect(fs.readFile(path.join(worktree.path, "draft.txt"), "utf8")).resolves.toBe(
-      "restore this work\n",
-    );
+    await expect(fs.readFile(draftPath, "utf8")).resolves.toBe("restore this work\n");
   } finally {
     restore.mockRestore();
   }
@@ -194,10 +176,9 @@ test("failed worker cleanup keeps worktree reconstruction blocked until the work
 test("sessions.patchMany commits archive and releases same-session writes before responding and waking cleanup", async ({
   signal,
 }) => {
-  const { key, sessionId, storePath, worktree, tickWorktreeMaintenance } =
-    await createArchiveWorktreeFixture();
-  const revision = loadSessionEntry({ storePath, sessionKey: key })?.lifecycleRevision;
-  await fs.writeFile(path.join(worktree.path, "draft.txt"), "preserved work\n");
+  const { key, worktree, tickWorktreeMaintenance, target, entry } =
+    await archiveFixture("preserved work\n");
+  const revision = entry()?.lifecycleRevision;
   const effectsEntered = createDeferredCore();
   const releaseEffects = createDeferredCore();
   const cleanupEntered = createDeferredCore();
@@ -216,7 +197,7 @@ test("sessions.patchMany commits archive and releases same-session writes before
   });
   const archived = directSessionReq(
     "sessions.patchMany",
-    { targets: [{ key, expectedSessionId: sessionId }], patch: { archived: true } },
+    { targets: [target], patch: { archived: true } },
     {
       context: {
         cron: {
@@ -245,15 +226,15 @@ test("sessions.patchMany commits archive and releases same-session writes before
       ),
       signal,
     );
-    expect(loadSessionEntry({ storePath, sessionKey: key })).toMatchObject({
+    expect(entry()).toMatchObject({
       archivedAt: expect.any(Number),
       worktree: { id: worktree.id },
     });
-    expect(loadSessionEntry({ storePath, sessionKey: key })?.lifecycleRevision).toBe(revision);
+    expect(entry()?.lifecycleRevision).toBe(revision);
     expect(
       await withinTest(directSessionReq("sessions.patch", { key, label: "Same session" }), signal),
     ).toMatchObject({ ok: true });
-    expect(loadSessionEntry({ storePath, sessionKey: key })?.label).toBe("Same session");
+    expect(entry()?.label).toBe("Same session");
     await fs.access(worktree.path);
 
     beforeResponseTick = tickWorktreeMaintenance();

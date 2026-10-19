@@ -30,6 +30,8 @@ test.each(["separate", "shared"] as const)(
     const root = expectDefined(process.env.OPENCLAW_STATE_DIR, "isolated state");
     const agentCount = 12;
     const agentIds = Array.from({ length: agentCount }, (_, index) => `fleet${index}`);
+    const recentKeys = (agentId: string, length = 10) =>
+      Array.from({ length }, (_, index) => `agent:${agentId}:session${11 - index}`);
     const storeTemplate = path.join(
       root,
       "fleet",
@@ -81,7 +83,10 @@ test.each(["separate", "shared"] as const)(
     const { calls: sqliteSummaries, restore: restoreSummaries } = spyOnSessionStoreSummaries();
     try {
       const { ws } = await harness.openClient();
-      await rpcReq(ws, "health", { probe: true });
+      const health = () => rpcReq<HealthSummary>(ws, "health", { probe: true });
+      const statusSummary = () =>
+        rpcReq<StatusSummary>(ws, "status", { includeChannelSummary: false });
+      await health();
       await requestHealth();
       sqliteSummaries.mockClear();
       const projection = expectDefined(
@@ -123,22 +128,16 @@ test.each(["separate", "shared"] as const)(
         });
         try {
           if (method === "health") {
-            const response = await rpcReq<HealthSummary>(ws, "health", { probe: true });
+            const response = await health();
             expect(response.ok).toBe(true);
             expect(
               response.payload?.agents.map((agent) => [agent.agentId, agent.sessions.count]),
             ).toEqual(agentIds.map((agentId) => [agentId, 12]));
             expect(
               response.payload?.agents.map((agent) => agent.sessions.recent.map(({ key }) => key)),
-            ).toEqual(
-              agentIds.map((agentId) =>
-                Array.from({ length: 5 }, (_, index) => `agent:${agentId}:session${11 - index}`),
-              ),
-            );
+            ).toEqual(agentIds.map((agentId) => recentKeys(agentId, 5)));
           } else {
-            const response = await rpcReq<StatusSummary>(ws, "status", {
-              includeChannelSummary: false,
-            });
+            const response = await statusSummary();
             expect(response).toMatchObject({ ok: true });
             const sessions = expectDefined(response.payload?.sessions, "status sessions");
             expect(sessions.count).toBe(agentCount * 12 + (layout === "shared" ? 2 : 0));
@@ -151,10 +150,7 @@ test.each(["separate", "shared"] as const)(
                 .map((agentId) => [agentId, agentId === "fleet11" && inserted ? 13 : 12, 10]),
             );
             for (const agent of sessions.byAgent) {
-              const keys = Array.from(
-                { length: 10 },
-                (_, index) => `agent:${agent.agentId}:session${11 - index}`,
-              );
+              const keys = recentKeys(agent.agentId);
               expect(agent.recent.map(({ key }) => key)).toEqual(
                 agent.agentId === "fleet11" && inserted
                   ? ["agent:fleet11:new", ...keys.slice(0, 9)]
@@ -180,29 +176,27 @@ test.each(["separate", "shared"] as const)(
           read.mockImplementationOnce(() => {
             throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
           });
-          const failedRead = await rpcReq<HealthSummary>(ws, "health", { probe: true });
+          const failedRead = await health();
           expect(failedRead.ok).toBe(true);
           expect(failedRead.payload?.agents.map((agent) => agent.sessions.count)).toEqual(
             agentIds.map(() => 0),
           );
           expect(read).toHaveBeenCalledOnce();
-          const recovered = await rpcReq<HealthSummary>(ws, "health", { probe: true });
+          const recovered = await health();
           expect(recovered.payload?.agents.at(-1)?.sessions.count).toBe(13);
           read.mockClear().mockImplementationOnce(() => {
             throw new Error("invalid session state");
           });
-          const fatal = await rpcReq(ws, "health", { probe: true });
+          const fatal = await health();
           expect(fatal.ok).toBe(false);
           expect(read).toHaveBeenCalledOnce();
           read.mockClear().mockImplementationOnce(() => {
             throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
           });
-          const failedStatus = await rpcReq(ws, "status", { includeChannelSummary: false });
+          const failedStatus = await statusSummary();
           expect(failedStatus.ok).toBe(false);
           expect(read).toHaveBeenCalledOnce();
-          const recoveredStatus = await rpcReq<StatusSummary>(ws, "status", {
-            includeChannelSummary: false,
-          });
+          const recoveredStatus = await statusSummary();
           expect(recoveredStatus.payload?.sessions.count).toBe(146);
         } finally {
           read.mockRestore();
@@ -232,13 +226,11 @@ test.each(["separate", "shared"] as const)(
           return rows;
         });
         try {
-          const response = await rpcReq<HealthSummary>(ws, "health", { probe: true });
+          const response = await health();
           expect(response.payload?.agents.at(-1)?.sessions.count).toBe(0);
           expect(read).toHaveBeenCalledTimes(12);
           read.mockClear();
-          const statusResponse = await rpcReq<StatusSummary>(ws, "status", {
-            includeChannelSummary: false,
-          });
+          const statusResponse = await statusSummary();
           expect(statusResponse.payload?.sessions.count).toBe(132);
           expect(
             statusResponse.payload?.sessions.byAgent.find((agent) => agent.agentId === "fleet11"),
@@ -270,7 +262,7 @@ test.each(["separate", "shared"] as const)(
             return result;
           });
         try {
-          await Promise.allSettled([rpcReq(ws, "health", { probe: true })]);
+          await Promise.allSettled([health()]);
           await closing;
           expect(lifecycle).toEqual(["closing", "settled", "closed"]);
           const completedReads = closingRead.mock.calls.length;

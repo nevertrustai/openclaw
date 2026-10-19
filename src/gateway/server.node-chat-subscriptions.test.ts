@@ -1,6 +1,7 @@
 // Real gateway WebSocket coverage for canonical node chat subscriptions and reconnects.
 import { describe, expect, test, vi } from "vitest";
 import { createDeferred, withTestTimeout } from "../../test/helpers/promise.js";
+import type { dispatchInboundMessage } from "../auto-reply/dispatch.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
 import { registerAgentRunContext } from "../infra/agent-run-registry.js";
 import * as devicePairingNode from "../infra/device-pairing-node.js";
@@ -15,6 +16,54 @@ import { dispatchInboundMessageMock, installGatewayTestHooks } from "./test-help
 installGatewayTestHooks({ scope: "suite" });
 
 type ReceivedNodeEvent = { event?: string; payload?: unknown };
+type GatewayClient = Awaited<ReturnType<typeof connectGatewayClient>>;
+
+async function pairNode(name: string) {
+  const paired = await pairDeviceIdentity({
+    name,
+    role: "node",
+    scopes: [],
+    clientId: GATEWAY_CLIENT_NAMES.NODE_HOST,
+    clientMode: GATEWAY_CLIENT_MODES.NODE,
+  });
+  const pairing = await requestNodePairing({
+    nodeId: paired.identity.deviceId,
+    platform: "macos",
+    deviceFamily: "Mac",
+    commands: [],
+  });
+  const approved = await approveNodePairing(pairing.request.requestId, {
+    callerScopes: ["operator.pairing", "operator.write", "operator.admin"],
+  });
+  expect(approved).toMatchObject({ node: { nodeId: paired.identity.deviceId } });
+  return paired.identity;
+}
+
+function connectNode(
+  port: number,
+  deviceIdentity: Awaited<ReturnType<typeof pairNode>>,
+  onEvent: (event: ReceivedNodeEvent) => void,
+) {
+  return connectGatewayClient({
+    url: `ws://127.0.0.1:${port}`,
+    token: "secret",
+    role: "node",
+    clientName: GATEWAY_CLIENT_NAMES.NODE_HOST,
+    clientDisplayName: "canonical chat subscription node",
+    clientVersion: "1.0.0",
+    platform: "macos",
+    deviceFamily: "Mac",
+    mode: GATEWAY_CLIENT_MODES.NODE,
+    scopes: [],
+    commands: [],
+    deviceIdentity,
+    onEvent,
+  });
+}
+
+function subscribe(node: GatewayClient, sessionKey: string, event = "chat.subscribe") {
+  return node.request("node.event", { event, payload: { sessionKey } });
+}
 
 function emitCompletedSessionRun(runId: string, sessionKey: string): void {
   registerAgentRunContext(runId, { sessionKey, agentId: "main" });
@@ -42,54 +91,17 @@ async function expectNodeChatEvent(events: ReceivedNodeEvent[], runId: string, s
 describe("gateway node chat subscriptions", () => {
   describeWithGatewayServer("real WebSocket session fanout", (getStarted) => {
     test("delivers canonical chat events across reconnect and stops after an alias unsubscribe", async () => {
-      const paired = await pairDeviceIdentity({
-        name: "canonical-chat-subscription-reconnect",
-        role: "node",
-        scopes: [],
-        clientId: GATEWAY_CLIENT_NAMES.NODE_HOST,
-        clientMode: GATEWAY_CLIENT_MODES.NODE,
-      });
-      const pairing = await requestNodePairing({
-        nodeId: paired.identity.deviceId,
-        platform: "macos",
-        deviceFamily: "Mac",
-        commands: [],
-      });
-      const approved = await approveNodePairing(pairing.request.requestId, {
-        callerScopes: ["operator.pairing", "operator.write", "operator.admin"],
-      });
-      expect(approved).toMatchObject({ node: { nodeId: paired.identity.deviceId } });
-
+      const identity = await pairNode("canonical-chat-subscription-reconnect");
       const firstEvents: ReceivedNodeEvent[] = [];
       const reconnectEvents: ReceivedNodeEvent[] = [];
-      let first: Awaited<ReturnType<typeof connectGatewayClient>> | undefined;
-      let reconnected: Awaited<ReturnType<typeof connectGatewayClient>> | undefined;
+      let first: GatewayClient | undefined;
+      let reconnected: GatewayClient | undefined;
       const disconnectHistoryPending = createDeferred();
       const recordDisconnection = devicePairingNode.recordPairedNodeDisconnection;
       const disconnectHistory = vi.spyOn(devicePairingNode, "recordPairedNodeDisconnection");
-      const connectNode = (events: ReceivedNodeEvent[]) =>
-        connectGatewayClient({
-          url: `ws://127.0.0.1:${getStarted().port}`,
-          token: "secret",
-          role: "node",
-          clientName: GATEWAY_CLIENT_NAMES.NODE_HOST,
-          clientDisplayName: "canonical chat subscription node",
-          clientVersion: "1.0.0",
-          platform: "macos",
-          deviceFamily: "Mac",
-          mode: GATEWAY_CLIENT_MODES.NODE,
-          scopes: [],
-          commands: [],
-          deviceIdentity: paired.identity,
-          onEvent: (event) => events.push(event),
-        });
-
       try {
-        first = await connectNode(firstEvents);
-        await first.request("node.event", {
-          event: "chat.subscribe",
-          payload: { sessionKey: "  Main  " },
-        });
+        first = await connectNode(getStarted().port, identity, (event) => firstEvents.push(event));
+        await subscribe(first, "  Main  ");
         emitCompletedSessionRun("canonical-node-first", "agent:main:main");
         await expectNodeChatEvent(firstEvents, "canonical-node-first", "agent:main:main");
 
@@ -101,11 +113,10 @@ describe("gateway node chat subscriptions", () => {
         first = undefined;
         await vi.waitFor(() => expect(disconnectHistory).toHaveBeenCalledOnce());
 
-        reconnected = await connectNode(reconnectEvents);
-        await reconnected.request("node.event", {
-          event: "chat.subscribe",
-          payload: { sessionKey: "  MAIN  " },
-        });
+        reconnected = await connectNode(getStarted().port, identity, (event) =>
+          reconnectEvents.push(event),
+        );
+        await subscribe(reconnected, "  MAIN  ");
         emitCompletedSessionRun("canonical-node-reconnect", "agent:main:main");
         await expectNodeChatEvent(reconnectEvents, "canonical-node-reconnect", "agent:main:main");
 
@@ -119,14 +130,8 @@ describe("gateway node chat subscriptions", () => {
           "agent:main:main",
         );
 
-        await reconnected.request("node.event", {
-          event: "chat.subscribe",
-          payload: { sessionKey: "other" },
-        });
-        await reconnected.request("node.event", {
-          event: "chat.unsubscribe",
-          payload: { sessionKey: "  Main  " },
-        });
+        await subscribe(reconnected, "other");
+        await subscribe(reconnected, "  Main  ", "chat.unsubscribe");
 
         // The other subscribed session is an ordered live-transport barrier:
         // receiving its event proves the unsubscribed main event was not queued.
@@ -161,26 +166,10 @@ describe("gateway node chat subscriptions", () => {
     });
 
     test("delivers final and error terminals through one canonical node subscription", async () => {
-      const paired = await pairDeviceIdentity({
-        name: "canonical-chat-terminal-fanout",
-        role: "node",
-        scopes: [],
-        clientId: GATEWAY_CLIENT_NAMES.NODE_HOST,
-        clientMode: GATEWAY_CLIENT_MODES.NODE,
-      });
-      const pairing = await requestNodePairing({
-        nodeId: paired.identity.deviceId,
-        platform: "macos",
-        deviceFamily: "Mac",
-        commands: [],
-      });
-      await approveNodePairing(pairing.request.requestId, {
-        callerScopes: ["operator.pairing", "operator.write", "operator.admin"],
-      });
-
+      const identity = await pairNode("canonical-chat-terminal-fanout");
       const events: ReceivedNodeEvent[] = [];
-      let node: Awaited<ReturnType<typeof connectGatewayClient>> | undefined;
-      let operator: Awaited<ReturnType<typeof connectGatewayClient>> | undefined;
+      let node: GatewayClient | undefined;
+      let operator: GatewayClient | undefined;
       const requestExecution = await observeGatewayRunExecution();
       const finalRunId = "canonical-node-terminal-final";
       const errorRunId = "canonical-node-terminal-error";
@@ -196,74 +185,53 @@ describe("gateway node chat subscriptions", () => {
           .map((event) => event.payload as Record<string, unknown>);
 
       try {
-        node = await connectGatewayClient({
-          url: `ws://127.0.0.1:${getStarted().port}`,
-          token: "secret",
-          role: "node",
-          clientName: GATEWAY_CLIENT_NAMES.NODE_HOST,
-          clientDisplayName: "canonical terminal fanout node",
-          clientVersion: "1.0.0",
-          platform: "macos",
-          deviceFamily: "Mac",
-          mode: GATEWAY_CLIENT_MODES.NODE,
-          scopes: [],
-          commands: [],
-          deviceIdentity: paired.identity,
-          onEvent: (event) => {
-            events.push(event);
-            if (event.event !== "chat") {
-              return;
-            }
-            const payload = event.payload as Record<string, unknown>;
-            if (payload.runId === finalRunId) {
-              finalTerminal.resolve(payload);
-            } else if (payload.runId === errorRunId) {
-              errorTerminal.resolve(payload);
-            }
-          },
+        node = await connectNode(getStarted().port, identity, (event) => {
+          events.push(event);
+          if (event.event !== "chat") {
+            return;
+          }
+          const payload = event.payload as Record<string, unknown>;
+          if (payload.runId === finalRunId) {
+            finalTerminal.resolve(payload);
+          } else if (payload.runId === errorRunId) {
+            errorTerminal.resolve(payload);
+          }
         });
-        operator = await connectGatewayClient({
+        const sender = (operator = await connectGatewayClient({
           url: `ws://127.0.0.1:${getStarted().port}`,
           token: "secret",
           role: "operator",
           scopes: ["operator.write"],
-        });
-        await node.request("node.event", {
-          event: "chat.subscribe",
-          payload: { sessionKey: " Main " },
-        });
+        }));
+        await subscribe(node, " Main ");
+        const sendAndWait = async (
+          runId: string,
+          message: string,
+          terminal: Promise<Record<string, unknown>>,
+        ) => {
+          expect(
+            await sender.request("chat.send", {
+              sessionKey: "main",
+              message,
+              idempotencyKey: runId,
+            }),
+          ).toMatchObject({ runId, status: "started" });
+          // Admission precedes detached dispatch and terminal effects.
+          await requestExecution.waitForCompletion(runId);
+          return withTestTimeout(terminal, 5_000, `node terminal ${runId} was not delivered`);
+        };
 
         dispatchInboundMessageMock.mockImplementationOnce(async (...args: unknown[]) => {
-          const [params] = args as [
-            {
-              dispatcher: {
-                sendFinalReply: (payload: { text: string }) => boolean;
-                markComplete: () => void;
-                waitForIdle: () => Promise<void>;
-                getQueuedCounts: () => { final: number; block: number; tool: number };
-              };
-            },
-          ];
-          params.dispatcher.sendFinalReply({ text: "node subscription final" });
-          params.dispatcher.markComplete();
-          await params.dispatcher.waitForIdle();
-          return { queuedFinal: true, counts: params.dispatcher.getQueuedCounts() };
+          const [{ dispatcher }] = args as Parameters<typeof dispatchInboundMessage>;
+          dispatcher.sendFinalReply({ text: "node subscription final" });
+          dispatcher.markComplete();
+          await dispatcher.waitForIdle();
+          return { queuedFinal: true, counts: dispatcher.getQueuedCounts() };
         });
-        const finalStarted = await operator.request<{ runId: string; status: string }>(
-          "chat.send",
-          {
-            sessionKey: "main",
-            message: "deliver a final terminal",
-            idempotencyKey: finalRunId,
-          },
-        );
-        expect(finalStarted).toMatchObject({ runId: finalRunId, status: "started" });
-        // The RPC acknowledges admission before detached dispatch and terminal effects settle.
-        await requestExecution.waitForCompletion(finalRunId);
-        const finalPayload = await withTestTimeout(
+        const finalPayload = await sendAndWait(
+          finalRunId,
+          "deliver a final terminal",
           finalTerminal.promise,
-          5_000,
-          "node final terminal was not delivered",
         );
         expect(terminalPayloads(finalRunId)).toHaveLength(1);
         expect(finalPayload).toMatchObject({
@@ -277,25 +245,12 @@ describe("gateway node chat subscriptions", () => {
         });
 
         dispatchInboundMessageMock.mockRejectedValueOnce(new Error("node dispatch rejected"));
-        const errorStarted = await operator.request<{ runId: string; status: string }>(
-          "chat.send",
-          {
-            sessionKey: "main",
-            message: "deliver an error terminal",
-            idempotencyKey: errorRunId,
-          },
-        );
-        expect(errorStarted).toMatchObject({ runId: errorRunId, status: "started" });
-        await requestExecution.waitForCompletion(errorRunId);
-        const errorPayload = await withTestTimeout(
+        const errorPayload = await sendAndWait(
+          errorRunId,
+          "deliver an error terminal",
           errorTerminal.promise,
-          5_000,
-          "node error terminal was not delivered",
         );
-        await node.request("node.event", {
-          event: "chat.subscribe",
-          payload: { sessionKey: "main" },
-        });
+        await subscribe(node, "main");
 
         expect(terminalPayloads(finalRunId)).toHaveLength(1);
         expect(terminalPayloads(errorRunId)).toHaveLength(1);

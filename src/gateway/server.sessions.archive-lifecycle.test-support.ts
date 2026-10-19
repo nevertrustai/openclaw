@@ -33,19 +33,21 @@ export async function activeRunContext(params: {
   ownerConnId?: string;
   terminalPersistenceError?: Error;
 }) {
+  const { runId, sessionId, sessionKey, persistence, ownerConnId, terminalPersistenceError } =
+    params;
   rpcSourceTesting.clear();
   const registration = registerChatAbortController({
-    runId: params.runId,
-    sessionId: params.sessionId,
-    sessionKey: params.sessionKey,
-    sourceWork: params.persistence.promise,
+    runId,
+    sessionId,
+    sessionKey,
+    sourceWork: persistence.promise,
     target: captureSessionTarget({
       storeScope: resolveSessionStorePathCore(getHostRuntimeConfig().session?.store),
-      sessionKey: params.sessionKey,
-      incarnation: params.sessionId,
+      sessionKey,
+      incarnation: sessionId,
     }),
     timeoutMs: 60_000,
-    ownerConnId: params.ownerConnId,
+    ownerConnId,
   });
   if (!registration.entry) {
     throw new Error("expected active run registration");
@@ -55,8 +57,8 @@ export async function activeRunContext(params: {
   let operation: ReturnType<typeof createReplyOperation> | undefined;
   const claim = await claimSessionControllerTask(entry.input, (mailboxClaim) => {
     operation = createReplyOperation({
-      sessionKey: params.sessionKey,
-      sessionId: params.sessionId,
+      sessionKey,
+      sessionId,
       resetTriggered: false,
       target: entry.input.target,
       mailboxClaim,
@@ -73,16 +75,12 @@ export async function activeRunContext(params: {
   entry.input.abortSignal.addEventListener("abort", onAbort, { once: true });
   const terminalStarted = createDeferredCore();
   const unsubscribe = onAgentEvent((event) => {
-    if (
-      event.runId !== params.runId ||
-      event.stream !== "lifecycle" ||
-      event.data.phase !== "end"
-    ) {
+    if (event.runId !== runId || event.stream !== "lifecycle" || event.data.phase !== "end") {
       return;
     }
     entry.adapter.projectSessionTerminalPending = false;
-    entry.adapter.projectSessionTerminalPersistence = params.persistence.promise;
-    void params.persistence.promise.then(
+    entry.adapter.projectSessionTerminalPersistence = persistence.promise;
+    void persistence.promise.then(
       () => {
         entry.adapter.projectSessionTerminalPersistence = undefined;
         entry.adapter.projectSessionTerminalPersisted = true;
@@ -96,25 +94,22 @@ export async function activeRunContext(params: {
       },
     );
     terminalStarted.resolve();
-    if (params.terminalPersistenceError) {
-      params.persistence.reject(params.terminalPersistenceError);
+    if (terminalPersistenceError) {
+      persistence.reject(terminalPersistenceError);
     }
   });
   const chatRunState = createChatRunState();
   return {
     aborted: aborted.promise,
     context: {
-      agentRunSeq: new Map([[params.runId, 0]]),
+      agentRunSeq: new Map([[runId, 0]]),
       broadcast: vi.fn(),
       cancelRunBoundApprovals: vi.fn(),
       rpcSourceTesting,
       chatRunState,
       logGateway: { warn: vi.fn() },
       nodeSendToSession: vi.fn(),
-      removeChatRun: vi.fn(() => ({
-        sessionKey: params.sessionKey,
-        clientRunId: params.runId,
-      })),
+      removeChatRun: vi.fn(() => ({ sessionKey, clientRunId: runId })),
     },
     controller: registration.controller,
     terminalStarted: terminalStarted.promise,
@@ -176,6 +171,9 @@ export function workerPlacement(params: {
   agentId?: string;
   environmentId?: string | null;
 }): WorkerSessionPlacementRecord {
+  const awaitingEnvironment = params.state === "local" || params.state === "requested";
+  const awaitingBundle = awaitingEnvironment || params.state === "provisioning";
+  const awaitingWorkspace = awaitingBundle || params.state === "syncing";
   return {
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
@@ -190,7 +188,7 @@ export function workerPlacement(params: {
     environmentId:
       params.environmentId !== undefined
         ? params.environmentId
-        : params.state === "local" || params.state === "requested"
+        : awaitingEnvironment
           ? null
           : "worker-environment",
     activeOwnerEpoch: ["active", "draining", "reconciling", "reclaimed", "failed"].includes(
@@ -198,24 +196,9 @@ export function workerPlacement(params: {
     )
       ? 1
       : null,
-    workspaceBaseManifestRef:
-      params.state === "local" ||
-      params.state === "requested" ||
-      params.state === "provisioning" ||
-      params.state === "syncing"
-        ? null
-        : "manifest-ref",
-    remoteWorkspaceDir:
-      params.state === "local" ||
-      params.state === "requested" ||
-      params.state === "provisioning" ||
-      params.state === "syncing"
-        ? null
-        : "/workspace",
-    workerBundleHash:
-      params.state === "local" || params.state === "requested" || params.state === "provisioning"
-        ? null
-        : "bundle-hash",
+    workspaceBaseManifestRef: awaitingWorkspace ? null : "manifest-ref",
+    remoteWorkspaceDir: awaitingWorkspace ? null : "/workspace",
+    workerBundleHash: awaitingBundle ? null : "bundle-hash",
     lastTranscriptAckCursor: null,
     lastLiveEventAckCursor: null,
     recoveryError: params.state === "failed" ? "worker recovery stopped" : null,
@@ -269,10 +252,6 @@ type LifecycleHandlerResponse = {
   error?: Parameters<RespondFn>[2];
 };
 
-function archivePatch(key: string, expectedSessionId: string) {
-  return { key, archived: true, expectedSessionId };
-}
-
 export function archiveTarget(key: string, expectedSessionId: string) {
   return { key, expectedSessionId };
 }
@@ -297,7 +276,7 @@ export async function invokeArchiveHandler(params: {
   };
   await handlers["sessions.patch"]?.({
     req: {} as never,
-    params: archivePatch(params.sessionKey, params.expectedSessionId),
+    params: { key: params.sessionKey, archived: true, expectedSessionId: params.expectedSessionId },
     client: params.client,
     context: params.context,
     isWebchatConnect: () => false,
