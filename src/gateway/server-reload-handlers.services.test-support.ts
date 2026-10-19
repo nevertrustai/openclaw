@@ -1,8 +1,4 @@
 import { describe, expect, it, onTestFinished, vi } from "vitest";
-import {
-  attachRuntimeConfigWriteApplication,
-  createRuntimeConfigWriteApplication,
-} from "../config/runtime-write-application.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { PluginRuntimeApplicationError } from "../plugins/lifecycle.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
@@ -21,6 +17,7 @@ import {
   createHotTailPlan,
   createValidConfigSnapshot,
   makePluginReloadResult,
+  publishConfigWrite,
 } from "./server-reload-handlers.config.test-support.js";
 import type { createGatewayReloadHandlers as createGatewayReloadHandlersImpl } from "./server-reload-hot.js";
 import * as modelRuntime from "./server-reload-model-runtime-scope.js";
@@ -63,18 +60,15 @@ export function registerGatewayTargetedServiceReloadTests({
       });
       await reloader.ready;
       try {
-        const application = createRuntimeConfigWriteApplication();
         if (!listener.current) {
           throw new Error("Expected managed config write listener");
         }
-        listener.current(
-          attachRuntimeConfigWriteApplication(
-            createConfigWriteNotification(nextConfig, "otel-disabled", 1, "runtime", "source"),
-            application,
-          ),
+        const applied = publishConfigWrite(
+          listener.current,
+          createConfigWriteNotification(nextConfig, "otel-disabled", 1, "runtime", "source"),
         );
         await vi.advanceTimersByTimeAsync(0);
-        await expect(application.result).resolves.toBe("applied");
+        await expect(applied).resolves.toBe("applied");
         expect(reloadPluginServices).toHaveBeenCalledExactlyOnceWith(
           nextConfig,
           new Set(["exporter"]),

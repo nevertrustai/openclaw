@@ -42,23 +42,16 @@ export function registerGatewayCronReloadTests({
       const clock = createGatewaySchedulerClock(Date.now());
       const scheduler = createTestGatewayScheduler(clock.clock);
       const fixtureDir = autoCleanupTempDirs.make("openclaw-monitor-publication-");
-      const initialConfig: OpenClawConfig = {
+      const heartbeatConfig = (every: string): OpenClawConfig => ({
         agents: {
           entries: {
-            first: { heartbeat: { every: "1h" } },
-            second: { heartbeat: { every: "1h" } },
+            first: { heartbeat: { every } },
+            second: { heartbeat: { every } },
           },
         },
-      };
-      const nextConfig = {
-        ...initialConfig,
-        agents: {
-          entries: {
-            first: { heartbeat: { every: "2h" } },
-            second: { heartbeat: { every: "2h" } },
-          },
-        },
-      } satisfies OpenClawConfig;
+      });
+      const initialConfig = heartbeatConfig("1h");
+      const nextConfig = heartbeatConfig("2h");
       activateSecretsRuntimeSnapshot(makePreparedSecretsSnapshot(initialConfig));
       const { buildGatewayCronService } =
         await vi.importActual<typeof import("./server-cron.js")>("./server-cron.js");
@@ -138,24 +131,16 @@ export function registerGatewayCronReloadTests({
         expect(getActiveSecretsRuntimeSnapshot()?.config).toEqual(nextConfig);
         publicationFailure.remove();
         const successorConfig = { ...nextConfig, logging: { level: "debug" as const } };
+        const applied = managed.onHotReload(
+          buildGatewayReloadPlan(successor === "rejected" ? ["logging.level"] : []),
+          successorConfig,
+          successor === "rejected" ? { ...ownership, isCurrent: () => false } : ownership,
+          successorConfig,
+        );
         if (successor === "rejected") {
-          await expect(
-            managed.onHotReload(
-              buildGatewayReloadPlan(["logging.level"]),
-              successorConfig,
-              { ...ownership, isCurrent: () => false },
-              successorConfig,
-            ),
-          ).rejects.toThrow("superseded");
+          await expect(applied).rejects.toThrow("superseded");
         } else {
-          await expect(
-            managed.onHotReload(
-              buildGatewayReloadPlan([]),
-              successorConfig,
-              ownership,
-              successorConfig,
-            ),
-          ).resolves.toBe("applied");
+          await expect(applied).resolves.toBe("applied");
         }
         await clock.advanceBy(30_000);
         expect(await readIntervals()).toEqual([7_200_000, 7_200_000]);

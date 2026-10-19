@@ -1,10 +1,12 @@
 import { vi } from "vitest";
+import { createInfoWarnErrorLogger } from "../../test/helpers/mock-logger.js";
 import type { ConfigWriteNotification } from "../config/config.js";
 import {
   attachRuntimeConfigWriteApplication,
   createRuntimeConfigWriteApplication,
 } from "../config/runtime-write-application.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
+import { requireActivePluginChannelRegistry } from "../plugins/runtime.js";
 import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
@@ -15,6 +17,7 @@ import type {
   GatewayPluginReloadResult,
   ManagedGatewayConfigReloaderParams,
 } from "./server-reload-contracts.js";
+import { SharedGatewaySessionGenerationState } from "./server-shared-auth-generation.js";
 
 export function createMonitorPublicationFailure() {
   const database = openOpenClawStateDatabase();
@@ -60,20 +63,18 @@ export function makePluginReloadResult(
 }
 
 export function enableChannelReloadsForTest() {
-  const previousSkipChannels = process.env.OPENCLAW_SKIP_CHANNELS;
-  const previousSkipProviders = process.env.OPENCLAW_SKIP_PROVIDERS;
-  delete process.env.OPENCLAW_SKIP_CHANNELS;
-  delete process.env.OPENCLAW_SKIP_PROVIDERS;
+  const previous = ["OPENCLAW_SKIP_CHANNELS", "OPENCLAW_SKIP_PROVIDERS"].map((key) => {
+    const value = process.env[key];
+    delete process.env[key];
+    return { key, value };
+  });
   return () => {
-    if (previousSkipChannels === undefined) {
-      delete process.env.OPENCLAW_SKIP_CHANNELS;
-    } else {
-      process.env.OPENCLAW_SKIP_CHANNELS = previousSkipChannels;
-    }
-    if (previousSkipProviders === undefined) {
-      delete process.env.OPENCLAW_SKIP_PROVIDERS;
-    } else {
-      process.env.OPENCLAW_SKIP_PROVIDERS = previousSkipProviders;
+    for (const { key, value } of previous) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
     }
   };
 }
@@ -240,6 +241,62 @@ export function createTestCronState(overrides: Partial<GatewayCronState> = {}): 
   };
 }
 
+export function createManagedReloadTestParams(
+  params: Pick<
+    ManagedGatewayConfigReloaderParams,
+    | "initialConfig"
+    | "scheduler"
+    | "activateRuntimeSecrets"
+    | "readSnapshot"
+    | "subscribeToWrites"
+    | "channelManager"
+  > &
+    Partial<ManagedGatewayConfigReloaderParams>,
+): ManagedGatewayConfigReloaderParams {
+  let state = createDefaultGatewayReloadState();
+  const log = createInfoWarnErrorLogger();
+  return {
+    getPluginRegistry: requireActivePluginChannelRegistry,
+    configRevisionProjector: createTestConfigRevisionProjector(),
+    minimalTestGateway: false,
+    initialCompareConfig: params.initialConfig,
+    initialSnapshotRawHash: null,
+    initialAuthoredConfig: {},
+    initialSnapshotValid: true,
+    initialSnapshotIssues: [],
+    initialPluginInstallRecords: {},
+    watchPath: "/tmp/openclaw.json",
+    promoteSnapshot: async () => true,
+    deps: {},
+    broadcast: vi.fn(),
+    getState: () => state,
+    setState: (next) => {
+      state = next;
+    },
+    startChannel: vi.fn(async () => new Map()),
+    stopChannel: vi.fn(async () => {}),
+    reloadPlugins: async () => {
+      throw new Error("Unexpected plugin reload");
+    },
+    logHooks: log,
+    logChannels: log,
+    logCron: log,
+    logReload: log,
+    cronReconciliation: { arm: () => ({ complete: async () => {} }), invalidate: vi.fn() },
+    resolveSharedGatewaySessionGenerationForConfig: () => undefined,
+    sharedGatewaySessionGenerationState: new SharedGatewaySessionGenerationState({
+      current: undefined,
+      required: null,
+    }),
+    prepareTerminalConfig: vi.fn(),
+    reconcileRuntimePolicy: vi.fn(),
+    commitRuntimePolicy: vi.fn(),
+    acceptTerminalConfig: vi.fn(),
+    clients: [],
+    ...params,
+  };
+}
+
 export function createManagedReloadAuthFixture(params: {
   sharedAuthRotation?: boolean;
   resolvedProviderRotation?: "channel" | "agent";
@@ -269,48 +326,19 @@ export function createManagedRestartSequenceConfigs() {
   // This fixture owns auth inputs throughout asynchronous restart checks.
   vi.stubEnv("OPENCLAW_GATEWAY_PASSWORD", undefined);
   vi.stubEnv("OPENCLAW_GATEWAY_TOKEN", undefined);
-  const initialConfig = {
+  const secret = (id: string) => ({ source: "env" as const, provider: "default", id });
+  const gatewayConfig = (port: number, token?: string, enabled = true): OpenClawConfig => ({
     gateway: {
-      port: 18789,
+      port,
       reload: {},
-      terminal: { enabled: true },
+      terminal: { enabled },
+      ...(token ? { auth: { mode: "token", token: secret(token) } } : {}),
     },
-  } as OpenClawConfig;
-  const deferredConfig = {
-    gateway: {
-      port: 18790,
-      reload: {},
-      terminal: { enabled: true },
-      auth: {
-        mode: "token",
-        token: {
-          source: "env",
-          provider: "default",
-          id: "RESTART_A_TOKEN",
-        },
-      },
-    },
-  } as OpenClawConfig;
-  const invalidConfig = {
-    gateway: {
-      ...deferredConfig.gateway,
-      port: 18791,
-      auth: {
-        mode: "token",
-        token: {
-          source: "env",
-          provider: "default",
-          id: "MISSING_RESTART_TOKEN",
-        },
-      },
-      terminal: { enabled: false },
-    },
-  } as OpenClawConfig;
-  const missingHotSecret = {
-    source: "env" as const,
-    provider: "default",
-    id: "MISSING_HOT_TOKEN",
-  };
+  });
+  const initialConfig = gatewayConfig(18789);
+  const deferredConfig = gatewayConfig(18790, "RESTART_A_TOKEN");
+  const invalidConfig = gatewayConfig(18791, "MISSING_RESTART_TOKEN", false);
+  const missingHotSecret = secret("MISSING_HOT_TOKEN");
   const invalidHotConfig = {
     ...deferredConfig,
     models: {
@@ -322,7 +350,7 @@ export function createManagedRestartSequenceConfigs() {
         },
       },
     },
-  } as OpenClawConfig;
+  } satisfies OpenClawConfig;
   const invalidNoopConfig = {
     ...deferredConfig,
     plugins: {
@@ -332,13 +360,13 @@ export function createManagedRestartSequenceConfigs() {
         },
       },
     },
-  } as OpenClawConfig;
+  } satisfies OpenClawConfig;
   const replacementConfig = {
     gateway: {
       ...deferredConfig.gateway,
       bind: "lan",
     },
-  } as OpenClawConfig;
+  } satisfies OpenClawConfig;
   return {
     initialConfig,
     deferredConfig,

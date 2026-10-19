@@ -8,6 +8,10 @@ import type {
   GatewayHotReloadPublication,
   GatewayReloadHandlerParams,
 } from "./server-reload-contracts.js";
+import {
+  createTestCronState,
+  makePluginReloadResult,
+} from "./server-reload-handlers.config.test-support.js";
 
 const { buildGatewayCronService } = vi.hoisted(() => ({
   buildGatewayCronService: vi.fn<typeof import("./server-cron.js").buildGatewayCronService>(),
@@ -37,15 +41,10 @@ afterEach(async () => {
 
 function createCronState() {
   const cron = { start: vi.fn(async () => {}), stop: vi.fn() };
-  const state: GatewayCronState = {
+  const state = createTestCronState({
     cron: cron as unknown as GatewayCronState["cron"],
-    storePath: "/tmp/cron.json",
     cronEnabled: true,
-    reconcileExitWatchers: vi.fn(async () => {}),
-    reconcileStreamWatchers: vi.fn(async () => {}),
-    stopStreamWatchers: vi.fn(async () => {}),
-    reconcileSystemJobs: vi.fn(async () => "converged" as const),
-  };
+  });
   return { state, cron };
 }
 
@@ -78,10 +77,9 @@ async function createFixture() {
     stopChannel: vi.fn(async () => {}),
     releaseChannelRouteHandoffs: vi.fn(),
     pruneInactiveChannelAccountState: vi.fn(),
-    reloadPlugins: vi.fn<GatewayReloadHandlerParams["reloadPlugins"]>(async () => ({
-      runtime: { operationId: "test-reload", generation: 1, pluginIds: [] },
-      activeChannels: new Set(),
-    })),
+    reloadPlugins: vi.fn<GatewayReloadHandlerParams["reloadPlugins"]>(async () =>
+      makePluginReloadResult(),
+    ),
     logHooks: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     logChannels: { info: vi.fn(), error: vi.fn() },
     logCron: { error: vi.fn() },
@@ -186,10 +184,7 @@ describe("cron reload loading", { concurrent: false }, () => {
       if (plugins) {
         fixture.reloadPlugins.mockImplementationOnce(async ({ commitRuntime }) => {
           await commitRuntime({ publish: publishPluginRuntime });
-          return {
-            runtime: { operationId: "test-reload", generation: 1, pluginIds: [] },
-            activeChannels: new Set(),
-          };
+          return makePluginReloadResult();
         });
       }
       if (phase === "load") {
