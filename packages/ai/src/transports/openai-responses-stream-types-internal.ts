@@ -62,3 +62,9 @@ export type ResponsesStreamOptions = FirstStreamEventInternalOptions & {
   reasoningReplayMetadata?: OpenAIResponsesReasoningReplayMetadata;
   resolveResponseModel?: () => string | undefined;
 };
+
+export function isResponsesTerminalEventType(value: unknown): boolean {
+  return (
+    value === "response.completed" || value === "response.incomplete" || value === "response.failed"
+  );
+}

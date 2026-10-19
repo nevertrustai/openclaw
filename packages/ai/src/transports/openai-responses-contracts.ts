@@ -43,6 +43,12 @@ export const OPENAI_RESPONSES_APIS: ReadonlySet<Api> = new Set([
   "openclaw-openai-chatgpt-responses-transport",
   "openclaw-azure-openai-responses-transport",
 ]);
+export const OPENAI_RESPONSES_TOOL_CALL_PROVIDERS: ReadonlySet<string> = new Set([
+  "openai",
+  "opencode",
+  "azure-openai-responses",
+  "github-copilot",
+]);
 
 export class OpenAIResponsesWebSocketPreDispatchError extends Error {
   constructor(cause: unknown) {

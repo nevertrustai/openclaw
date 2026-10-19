@@ -51,6 +51,7 @@ import type {
   ResponsesStreamOptions,
   ResponsesStreamOutputMessage,
 } from "./openai-responses-stream-types-internal.js";
+import { isResponsesTerminalEventType } from "./openai-responses-stream-types-internal.js";
 import { transportAbortError } from "./transport-stream-shared.js";
 
 export type { OpenAIResponsesStreamEvent } from "./openai-responses-stream-types-internal.js";
@@ -326,13 +327,7 @@ export async function processResponsesStream<TApi extends Api>(
       }
       // A rejected call closes output admission; only drain terminal facts.
       // Later async tool completions must not authorize side effects.
-      if (
-        rejectedToolCall &&
-        event.type !== "response.completed" &&
-        event.type !== "response.incomplete" &&
-        event.type !== "response.failed" &&
-        event.type !== "error"
-      ) {
+      if (rejectedToolCall && !isResponsesTerminalEventType(event.type) && event.type !== "error") {
         continue;
       }
       if (event.type === "response.created") {

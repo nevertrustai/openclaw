@@ -7,6 +7,23 @@ import {
 } from "./provider-model-id-normalization.js";
 
 describe("provider model id policy normalization", () => {
+  it.each(["constructor", "toString", "__proto__", "hasOwnProperty"])(
+    "preserves prototype-like model IDs unless explicitly aliased: %s",
+    (model) => {
+      for (const provider of ["anthropic", "vercel-ai-gateway", "xai"]) {
+        expect(normalizeConfiguredProviderCatalogModelId(provider, model)).toBe(model);
+      }
+      for (const aliases of [{}, Object.fromEntries([[model.toLowerCase(), "custom-model"]])]) {
+        const policies = collectManifestModelIdNormalizationPolicies([
+          { modelIdNormalization: { providers: { fixture: { aliases } } } },
+        ]);
+        expect(normalizeConfiguredProviderCatalogModelId("fixture", model, policies)).toBe(
+          Object.keys(aliases).length ? "custom-model" : model,
+        );
+      }
+    },
+  );
+
   it("applies manifest policies before built-in provider normalization", () => {
     const policies = collectManifestModelIdNormalizationPolicies([
       {

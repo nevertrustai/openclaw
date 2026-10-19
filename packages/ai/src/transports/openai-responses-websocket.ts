@@ -38,6 +38,7 @@ import {
   type ResponsesInputReplay,
 } from "./openai-responses-input-replay.js";
 import { createResponsesSteering, omitAcceptedSteering } from "./openai-responses-steering.js";
+import { isResponsesTerminalEventType } from "./openai-responses-stream-types-internal.js";
 import { transportAbortError } from "./transport-stream-shared.js";
 import { sha256Hex } from "./transport-utils.js";
 
@@ -591,10 +592,7 @@ export function createOpenAIResponsesWebSocketStream(params: {
           if (event.type === "response.completed") {
             terminalResponse = event.response;
           }
-          terminalReceived =
-            event.type === "response.completed" ||
-            event.type === "response.incomplete" ||
-            event.type === "response.failed";
+          terminalReceived = isResponsesTerminalEventType(event.type);
           if (terminalReceived) {
             steering?.seal();
             if (event.type === "response.failed") {

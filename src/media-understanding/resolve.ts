@@ -17,13 +17,7 @@ import type {
 } from "../config/types.tools.js";
 import { logVerbose, shouldLogVerbose } from "../globals.js";
 import { runtimeMediaModelSecretOwnerId } from "../secrets/runtime-media-secret-owner.js";
-import {
-  DEFAULT_MAX_BYTES,
-  DEFAULT_MAX_CHARS_BY_CAPABILITY,
-  DEFAULT_MEDIA_CONCURRENCY,
-  DEFAULT_PROMPT,
-  DEFAULT_TIMEOUT_SECONDS,
-} from "./defaults.constants.js";
+import { DEFAULT_MEDIA_CONCURRENCY, MEDIA_CAPABILITY_DEFAULTS } from "./defaults.constants.js";
 import { resolveEffectiveMediaEntryCapabilities } from "./entry-capabilities.js";
 import type { MediaUnderstandingCapability } from "./types.js";
 
@@ -104,7 +98,7 @@ function resolveMaxChars(params: MediaEntryRunParams): number | undefined {
   if (typeof configured === "number") {
     return configured;
   }
-  return DEFAULT_MAX_CHARS_BY_CAPABILITY[capability];
+  return MEDIA_CAPABILITY_DEFAULTS[capability].maxChars;
 }
 
 export function resolveMaxBytes(params: MediaEntryRunParams): number {
@@ -115,7 +109,7 @@ export function resolveMaxBytes(params: MediaEntryRunParams): number {
   if (typeof configured === "number") {
     return configured;
   }
-  return DEFAULT_MAX_BYTES[params.capability];
+  return MEDIA_CAPABILITY_DEFAULTS[params.capability].maxBytes;
 }
 
 export function resolveEntryRunOptions(params: MediaEntryRunParams): {
@@ -132,14 +126,14 @@ export function resolveEntryRunOptions(params: MediaEntryRunParams): {
     entry.timeoutSeconds ??
       params.config?.timeoutSeconds ??
       cfg.tools?.media?.[capability]?.timeoutSeconds,
-    DEFAULT_TIMEOUT_SECONDS[capability],
+    MEDIA_CAPABILITY_DEFAULTS[capability].timeoutSeconds,
   );
   const configuredPrompt = (
     entry.prompt ??
     params.config?.prompt ??
     cfg.tools?.media?.[capability]?.prompt
   )?.trim();
-  const basePrompt = configuredPrompt || DEFAULT_PROMPT[capability];
+  const basePrompt = configuredPrompt || MEDIA_CAPABILITY_DEFAULTS[capability].prompt;
   return {
     maxBytes,
     maxChars,
