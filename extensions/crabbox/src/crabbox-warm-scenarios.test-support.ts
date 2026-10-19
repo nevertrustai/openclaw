@@ -1,11 +1,17 @@
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import type { WorkerProvider } from "openclaw/plugin-sdk/plugin-entry";
-import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
+import {
+  resetPluginStateStoreForTests,
+  createPluginStateSyncKeyedStoreForTests,
+} from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import { expect } from "vitest";
 import { crabboxState, openWarmImageStore } from "./crabbox-state.test-support.js";
 import {
   listCrabboxWarmImages,
   type WarmImageRecord,
   type WarmProfileRecord,
+  type WarmAllocationRecord,
 } from "./crabbox-worker-warm-image-store.js";
 import type { CommandCall } from "./crabbox-worker-warm-image.test-support.js";
 
@@ -58,3 +64,60 @@ export const warmRecord = (overrides: Partial<WarmProfileRecord> = {}): WarmProf
   allocations: {},
   ...overrides,
 });
+
+type CaptureOperation = Extract<NonNullable<WarmProfileRecord["operation"]>, { type: "capture" }>;
+export const captureOperation = (
+  id: string,
+  overrides: Partial<CaptureOperation> = {},
+): CaptureOperation => ({
+  type: "capture",
+  id,
+  phase: "creating",
+  startedAtMs: Date.now(),
+  ...overrides,
+});
+
+export function pause() {
+  const entered = createDeferred<void>(),
+    released = createDeferred<void>();
+  return {
+    entered: entered.promise,
+    release: () => released.resolve(),
+    async wait() {
+      entered.resolve();
+      await released.promise;
+    },
+  };
+}
+
+export const warmStore = <T = WarmProfileRecord>(env?: NodeJS.ProcessEnv) =>
+  createPluginStateSyncKeyedStoreForTests<T>("crabbox", {
+    namespace: "warm-images",
+    maxEntries: 128,
+    overflowPolicy: "reject-new",
+    env,
+  });
+
+export const warmAllocation = (
+  choice: WarmAllocationRecord["choice"] = { kind: "cold" },
+  overrides: Partial<WarmAllocationRecord> = {},
+): WarmAllocationRecord => ({
+  machineClass: "standard",
+  phase: "pending",
+  choice,
+  preparationKey: null,
+  cacheKey: null,
+  purpose: null,
+  demandAtMs: null,
+  imageGeneration: null,
+  ...overrides,
+});
+
+export function expectText(text: string | undefined, contains: string[], excludes: string[] = []) {
+  for (const value of contains) {
+    expect(text).toContain(value);
+  }
+  for (const value of excludes) {
+    expect(text).not.toContain(value);
+  }
+}

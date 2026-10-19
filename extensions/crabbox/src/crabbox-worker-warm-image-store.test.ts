@@ -1,9 +1,15 @@
-import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import type { OpenAsyncKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
-import { createPluginStateSyncKeyedStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { describe, expect, it, vi } from "vitest";
 import { crabboxState, openWarmImageStore } from "./crabbox-state.test-support.js";
-import { checkpointArgs, warmImage, warmRecord } from "./crabbox-warm-scenarios.test-support.js";
+import { scenario } from "./crabbox-warm-provider-scenarios.test-support.js";
+import {
+  checkpointArgs,
+  warmImage,
+  warmRecord,
+  warmStore,
+  warmAllocation,
+  pause,
+} from "./crabbox-warm-scenarios.test-support.js";
 import {
   openCrabboxWarmImageStore,
   type WarmProfileRecord,
@@ -14,15 +20,24 @@ import {
   tempDirs,
 } from "./crabbox-worker-warm-image.test-support.js";
 
-const allocation = {
-  machineClass: "standard",
-  phase: "pending" as const,
-  preparationKey: null,
-  cacheKey: null,
-  purpose: null,
-  demandAtMs: null,
-};
+const { choice: _choice, imageGeneration: _generation, ...allocation } = warmAllocation();
 const image = warmImage("chk_original");
+
+function stateFixture(profile?: Partial<WarmProfileRecord>) {
+  vi.stubEnv("OPENCLAW_STATE_DIR", tempDirs.make("crabbox-store-"));
+  const fixture = openWarmImageStore();
+  const seed = (record: Partial<WarmProfileRecord>) =>
+    fixture.register("profile", warmRecord(record));
+  if (profile) {
+    seed(profile);
+  }
+  return {
+    fixture,
+    seed,
+    read: () => fixture.lookup("profile"),
+    store: openCrabboxWarmImageStore(crabboxState),
+  };
+}
 
 function recordAllocation(availableImage?: typeof image) {
   return openCrabboxWarmImageStore(crabboxState).recordAllocation({
@@ -44,8 +59,7 @@ function observeComparisons(before: () => void | Promise<void>, after?: () => vo
       return {
         ...store,
         compareAndApply: async (...args: Parameters<typeof compareAndApply>) => {
-          attempts += 1;
-          if (attempts === 1) {
+          if (++attempts === 1) {
             await before();
           }
           const result = await compareAndApply(...args);
@@ -59,30 +73,20 @@ function observeComparisons(before: () => void | Promise<void>, after?: () => vo
 }
 
 describe("Crabbox asynchronous warm-image mutations", () => {
-  it("normalizes optional recipe diagnostics without migrating existing v3 records", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", tempDirs.make("crabbox-recipe-diagnostics-"));
-    const fixture = openWarmImageStore();
-    const store = openCrabboxWarmImageStore(crabboxState);
+  it("normalizes diagnostics without migrating v3 records", async () => {
+    const { fixture, store } = stateFixture();
     fixture.register("old", warmRecord());
-    createPluginStateSyncKeyedStoreForTests<unknown>("crabbox", {
-      namespace: "warm-images",
-      maxEntries: 128,
-      overflowPolicy: "reject-new",
-    }).register("malformed", {
+    warmStore<unknown>().register("malformed", {
       version: 3,
       allocations: {},
       recipePreparation: { source: "unknown", commands: ["must not appear"] },
     });
-    fixture.register(
-      "oversized",
-      warmRecord({
-        recipePreparation: {
-          source: "detected",
-          phaseDurationsMs: { detectedInstall: 20 },
-          failure: { reason: "install failed", outputTail: "☃".repeat(6000) },
-        },
-      }),
-    );
+    const recipePreparation = {
+      source: "detected" as const,
+      phaseDurationsMs: { detectedInstall: 20 },
+      failure: { reason: "install failed", outputTail: "☃".repeat(6000) },
+    };
+    fixture.register("oversized", warmRecord({ recipePreparation }));
 
     expect(await store.lookup("old")).toEqual({ version: 3, allocations: {} });
     expect((await store.lookup("malformed"))?.recipePreparation).toBeUndefined();
@@ -93,10 +97,9 @@ describe("Crabbox asynchronous warm-image mutations", () => {
     expect(diagnostics?.failure?.outputTail).toMatch(/☃$/u);
   });
 
-  it("rejects malformed native-capture refusal markers before reading or updating state", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", tempDirs.make("crabbox-capture-unsupported-invalid-"));
-    const fixture = openWarmImageStore();
-    const store = openCrabboxWarmImageStore(crabboxState);
+  it("rejects malformed refusals before reading or updating", async () => {
+    const { store } = stateFixture();
+    const raw = warmStore<unknown>();
     const valid = { atMs: 1, provider: "hetzner", message: "Native capture is unsupported" };
     for (const captureUnsupported of [
       null,
@@ -111,11 +114,7 @@ describe("Crabbox asynchronous warm-image mutations", () => {
       { ...valid, message: "" },
       { ...valid, message: "m".repeat(1025) },
     ]) {
-      fixture.register("profile", {
-        version: 3,
-        allocations: {},
-        captureUnsupported,
-      } as WarmProfileRecord);
+      raw.register("profile", { ...warmRecord(), captureUnsupported });
 
       await expect(store.lookup("profile")).rejects.toThrow("preparation state is invalid");
       const update = vi.fn(() => undefined);
@@ -124,26 +123,21 @@ describe("Crabbox asynchronous warm-image mutations", () => {
     }
   });
 
-  it("rechecks retirement and preserves sibling allocations after a comparison conflict", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", tempDirs.make("crabbox-state-conflict-"));
-    const fixture = openWarmImageStore();
-    fixture.register("profile", warmRecord({ image }));
+  it("rechecks retirement and siblings after conflict", async () => {
+    const { seed, read } = stateFixture({ image });
     const attempts = observeComparisons(() => {
-      fixture.register(
-        "profile",
-        warmRecord({
-          image,
-          operation: { type: "retire", checkpointId: image.checkpointId },
-          allocations: {
-            sibling: { ...allocation, choice: { kind: "cold" }, imageGeneration: null },
-          },
-        }),
-      );
+      seed({
+        image,
+        operation: { type: "retire", checkpointId: image.checkpointId },
+        allocations: {
+          sibling: { ...allocation, choice: { kind: "cold" }, imageGeneration: null },
+        },
+      });
     });
     const result = await recordAllocation(image);
 
     expect(result.choice).toEqual({ kind: "cold" });
-    const committed = fixture.lookup("profile")!;
+    const committed = read()!;
     expect(Object.keys(committed.allocations).toSorted()).toEqual(["new", "sibling"]);
     expect(committed.operation).toEqual({
       type: "retire",
@@ -152,30 +146,29 @@ describe("Crabbox asynchronous warm-image mutations", () => {
     expect(attempts()).toBe(2);
   });
 
-  it("discards a capacity rejection when the compared row gained room", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", tempDirs.make("crabbox-state-capacity-"));
-    const fixture = openWarmImageStore();
+  it("rechecks capacity after a comparison conflict", async () => {
+    const { seed, read } = stateFixture();
     const allocations = Object.fromEntries(
       Array.from({ length: 256 }, (_, index) => [
         `lease-${index}`,
         { ...allocation, choice: { kind: "cold" as const }, imageGeneration: null },
       ]),
     );
-    fixture.register("profile", warmRecord({ allocations }));
+    seed({ allocations });
     observeComparisons(() => {
       delete allocations["lease-0"];
-      fixture.register("profile", warmRecord({ allocations }));
+      seed({ allocations });
     });
 
     await expect(recordAllocation()).resolves.toMatchObject({
       key: "profile",
       choice: { kind: "cold" },
     });
-    expect(Object.keys(fixture.lookup("profile")!.allocations)).toHaveLength(256);
+    expect(Object.keys(read()!.allocations)).toHaveLength(256);
   });
 
-  it("does not replay a mutation whose completion is unavailable", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", tempDirs.make("crabbox-state-uncertain-"));
+  it("never replays an indeterminate mutation", async () => {
+    const { read } = stateFixture();
     const attempts = observeComparisons(
       () => {},
       () => {
@@ -186,37 +179,33 @@ describe("Crabbox asynchronous warm-image mutations", () => {
     await expect(recordAllocation()).rejects.toThrow("fixture completion unavailable");
 
     expect(attempts()).toBe(1);
-    expect(openWarmImageStore().lookup("profile")?.allocations.new?.choice).toEqual({
+    expect(read()?.allocations.new?.choice).toEqual({
       kind: "cold",
     });
   });
 
-  it("returns the committed checkpoint projection after its row is replaced", async () => {
-    const { provider } = createWarmProvider();
-    const fixture = openWarmImageStore();
-    fixture.register("profile", warmRecord({ image }));
+  it("returns the committed projection despite replacement", async () => {
+    const s = scenario();
+    s.store.register("profile", warmRecord({ image }));
     observeComparisons(
       () => {},
-      () => {
-        fixture.register(
+      () =>
+        s.store.register(
           "profile",
-          warmRecord({
-            image: { ...image, checkpointId: "chk_replacement" },
-          }),
-        );
-      },
+          warmRecord({ image: { ...image, checkpointId: "chk_replacement" } }),
+        ),
     );
 
-    await expect(provider.images.pin(image.checkpointId, true)).resolves.toMatchObject({
+    await expect(s.provider.images.pin(image.checkpointId, true)).resolves.toMatchObject({
       profileKey: "profile",
       checkpointId: image.checkpointId,
       pinned: { atMs: expect.any(Number) },
     });
-    expect(fixture.lookup("profile")?.image?.checkpointId).toBe("chk_replacement");
+    expect(s.store.lookup("profile")?.image?.checkpointId).toBe("chk_replacement");
   });
 
   it.each(["profile removed", "allocation removed", "allocation changed"] as const)(
-    "refuses replay dispatch when its durable owner is %s before comparison",
+    "refuses dispatch if its owner is %s",
     async (change) => {
       const initial = createWarmProvider();
       const lease = await provisionWarmProfile(initial.provider);
@@ -255,41 +244,37 @@ describe("Crabbox asynchronous warm-image mutations", () => {
   );
 
   it.each(["pin", "rollback"] as const)(
-    "drains an admitted %s write before provider disposal settles",
+    "drains admitted %s writes before disposal",
     async (action) => {
-      const { provider } = createWarmProvider();
-      const record = warmRecord({
-        image,
-        previous: { ...image, checkpointId: "chk_previous" },
-      });
-      openWarmImageStore().register("profile", record);
-      const admitted = createDeferred<void>();
-      const complete = createDeferred<void>();
-      observeComparisons(async () => {
-        admitted.resolve();
-        await complete.promise;
-      });
+      const s = scenario();
+      s.store.register(
+        "profile",
+        warmRecord({
+          image,
+          previous: { ...image, checkpointId: "chk_previous" },
+        }),
+      );
+      const gate = pause();
+      observeComparisons(gate.wait);
       const mutation =
         action === "pin"
-          ? provider.images.pin(image.checkpointId, true)
-          : provider.images.rollback("chk_previous");
-      await admitted.promise;
-      let disposed = false;
-      const disposal = provider.dispose().then(() => {
-        disposed = true;
-      });
+          ? s.provider.images.pin(image.checkpointId, true)
+          : s.provider.images.rollback("chk_previous");
+      await gate.entered;
+      const disposed = vi.fn();
+      const disposal = s.provider.dispose().then(disposed);
       await Promise.resolve();
-      expect(disposed).toBe(false);
-      complete.resolve();
+      expect(disposed).not.toHaveBeenCalled();
+      gate.release();
       await mutation;
       await disposal;
-      expect(disposed).toBe(true);
-      expect(openWarmImageStore().lookup("profile")?.image).toMatchObject(
+      expect(disposed).toHaveBeenCalledOnce();
+      expect(s.store.lookup("profile")?.image).toMatchObject(
         action === "pin"
           ? { pinned: { atMs: expect.any(Number) } }
           : { checkpointId: "chk_previous" },
       );
-      await expect(provider.images.pin(image.checkpointId, false)).rejects.toThrow();
+      await expect(s.provider.images.pin(image.checkpointId, false)).rejects.toThrow();
     },
   );
 });
