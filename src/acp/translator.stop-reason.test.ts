@@ -18,6 +18,9 @@ import {
 const sessionId = "session-1";
 const sessionKey = "agent:main:main";
 const closeError = () => new Error("gateway closed (1006): connection lost");
+const throwClose = () => {
+  throw closeError();
+};
 const disconnected = "Gateway disconnected: 1006: connection lost";
 const emptyReply = { status: "ok", terminalReply: { disposition: "empty" } };
 const timeout = { status: "timeout" };
@@ -185,9 +188,7 @@ describe("acp translator stop reason mapping", () => {
     vi.useFakeTimers();
     const h = harness({
       send: () => ({}),
-      wait: () => {
-        throw closeError();
-      },
+      wait: throwClose,
     });
     await h.eventLedger.startSession({ sessionId, sessionKey, cwd: "/tmp", complete: true });
     const prompt = h.start();
@@ -220,12 +221,8 @@ describe("acp translator stop reason mapping", () => {
   it("keeps pre-ack disconnects pending until the grace deadline", async () => {
     vi.useFakeTimers();
     const h = harness({
-      send: () => {
-        throw closeError();
-      },
-      wait: () => {
-        throw closeError();
-      },
+      send: throwClose,
+      wait: throwClose,
     });
     await h.eventLedger.startSession({ sessionId, sessionKey, cwd: "/tmp", complete: true });
     const prompt = h.start();
@@ -276,12 +273,7 @@ describe("acp translator stop reason mapping", () => {
   it("isolates replacement disconnect handling from a cancelled send's late success", async () => {
     vi.useFakeTimers();
     const firstSend = createDeferred();
-    const send = vi
-      .fn()
-      .mockReturnValueOnce(firstSend.promise)
-      .mockImplementation(() => {
-        throw closeError();
-      });
+    const send = vi.fn().mockReturnValueOnce(firstSend.promise).mockImplementation(throwClose);
     const h = harness({ send, wait: () => timeout });
     const first = h.start();
     await first.sent;
@@ -367,9 +359,7 @@ describe("acp translator stop reason mapping", () => {
     const send = vi.fn().mockReturnValueOnce(firstSend.promise).mockResolvedValue({});
     const h = harness({
       send,
-      wait: () => {
-        throw closeError();
-      },
+      wait: throwClose,
     });
     const first = h.start();
     await first.sent;
@@ -387,12 +377,7 @@ describe("acp translator stop reason mapping", () => {
 
   it("does not let a stale disconnect deadline reject a newer prompt", async () => {
     vi.useFakeTimers();
-    const send = vi
-      .fn()
-      .mockImplementationOnce(() => {
-        throw closeError();
-      })
-      .mockResolvedValue({});
+    const send = vi.fn().mockImplementationOnce(throwClose).mockResolvedValue({});
     const h = harness({
       send,
       wait: (params) => (params?.runId === firstRunId ? timeout : { status: "ok" }),

@@ -39,6 +39,16 @@ async function createHarness() {
     });
   const tool = (toolCallId: string, phase: "start" | "result") =>
     send("agent", { stream: "tool", data: { phase, name: "read", toolCallId } });
+  const assistant = (itemId: string, text: string, fields: Record<string, unknown> = {}) =>
+    send("agent", { stream: "assistant", data: { itemId, text, ...fields } });
+  const round = async (id = "read") => {
+    await tool(id, "start");
+    await tool(id, "result");
+  };
+  const finish = async (text = "Done.") => {
+    await chat(text, { state: "final" });
+    await prompt;
+  };
   const updates = () =>
     harness.sessionUpdate.mock.calls.flatMap(([{ update }]) => {
       switch (update.sessionUpdate) {
@@ -51,70 +61,57 @@ async function createHarness() {
           return [];
       }
     });
-  return { ...harness, prompt, send, chat, preamble, tool, updates };
+  return { ...harness, prompt, assistant, chat, preamble, tool, round, finish, updates };
 }
 
 describe("ACP commentary reclassification", () => {
-  it.each(["OK."])(
-    "preserves narration and the answer when the replacement is deferred: %s",
-    async (answer) => {
-      const h = await createHarness();
-      const narration = "I will read the sample now.";
-      await h.send("agent", {
-        stream: "assistant",
-        data: { itemId: "preview", text: narration, delta: narration },
-      });
-      await h.chat("I will");
-      await h.preamble("commentary", narration);
-      await h.preamble("commentary", narration);
-      await h.tool("read", "start");
-      await h.tool("read", "result");
-      // Transcript publication releases the replacement with a later sequence.
-      await h.chat("", { replace: true });
-      await h.send("agent", {
-        stream: "assistant",
-        data: { itemId: "answer", text: answer, delta: answer },
-      });
-      await h.chat(answer);
-      await h.chat("", { replace: true });
-      await h.chat(answer, { state: "final" });
-      await h.prompt;
-      expect(h.updates()).toEqual([
-        "I will",
-        " read the sample now.",
-        "read:in_progress",
-        "read:completed",
-        answer,
-      ]);
-    },
-  );
+  it("preserves narration and the answer when the replacement is deferred", async () => {
+    const answer = "OK.";
+    const h = await createHarness();
+    const narration = "I will read the sample now.";
+    await h.assistant("preview", narration, { delta: narration });
+    await h.chat("I will");
+    await h.preamble("commentary", narration);
+    await h.preamble("commentary", narration);
+    await h.round();
+    // Transcript publication releases the replacement with a later sequence.
+    await h.chat("", { replace: true });
+    await h.assistant("answer", answer, { delta: answer });
+    await h.chat(answer);
+    await h.chat("", { replace: true });
+    await h.finish(answer);
+    expect(h.updates()).toEqual([
+      "I will",
+      " read the sample now.",
+      "read:in_progress",
+      "read:completed",
+      answer,
+    ]);
+  });
 
-  it.each([{ answer: "Verified.", rounds: 2 }])(
-    "delivers the complete answer after $rounds tool rounds: $answer",
-    async ({ answer, rounds }) => {
-      const h = await createHarness();
-      const expected: string[] = [];
-      for (let round = 0; round < rounds; round++) {
-        const narration = round === 0 ? "I will read the sample now." : "Checking again.";
-        await h.chat(narration);
-        const seq = 100 + round;
-        await h.chat("", { replace: true, seq });
-        await h.preamble(`commentary-${round}`, narration, { seq });
-        // A completion echo must not retire another answer's baseline.
-        await h.preamble(`commentary-${round}`, narration);
-        await h.tool(`read-${round}`, "start");
-        await h.tool(`read-${round}`, "result");
-        expected.push(narration, `read-${round}:in_progress`, `read-${round}:completed`);
-      }
-      await h.send("agent", { stream: "assistant", data: { itemId: "answer", text: answer } });
-      await h.chat(answer);
-      // Ordinary final retirement also sends an empty replacement, without a preamble.
-      await h.chat("", { replace: true });
-      await h.chat(answer, { state: "final" });
-      await expect(h.prompt).resolves.toEqual({ stopReason: "end_turn" });
-      expect(h.updates()).toEqual([...expected, answer]);
-    },
-  );
+  it("delivers the complete answer after two tool rounds", async () => {
+    const answer = "Verified.";
+    const h = await createHarness();
+    const expected: string[] = [];
+    for (let round = 0; round < 2; round++) {
+      const narration = round === 0 ? "I will read the sample now." : "Checking again.";
+      await h.chat(narration);
+      const seq = 100 + round;
+      await h.chat("", { replace: true, seq });
+      await h.preamble(`commentary-${round}`, narration, { seq });
+      // A completion echo must not retire another answer's baseline.
+      await h.preamble(`commentary-${round}`, narration);
+      await h.round(`read-${round}`);
+      expected.push(narration, `read-${round}:in_progress`, `read-${round}:completed`);
+    }
+    await h.assistant("answer", answer);
+    await h.chat(answer);
+    // Ordinary final retirement also sends an empty replacement, without a preamble.
+    await h.chat("", { replace: true });
+    await h.chat(answer, { state: "final" });
+    await expect(h.prompt).resolves.toEqual({ stopReason: "end_turn" });
+    expect(h.updates()).toEqual([...expected, answer]);
+  });
 
   it("streams preamble-only snapshots once per item before the tool", async () => {
     const h = await createHarness();
@@ -131,8 +128,7 @@ describe("ACP commentary reclassification", () => {
       h.tool("read-2", "result"),
     ];
     await Promise.all(pending);
-    await h.chat("Done.", { state: "final" });
-    await h.prompt;
+    await h.finish();
     expect(h.updates()).toEqual([
       "Checking",
       " again.",
@@ -145,18 +141,14 @@ describe("ACP commentary reclassification", () => {
     ]);
   });
 
-  it.each(["Reading files"])(
-    "resumes commentary from the last emitted snapshot after %s",
-    async (snapshot) => {
-      const h = await createHarness();
-      await h.preamble("commentary", "Checking files");
-      await h.preamble("commentary", snapshot);
-      await h.preamble("commentary", "Checking files now");
-      await h.chat("Done.", { state: "final" });
-      await h.prompt;
-      expect(h.updates()).toEqual(["Checking files", " now", "Done."]);
-    },
-  );
+  it("resumes commentary from the last emitted snapshot after a divergent snapshot", async () => {
+    const h = await createHarness();
+    await h.preamble("commentary", "Checking files");
+    await h.preamble("commentary", "Reading files");
+    await h.preamble("commentary", "Checking files now");
+    await h.finish();
+    expect(h.updates()).toEqual(["Checking files", " now", "Done."]);
+  });
 
   it("advances an item's boundary within an already displayed multi-item preview", async () => {
     const h = await createHarness();
@@ -164,8 +156,7 @@ describe("ACP commentary reclassification", () => {
     await h.preamble("first", "Checking");
     await h.preamble("first", "Checking files.", { preamble: {} });
     await h.preamble("second", "Reading config.", { preamble: {} });
-    await h.chat("Done.", { state: "final" });
-    await h.prompt;
+    await h.finish();
     expect(h.updates()).toEqual(["Checking files.\nReading config.", "Done."]);
   });
 
@@ -177,18 +168,12 @@ describe("ACP commentary reclassification", () => {
     "keeps an earlier answer prefix (deferred=$deferred, chatFirst=$chatFirst)",
     async ({ deferred, chatFirst }) => {
       const h = await createHarness();
-      await h.send("agent", {
-        stream: "assistant",
-        data: { itemId: "earlier-answer", text: "First answer.", phase: "final_answer" },
-      });
+      await h.assistant("earlier-answer", "First answer.", { phase: "final_answer" });
       await h.chat("First answer.");
       if (chatFirst) {
         await h.chat("First answer.\n\nChecking again.");
       }
-      await h.send("agent", {
-        stream: "assistant",
-        data: { itemId: "preview", text: "First answer.\n\nChecking again." },
-      });
+      await h.assistant("preview", "First answer.\n\nChecking again.");
       if (!chatFirst) {
         await h.chat("First answer.\n\nChecking again.");
       }
@@ -202,10 +187,8 @@ describe("ACP commentary reclassification", () => {
       if (deferred) {
         await h.chat("First answer.", { replace: true });
       }
-      await h.tool("read", "start");
-      await h.tool("read", "result");
-      await h.chat("First answer.\n\nDone.", { state: "final" });
-      await h.prompt;
+      await h.round();
+      await h.finish("First answer.\n\nDone.");
       expect(h.updates()).toEqual([
         "First answer.",
         "\n\nChecking again.",
@@ -221,12 +204,8 @@ describe("ACP commentary reclassification", () => {
     await h.chat("Answer.");
     await h.chat("", { replace: true, seq: 100 });
     await h.preamble("foreign", "Answer.", { seq: 100, runId: "other-run" });
-    await h.preamble("unrelated", "Answer.", {
-      seq: 101,
-      preamble: {},
-    });
-    await h.chat("Answer.", { state: "final" });
-    await h.prompt;
+    await h.preamble("unrelated", "Answer.", { seq: 101, preamble: {} });
+    await h.finish("Answer.");
     expect(h.updates()).toEqual(["Answer.", "Answer."]);
   });
   it("delivers a retained answer that was held before a reclassified item", async () => {
@@ -234,10 +213,8 @@ describe("ACP commentary reclassification", () => {
     await h.preamble("commentary", "Checking again.", {
       preamble: { retainedText: "First answer." },
     });
-    await h.tool("read", "start");
-    await h.tool("read", "result");
-    await h.chat("First answer.\n\nDone.", { state: "final" });
-    await h.prompt;
+    await h.round();
+    await h.finish("First answer.\n\nDone.");
     expect(h.updates()).toEqual([
       "First answer.\n\nChecking again.",
       "read:in_progress",
@@ -249,11 +226,9 @@ describe("ACP commentary reclassification", () => {
   it("keeps legacy events without projection metadata compatible", async () => {
     const h = await createHarness();
     await h.preamble("legacy", "Checking.", { preamble: undefined });
-    await h.tool("read", "start");
-    await h.tool("read", "result");
+    await h.round();
     await h.chat("Done.");
-    await h.chat("Done.", { state: "final" });
-    await h.prompt;
+    await h.finish();
     expect(h.updates()).toEqual(["read:in_progress", "read:completed", "Done."]);
   });
 });
