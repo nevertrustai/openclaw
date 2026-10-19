@@ -110,6 +110,9 @@ async function addComment(page: Page, comment: string, passage = selectedText) {
   await commentEditor(page).getByRole("textbox").press("Enter");
 }
 async function selectText(text: Locator) {
+  await text.scrollIntoViewIfNeeded();
+  // A transcript scroll dismisses the toolbar, so select only after initial layout settles.
+  await waitForChatScrollIdle(text.page());
   await text.evaluate((element) => {
     const range = document.createRange();
     range.selectNodeContents(element);
