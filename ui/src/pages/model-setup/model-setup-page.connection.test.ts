@@ -86,34 +86,50 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-it.each(["connect", "setup"] as const)(
-  "completes %s OAuth from the browser callback",
-  async (operation) => {
+it.each([
+  ["connect", "callback"],
+  ["setup", "callback"],
+  ["connect", "terminal"],
+  ["setup", "request"],
+] as const)("settles %s OAuth through %s", async (operation, outcome) => {
+  const failed = outcome !== "callback";
+  if (!failed) {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const { context, client, request } = fixture;
-    vi.spyOn(window, "open").mockReturnValue(null);
-    const callback = createDeferred();
-    const manual = new AbortController();
-    let session: WizardSession | undefined;
-    let verificationRuns = 0;
-    configureRequests({
-      [signInMethod(operation)]: () => {
+  }
+  const { context, client, request } = fixture;
+  vi.spyOn(window, "open").mockReturnValue(null);
+  const finish = createDeferred();
+  const manual = new AbortController();
+  const diagnostic = "Token exchange returned no refresh token.";
+  const guidance = "Check the client ID, client secret, and redirect URI.";
+  const url = failed
+    ? "https://example.invalid/authorize?code=synthetic"
+    : "https://example.invalid/authorize";
+  const authorization = "Open the authorization URL: " + url;
+  let reads = 0;
+  let verificationRuns = 0;
+  let session: WizardSession | undefined;
+  configureRequests({
+    [signInMethod(operation)]: () => {
+      if (!failed) {
         session = new WizardSession(async (prompter, _signal, active) => {
           await prompter.note("Approve this account in your browser.", "Account access");
-          await prompter.openUrl?.("https://example.invalid/authorize");
+          await prompter.openUrl?.(url);
           void prompter
             .text({ message: "Paste the redirect URL", signal: manual.signal })
             .catch(() => {});
-          await callback.promise;
+          await finish.promise;
           manual.abort();
           if (operation === "setup") {
             verificationRuns += 1;
             active.setModelActivation({ modelRef: "fixture/verified" });
           }
         });
-        return { done: false, status: "running" };
-      },
-      "wizard.next": async (params) => {
+      }
+      return { done: false, status: "running" };
+    },
+    "wizard.next": async (params) => {
+      if (!failed) {
         if (!session) {
           throw new Error("Expected registered wizard start");
         }
@@ -123,20 +139,65 @@ it.each(["connect", "setup"] as const)(
           await session.answer(answer.stepId, answer.value);
         }
         return session.next();
-      },
-      "wizard.cancel": () => {
-        session?.cancel();
-        return { status: "cancelled" };
-      },
-    });
-    try {
-      const { page } = await mountDetection(context, client, setup, false);
-      const setupButton = authButton(page, "setup-only")!;
-      await startSignIn(page, operation);
-      await waitForSignIn(page);
-      expect(modalTitle(page.querySelector(".model-setup-wizard")!)).toBe(labelFor(operation));
+      }
+      if (++reads <= 2) {
+        return runningStep({
+          id: "note-" + reads,
+          type: "note",
+          executor: "client",
+          message: reads === 1 ? guidance : authorization,
+        });
+      }
+      if (reads === 3) {
+        return runningStep({
+          id: "approval",
+          type: "progress",
+          executor: "gateway",
+          message: "Waiting for approval",
+          externalUrl: url,
+        });
+      }
+      await finish.promise;
+      if (outcome === "request") {
+        throw new Error(diagnostic);
+      }
+      return { done: true, status: "error", error: diagnostic };
+    },
+    "wizard.cancel": () => {
+      session?.cancel();
+      return { status: "cancelled" };
+    },
+  });
+  try {
+    const { page } = await mountDetection(context, client, setup, false);
+    const setupButton = authButton(page, "setup-only")!;
+    await startSignIn(page, operation);
+    await waitForSignIn(page);
+    const modal = page.querySelector("openclaw-modal-dialog")!;
+    expect(modalTitle(modal)).toBe(labelFor(operation));
+    if (failed) {
+      expect(modal.textContent).not.toContain(guidance);
+      expect(modal.textContent).not.toContain(url);
+    } else {
       expect(verificationRuns).toBe(0);
-      callback.resolve();
+    }
+    finish.resolve();
+    if (failed) {
+      const expectedError = [diagnostic, guidance, authorization].join("\n\n");
+      await waitForFast(() =>
+        expect(modal.querySelector(".model-setup-wizard__error-text")?.textContent).toBe(
+          expectedError,
+        ),
+      );
+      expect(modalTitle(modal)).toBe(labelFor(operation));
+      expect(modal.querySelector(".wizard-step__sign-in")).toBeNull();
+      const alert = modal.querySelector("[role=alert]")!;
+      expect(alert.textContent).toContain(guidance);
+      expect(alert.textContent).toContain(url);
+      expect(alert.querySelector<HTMLButtonElement>('button[aria-label="Copy"]')).not.toBeNull();
+      expect(modal.querySelector("details")).toBeNull();
+      expect(reads).toBe(4);
+    } else {
       await vi.advanceTimersByTimeAsync(1_000);
       await waitForFast(
         () =>
@@ -147,9 +208,8 @@ it.each(["connect", "setup"] as const)(
       );
       expect(verificationRuns).toBe(operation === "connect" ? 0 : 1);
       expect(page.textContent).not.toContain("Approve this account in your browser.");
-      expect(page.textContent).not.toContain("https://example.invalid/authorize");
+      expect(page.textContent).not.toContain(url);
       expect(setupButton.textContent?.trim()).toBe("Set up & verify");
-      expect(callsFor(request, "openclaw.setup.activate.start")).toHaveLength(0);
       if (operation === "connect") {
         expect(request).toHaveBeenCalledWith(
           "models.authLogin",
@@ -158,14 +218,15 @@ it.each(["connect", "setup"] as const)(
         );
         expect(callsFor(request, "openclaw.setup.auth.start")).toHaveLength(0);
       }
-    } finally {
-      callback.resolve();
-      manual.abort();
-      session?.cancel();
-      await session?.whenSettled();
     }
-  },
-);
+    expect(callsFor(request, "openclaw.setup.activate.start")).toHaveLength(0);
+  } finally {
+    finish.resolve();
+    manual.abort();
+    session?.cancel();
+    await session?.whenSettled();
+  }
+});
 
 it.each(["agent", "connection", "cancel"] as const)(
   "discards account inventory after %s changes",
@@ -201,74 +262,3 @@ it.each(["agent", "connection", "cancel"] as const)(
     }
   },
 );
-
-it.each([
-  ["connect", "terminal"],
-  ["setup", "request"],
-] as const)("shows %s recovery context after %s failure", async (operation, failure) => {
-  const { context, client, request } = fixture;
-  vi.spyOn(window, "open").mockReturnValue(null);
-  const finish = createDeferred();
-  const diagnostic = "Token exchange returned no refresh token.";
-  const guidance = "Check the client ID, client secret, and redirect URI.";
-  const url = "https://example.invalid/authorize?code=synthetic";
-  const authorization = `Open the authorization URL: ${url}`;
-  let reads = 0;
-  configureRequests({
-    [signInMethod(operation)]: () => ({ done: false, status: "running" }),
-    "wizard.next": async () => {
-      reads += 1;
-      if (reads <= 2) {
-        return runningStep({
-          id: `note-${reads}`,
-          type: "note",
-          executor: "client",
-          message: reads === 1 ? guidance : authorization,
-        });
-      }
-      if (reads === 3) {
-        return runningStep({
-          id: "approval",
-          type: "progress",
-          executor: "gateway",
-          message: "Waiting for approval",
-          externalUrl: url,
-        });
-      }
-      await finish.promise;
-      if (failure === "request") {
-        throw new Error(diagnostic);
-      }
-      return { done: true, status: "error", error: diagnostic };
-    },
-    "wizard.cancel": () => ({ status: "cancelled" }),
-  });
-  try {
-    const { page } = await mountDetection(context, client, setup, false);
-    await startSignIn(page, operation);
-    await waitForSignIn(page);
-    const modal = page.querySelector("openclaw-modal-dialog")!;
-    const label = labelFor(operation);
-    expect(modalTitle(modal)).toBe(label);
-    expect(modal.textContent).not.toContain(guidance);
-    expect(modal.textContent).not.toContain(url);
-    finish.resolve();
-    const expectedError = [diagnostic, guidance, authorization].join("\n\n");
-    await waitForFast(() =>
-      expect(modal.querySelector(".model-setup-wizard__error-text")?.textContent).toBe(
-        expectedError,
-      ),
-    );
-    expect(modalTitle(modal)).toBe(label);
-    expect(modal.querySelector(".wizard-step__sign-in")).toBeNull();
-    const alert = modal.querySelector("[role=alert]")!;
-    expect(alert.textContent).toContain(guidance);
-    expect(alert.textContent).toContain(url);
-    expect(alert.querySelector<HTMLButtonElement>('button[aria-label="Copy"]')).not.toBeNull();
-    expect(modal.querySelector("details")).toBeNull();
-    expect(reads).toBe(4);
-    expect(callsFor(request, "openclaw.setup.activate.start")).toHaveLength(0);
-  } finally {
-    finish.resolve();
-  }
-});

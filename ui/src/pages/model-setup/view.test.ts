@@ -7,6 +7,7 @@ import {
   detection as emptyDetection,
   candidate,
   authOption,
+  pageButton,
 } from "./model-setup-first-run.test-support.ts";
 import { activationTargetId } from "./state.ts";
 import {
@@ -53,15 +54,12 @@ function mountManual(
   );
 }
 
-const ready: SystemAgentSetupDetectResult = {
-  ...emptyDetection,
-  configuredModel: "openai/gpt-5",
-  setupComplete: true,
-};
-
 const firstRunProps = () =>
   props({
-    page: { phase: "ready", result: ready },
+    page: {
+      phase: "ready",
+      result: { ...emptyDetection, configuredModel: "openai/gpt-5", setupComplete: true },
+    },
     firstRun: true,
     manualProviderId: "",
     iconUrls: {},
@@ -95,13 +93,13 @@ describe("renderModelSetup", () => {
     const onStartPrepare = vi.fn();
     const container = mount(props({ onStartPrepare }));
 
-    const ollama = find<HTMLButtonElement>(container, '[data-prepare-choice="ollama"] button');
-    const llamaCpp = find<HTMLButtonElement>(container, '[data-prepare-choice="llama-cpp"] button');
+    const ollama = pageButton(container, '[data-prepare-choice="ollama"] button');
+    const llamaCpp = pageButton(container, '[data-prepare-choice="llama-cpp"] button');
     expect(ollama?.textContent).toContain("Choose connection");
     expect(llamaCpp?.textContent).toContain("Set up model");
-    expect(
-      find<HTMLButtonElement>(container, '[data-prepare-choice="lmstudio"] button')?.textContent,
-    ).toContain("Connect server");
+    expect(pageButton(container, '[data-prepare-choice="lmstudio"] button')?.textContent).toContain(
+      "Connect server",
+    );
     const llamaCppRow = find(container, '[data-prepare-choice="llama-cpp"]');
     expect(llamaCppRow?.querySelector('[data-provider-icon="llamacpp"]')).not.toBeNull();
     expect(text(llamaCppRow!)).toContain("llama.cpp");
@@ -144,63 +142,39 @@ describe("renderModelSetup", () => {
     expect(find(withSignIn, ".model-setup__empty")).toBeNull();
   });
 
-  it("uses explicit brand identity", () => {
-    const container = mountManual(
-      {
-        id: "custom-login",
-        brandId: "claude",
-        label: "Company account",
-        icon: "https://cdn.example.com/custom.png",
-      },
-      { iconUrls: {} },
-    );
-
-    expect(find(container, '.model-setup__manual [data-provider-icon="claude"]')).not.toBeNull();
-    expect(find<HTMLImageElement>(container, ".model-setup__manual img")).toBeNull();
-  });
-
-  it("uses proxied artwork and invalidates broken blobs", () => {
+  it.each(["claude", undefined])("renders explicit branding or proxied artwork: %s", (brandId) => {
     const iconUrl = "https://cdn.example.com/acme.png";
     const onIconError = vi.fn();
     const container = mountManual(
-      { id: "acme", label: "Acme", icon: iconUrl },
-      { iconUrls: { [iconUrl]: "blob:acme" }, onIconError },
+      { id: "custom-login", label: "Company account", brandId, icon: iconUrl },
+      { iconUrls: brandId ? {} : { [iconUrl]: "blob:acme" }, onIconError },
     );
-
     const image = find<HTMLImageElement>(container, ".model-setup__manual img");
-    expect(image).toMatchObject({ src: "blob:acme", alt: "Acme" });
-    image?.dispatchEvent(new Event("error"));
-    expect(onIconError).toHaveBeenCalledWith(iconUrl);
-    expect(container.innerHTML).not.toContain(iconUrl);
+    if (brandId) {
+      expect(find(container, '.model-setup__manual [data-provider-icon="claude"]')).not.toBeNull();
+      expect(image).toBeNull();
+    } else {
+      expect(image).toMatchObject({ src: "blob:acme", alt: "Company account" });
+      image?.dispatchEvent(new Event("error"));
+      expect(onIconError).toHaveBeenCalledWith(iconUrl);
+      expect(container.innerHTML).not.toContain(iconUrl);
+    }
   });
 
   it("offers saved credentials without duplicating the current model", () => {
     const onActivateCandidate = vi.fn();
-    const savedCandidate: SystemAgentSetupDetectResult["candidates"][number] = {
-      ...candidate("saved-auth:openai:replacement", "openai/gpt-5", true),
-      brandId: "openai",
-      label: "Saved OpenAI credentials",
-      detail: "Saved for retry after a failed setup test",
-    };
+    const savedCandidate = candidate("saved-auth:openai:replacement", "openai/gpt-5", true);
     const container = mountDetected(
       {
         configuredModel: savedCandidate.modelRef,
         setupComplete: true,
         candidates: [
-          {
-            ...savedCandidate,
-            kind: "existing-model",
-            label: "Current model",
-            detail: "openai/gpt-5 — already configured",
-          },
-          { ...savedCandidate, kind: "provider-auto:openai", label: "OpenAI" },
+          { ...savedCandidate, kind: "existing-model" },
+          { ...savedCandidate, kind: "provider-auto:openai" },
           savedCandidate,
           {
             ...savedCandidate,
             kind: "claude-cli",
-            brandId: "claude",
-            label: "Claude Code",
-            detail: "logged in",
             modelRef: "claude-cli/claude-opus-5",
           },
         ],
@@ -215,7 +189,7 @@ describe("renderModelSetup", () => {
     expect(find(current, "h2")?.textContent).toBe("Selected model");
     expect(find(current, "strong")?.textContent).toBe("OpenAI");
     expect(find(current, ".model-setup__current-copy .muted")?.textContent).toContain("gpt-5");
-    const retry = find<HTMLButtonElement>(
+    const retry = pageButton(
       container,
       '[data-candidate-kind="saved-auth:openai:replacement"] button',
     );
@@ -237,9 +211,7 @@ describe("renderModelSetup", () => {
     );
     if (checking) {
       expect(text(container)).toContain("Checking — asking openai/gpt-5 for a quick reply…");
-      expect(find<HTMLButtonElement>(container, ".model-setup__current button")?.disabled).toBe(
-        true,
-      );
+      expect(pageButton(container, ".model-setup__current button")?.disabled).toBe(true);
     } else {
       expect(text(container)).toContain("Ready · 1234 ms");
       const current = find(container, ".model-setup__current");
@@ -251,12 +223,11 @@ describe("renderModelSetup", () => {
   });
 
   it("hides verification without access or Gateway support", () => {
-    const result = { ...detected, configuredModel: "openai/gpt-5" };
-    const nonAdmin = mount(
-      props({ page: { phase: "ready", result }, canAdmin: false, canVerify: false }),
-    );
-    const unsupportedGateway = mount(props({ page: { phase: "ready", result }, canVerify: false }));
-    for (const page of [nonAdmin, unsupportedGateway]) {
+    for (const canAdmin of [false, true]) {
+      const page = mountDetected(
+        { configuredModel: "openai/gpt-5" },
+        { canAdmin, canVerify: false },
+      );
       const current = find(page, ".model-setup__current")!;
       expect(find(current, "h2")?.textContent).toBe("Selected model");
       expect(find(current, "strong")?.textContent).toBe("OpenAI");
@@ -288,12 +259,11 @@ describe("renderModelSetup", () => {
 
     if (copied) {
       const link = find<HTMLAnchorElement>(container, 'a[href="https://example.com/device"]');
-      expect(link?.target).toBe("_blank");
-      expect(link?.rel).toBe("noreferrer");
+      expect(link).toMatchObject({ target: "_blank", rel: "noreferrer" });
       expect(text(container)).toContain("ABCD-EFGH");
       expect(text(container)).toContain("Expires in 10 minutes");
     }
-    const copy = find<HTMLButtonElement>(container, ".wizard-step__sign-in button");
+    const copy = pageButton(container, ".wizard-step__sign-in button");
     copy?.click();
 
     const feedback = copied ? "Copied!" : "Copy failed";
@@ -377,7 +347,7 @@ describe("renderModelSetup", () => {
     expect(container.querySelectorAll('[role="status"]')).toHaveLength(1);
     expect(text(find(container, '[role="status"]')!)).toContain("Testing");
     expect(text(container)).not.toContain("test-only-secret");
-    const button = find<HTMLButtonElement>(
+    const button = pageButton(
       container,
       entry === "discovered"
         ? '[data-candidate-kind="codex-cli"] button'
@@ -456,12 +426,12 @@ describe("renderModelSetup", () => {
     expect(find(container, '[data-auth-choice="openai-oauth"]')).toBeNull();
     expect(find(container, '[data-prepare-choice="ollama"]')).not.toBeNull();
     for (const option of [install, custom]) {
-      find<HTMLButtonElement>(container, `[data-auth-choice="${option.id}"] button`)!.click();
+      pageButton(container, `[data-auth-choice="${option.id}"] button`)!.click();
       expect(onStartAuth).toHaveBeenLastCalledWith(option);
     }
     if (setupOnly) {
       expect(find(container, '[data-manual-provider="special-token"]')).not.toBeNull();
-      find<HTMLButtonElement>(container, ".model-setup__manual button.primary")!.click();
+      pageButton(container, ".model-setup__manual button.primary")!.click();
       expect(onManualConnect).toHaveBeenCalledOnce();
     } else {
       expect(find(container, ".model-setup__manual")).toBeNull();
@@ -481,36 +451,30 @@ describe("renderModelSetup", () => {
   });
 
   it.each(["wizard", "primary", "utility"] as const)("routes %s dialog actions", (mode) => {
-    const onWizardCancel = vi.fn();
-    const onClose = vi.fn();
-    const onOpenChat = vi.fn();
-    const onOpenSetupAssistant = vi.fn();
-    const container = mount(
-      props({
-        embedded: true,
-        onClose,
-        onWizardCancel,
-        onOpenChat,
-        onOpenSetupAssistant,
-        ...(mode === "wizard"
-          ? {
-              wizard: {
-                phase: "step",
-                authChoice: "local",
-                busy: false,
-                validationError: null,
-                step: { id: "choice", type: "confirm", message: "Prepare local model?" },
-              },
-            }
-          : {
-              activation: {
-                phase: "success",
-                modelRef: mode === "utility" ? "local/setup" : "openai/gpt-5.6-luna",
-                ...(mode === "utility" ? { modelTarget: "utility" } : {}),
-              },
-            }),
-      }),
-    );
+    const view = props({
+      embedded: true,
+      onClose: vi.fn(),
+      onOpenSetupAssistant: vi.fn(),
+      ...(mode === "wizard"
+        ? {
+            wizard: {
+              phase: "step",
+              authChoice: "local",
+              busy: false,
+              validationError: null,
+              step: { id: "choice", type: "confirm", message: "Prepare local model?" },
+            },
+          }
+        : {
+            activation: {
+              phase: "success",
+              modelRef: mode === "utility" ? "local/setup" : "openai/gpt-5.6-luna",
+              ...(mode === "utility" ? { modelTarget: "utility" } : {}),
+            },
+          }),
+    });
+    const { onWizardCancel, onClose, onOpenChat, onOpenSetupAssistant } = view;
+    const container = mount(view);
     const dialogs = container.querySelectorAll("openclaw-modal-dialog");
     expect(dialogs).toHaveLength(1);
     if (mode === "wizard") {
@@ -522,7 +486,7 @@ describe("renderModelSetup", () => {
       expect(onClose).not.toHaveBeenCalled();
     } else {
       const success = find(container, ".model-setup-success")!;
-      const done = find<HTMLButtonElement>(success, "button.primary")!;
+      const done = pageButton(success, "button.primary")!;
       if (mode === "utility") {
         expect(text(success)).toContain("Setup & utility model ready");
         expect(text(success)).not.toContain("Active model");
@@ -541,7 +505,6 @@ describe("renderModelSetup", () => {
   it("keeps utility and primary actions distinct during rescans", () => {
     const utility = {
       ...candidate("provider-auto:local", "local/setup"),
-      label: "Local utility",
       modelTarget: "utility" as const,
     };
     const onActivateCandidate = vi.fn();
@@ -554,7 +517,7 @@ describe("renderModelSetup", () => {
       },
     };
     const container = mount(props({ embedded: true, page, onActivateCandidate }));
-    const utilityButton = find<HTMLButtonElement>(
+    const utilityButton = pageButton(
       container,
       '[data-candidate-kind="provider-auto:local"] button',
     )!;
