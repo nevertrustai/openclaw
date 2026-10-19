@@ -24,6 +24,8 @@ import { withinTest } from "../../test/helpers/promise.js";
 import type { GatewayClient } from "../gateway/client.js";
 
 const ABORT_CAUSE = "session_status tool validation failed: invalid arguments";
+const modelId = "gpt-acp-abort-cause";
+const modelRef = `mock-openai/${modelId}`;
 
 function writeToolCall(response: ServerResponse): void {
   const call = {
@@ -65,8 +67,6 @@ async function connectOperator(instance: OpenClawTestInstance, signal: AbortSign
       url: instance.url,
       token: instance.gatewayToken,
       clientName: "cli",
-      clientDisplayName: "ACP abort-cause test operator",
-      clientVersion: "test",
       mode: "cli",
       role: "operator",
       scopes: ["operator.write", "operator.admin"],
@@ -148,12 +148,8 @@ it(
             defaults: {
               workspace: process.cwd(),
               skipBootstrap: true,
-              model: { primary: "mock-openai/gpt-acp-abort-cause" },
-              models: {
-                "mock-openai/gpt-acp-abort-cause": {
-                  params: { transport: "sse", openaiWsWarmup: false },
-                },
-              },
+              model: { primary: modelRef },
+              models: { [modelRef]: { params: { transport: "sse", openaiWsWarmup: false } } },
             },
           },
           tools: {
@@ -168,14 +164,7 @@ it(
                 baseUrl: `${providerUrl}/v1`,
                 apiKey: "test",
                 api: "openai-responses",
-                models: [
-                  {
-                    id: "gpt-acp-abort-cause",
-                    name: "gpt-acp-abort-cause",
-                    contextWindow: 128_000,
-                    maxTokens: 4096,
-                  },
-                ],
+                models: [{ id: modelId, name: modelId }],
               },
             },
           },
@@ -220,8 +209,6 @@ it(
       );
       await client.initialize({
         protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
-        clientInfo: { name: "openclaw-acp-abort-cause-test", version: "1.0.0" },
       });
       const sessionKey = `agent:main:acp-abort-cause-${process.pid}`;
       const session = await client.newSession({

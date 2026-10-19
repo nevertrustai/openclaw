@@ -1,10 +1,9 @@
 import { expectDefined } from "@openclaw/normalization-core";
-import { describe, expect, it, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import type { EventFrame } from "../../packages/gateway-protocol/src/index.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import type { AcpGatewayAgent } from "./translator.js";
-import { promptAgent } from "./translator.prompt-harness.test-support.js";
-import { createTranslatorScenario, expectSingleCall } from "./translator.scenario.test-support.js";
+import { createPromptScenario, expectSingleCall } from "./translator.scenario.test-support.js";
 
 vi.mock("./commands.js", () => ({ getAvailableCommands: () => [] }));
 const SESSION_KEY = "agent:main:main";
@@ -31,14 +30,8 @@ function approval(runId: string, approvalId = "approval-1", toolCallId?: string)
 }
 
 function rawApproval(id: string, toolCallId?: string): EventFrame {
-  return {
-    type: "event",
-    event: "exec.approval.requested",
-    payload: {
-      id,
-      request: { command: "echo raw", host: "gateway", sessionKey: SESSION_KEY, toolCallId },
-    },
-  };
+  const request = { command: "echo raw", host: "gateway", sessionKey: SESSION_KEY, toolCallId };
+  return { type: "event", event: "exec.approval.requested", payload: { id, request } };
 }
 
 function tool(runId: string, toolCallId: string, name = "exec", command?: string): EventFrame {
@@ -58,59 +51,46 @@ async function createHarness(
     resolveApproval?: (params?: Record<string, unknown>) => unknown;
   } = {},
 ) {
-  const runIds: string[] = [];
-  const request = vi.fn(async (method: string, requestParams?: Record<string, unknown>) => {
-    if (method === "chat.send") {
-      const runId = expectDefined(
-        requestParams?.idempotencyKey as string | undefined,
-        "Gateway run id",
-      );
-      runIds.push(runId);
-      return { status: "started", runId };
-    }
-    if (method === "exec.approval.get") {
-      return {
-        id: requestParams?.id,
-        commandText: "echo hydrated",
-        allowedDecisions: params.allowedDecisions ?? ["allow-once", "allow-always", "deny"],
-        host: "gateway",
-      };
-    }
-    if (method === "exec.approval.resolve" && params.resolveApproval) {
-      return params.resolveApproval(requestParams);
-    }
-    return {};
-  });
   const requestPermission =
     params.requestPermission ??
-    vi.fn(async () => ({
-      outcome: { outcome: "selected", optionId: "allow-once" },
-    }));
+    vi.fn(async () => ({ outcome: { outcome: "selected", optionId: "allow-once" } }));
   const sessions = params.sessions ?? ["session-1"];
-  const { agent } = createTranslatorScenario(request, { sessions, requestPermission });
-  const prompts = sessions.map((sessionId) => promptAgent(agent, sessionId));
-  await vi.waitFor(() => expect(runIds).toHaveLength(sessions.length));
-  return {
-    agent,
-    request,
+  const h = createPromptScenario({
+    sessions,
     requestPermission,
-    send: agent.handleGatewayEvent.bind(agent),
-    expectResolution(id: string, decision = "allow-once") {
-      expect(request).toHaveBeenCalledWith("exec.approval.resolve", { id, decision });
+    send: (sendParams) => ({ status: "started", runId: sendParams?.idempotencyKey }),
+    request: (method, requestParams) => {
+      if (method === "exec.approval.get") {
+        return {
+          commandText: "echo hydrated",
+          allowedDecisions: params.allowedDecisions ?? ["allow-once", "allow-always", "deny"],
+          host: "gateway",
+        };
+      }
+      return method === "exec.approval.resolve" && params.resolveApproval
+        ? params.resolveApproval(requestParams)
+        : {};
     },
-    runIds,
-    runId: expectDefined(runIds[0], "first Gateway run id"),
+  });
+  const prompts = sessions.map((sessionId) => h.prompt(sessionId));
+  await vi.waitFor(() => expect(h.runIds).toHaveLength(sessions.length));
+  return {
+    ...h,
+    requestPermission,
+    resolutions: () =>
+      h.request.mock.calls.filter(([method]) => method === "exec.approval.resolve"),
+    send: h.agent.handleGatewayEvent.bind(h.agent),
+    expectResolution(id: string, decision = "allow-once") {
+      expect(h.request).toHaveBeenCalledWith("exec.approval.resolve", { id, decision });
+    },
+    runId: expectDefined(h.runIds[0], "first Gateway run id"),
     async cleanup() {
       for (const sessionId of sessions) {
-        await agent.cancel({ sessionId });
+        await h.agent.cancel({ sessionId });
       }
       await Promise.all(prompts);
     },
   };
-}
-
-function resolveCalls(request: Awaited<ReturnType<typeof createHarness>>["request"]) {
-  return request.mock.calls.filter(([method]) => method === "exec.approval.resolve");
 }
 
 function disconnectedResolution(repeat = false) {
@@ -135,150 +115,148 @@ function approvalRelay(agent: AcpGatewayAgent, approvalId: string) {
   };
 }
 
-describe("ACP translator permission relay", () => {
-  it.each([
-    ["explicit deny", { outcome: "selected", optionId: "deny" }],
-    ["cancelled", { outcome: "cancelled" }],
-    ["unknown option", { outcome: "selected", optionId: "not-a-real-option" }],
-    ["client throws", new Error("client closed")],
-  ] as const)("relays %s as deny to Gateway approval resolution", async (_name, outcome) => {
-    const requestPermission =
-      outcome instanceof Error
-        ? vi.fn().mockRejectedValue(outcome)
-        : vi.fn().mockResolvedValue({ outcome });
-    const h = await createHarness({ requestPermission });
-    try {
-      await h.send(approval(h.runId));
-      await vi.waitFor(() => {
-        expect(h.requestPermission).toHaveBeenCalledTimes(1);
-        expect(resolveCalls(h.request)).toEqual([
-          ["exec.approval.resolve", { id: "approval-1", decision: "deny" }],
-        ]);
-      });
-    } finally {
-      await h.cleanup();
-    }
-  });
-
-  it("relays raw approval requests once before the later agent approval event", async () => {
-    const h = await createHarness();
-    await h.send(rawApproval("approval-raw"));
-    await h.send(approval(h.runId, "approval-raw", "tool-late"));
-    await vi.waitFor(() => {
-      expect(h.requestPermission).toHaveBeenCalledTimes(1);
-      expect(resolveCalls(h.request)).toHaveLength(1);
-    });
-    expectSingleCall(h.requestPermission, {
-      sessionId: "session-1",
-      toolCall: {
-        toolCallId: "exec:approval-raw",
-        kind: "execute",
-        rawInput: { name: "exec", approvalId: "approval-raw", command: "echo hydrated" },
-      },
-    });
-    expect(h.request).toHaveBeenCalledWith("exec.approval.get", { id: "approval-raw" });
-    h.expectResolution("approval-raw");
-    await h.cleanup();
-  });
-
-  it("correlates concurrent approvals by a unique execute tool call and fails closed otherwise", async () => {
-    const h = await createHarness({
-      sessions: ["session-1", "session-2"],
-      allowedDecisions: ["allow-once", "deny"],
-    });
-    const secondRun = expectDefined(h.runIds[1], "second Gateway run id");
-    await h.send(approval("other-run"));
-    await h.send(rawApproval("approval-without-tool-id"));
-    expect(h.requestPermission).not.toHaveBeenCalled();
-    expect(resolveCalls(h.request)).toHaveLength(0);
-    await h.send(tool(secondRun, "tool-second", "exec", "echo second"));
-    expect(h.requestPermission).not.toHaveBeenCalled();
-    await h.send(rawApproval("approval-shared", "tool-second"));
-    await vi.waitFor(() => {
-      expect(h.requestPermission).toHaveBeenCalledTimes(1);
-      expect(resolveCalls(h.request)).toHaveLength(1);
-    });
-    expectSingleCall(h.requestPermission, {
-      sessionId: "session-2",
-      toolCall: { toolCallId: "tool-second", title: expect.stringContaining("echo second") },
-    });
-    h.expectResolution("approval-shared");
-    await h.send(rawApproval("approval-mismatch", "tool-missing"));
-    for (const runId of h.runIds) {
-      await h.send(tool(runId, "tool-duplicate"));
-    }
-    await h.send(rawApproval("approval-duplicate", "tool-duplicate"));
-    await h.send(tool(h.runId, "tool-read", "read"));
-    await h.send(rawApproval("approval-read", "tool-read"));
-    expect(h.requestPermission).toHaveBeenCalledTimes(1);
-    expect(resolveCalls(h.request)).toHaveLength(1);
-    await h.cleanup();
-  });
-
-  it("retries the recorded decision on duplicate approval events instead of re-asking", async () => {
-    const resolveApproval = disconnectedResolution();
-    const h = await createHarness({ resolveApproval });
-    const event = approval(h.runId, "approval-retry");
-    await h.send(event);
-    await vi.waitFor(() =>
-      expect(approvalRelay(h.agent, "approval-retry").decision).toBe("allow-once"),
-    );
-    expect(resolveApproval).toHaveBeenCalledTimes(1);
-    await h.send(event);
-    await vi.waitFor(() => expect(resolveApproval).toHaveBeenCalledTimes(2));
-    expect(h.requestPermission).toHaveBeenCalledTimes(1);
-    expect(h.request).toHaveBeenLastCalledWith("exec.approval.resolve", {
-      id: "approval-retry",
-      decision: "allow-once",
-    });
-    await h.cleanup();
-  });
-
-  it("replays the user's approval decision on gateway reconnect", async () => {
-    const permission = createDeferredCore<unknown>();
-    const resolveApproval = disconnectedResolution();
-    const h = await createHarness({
-      resolveApproval,
-      requestPermission: vi.fn(() => permission.promise),
-    });
-    await h.send(approval(h.runId, "approval-replay"));
-    await vi.waitFor(() => expect(h.requestPermission).toHaveBeenCalledTimes(1));
-    h.agent.handleGatewayDisconnect("1006: connection lost");
-    permission.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
-    await vi.waitFor(() => expect(resolveApproval).toHaveBeenCalledTimes(1));
-    h.agent.handleGatewayReconnect();
-    await vi.waitFor(() => expect(resolveApproval).toHaveBeenCalledTimes(2));
-    h.expectResolution("approval-replay");
-    expect(h.requestPermission).toHaveBeenCalledTimes(1);
-    await h.cleanup();
-  });
-
-  it("does not retry a stored decision after prompt cleanup revokes its relay", async () => {
-    const resolveApproval = disconnectedResolution(true);
-    const h = await createHarness({ resolveApproval });
-    const approvalId = "approval-revoked";
-    await h.send(approval(h.runId, approvalId));
-    await vi.waitFor(() => expect(approvalRelay(h.agent, approvalId).decision).toBe("allow-once"));
-    const { retry } = approvalRelay(h.agent, approvalId);
-    await h.cleanup();
-    await retry();
-    expect(resolveApproval.mock.calls).toEqual([
-      [{ id: approvalId, decision: "allow-once" }],
-      [{ id: approvalId, decision: "deny" }],
-    ]);
-  });
-
-  it("does not allow execution when the prompt is cancelled during client permission UI", async () => {
-    const permission = createDeferredCore<unknown>();
-    const h = await createHarness({ requestPermission: vi.fn(() => permission.promise) });
+it.each([
+  ["explicit deny", { outcome: "selected", optionId: "deny" }],
+  ["cancelled", { outcome: "cancelled" }],
+  ["unknown option", { outcome: "selected", optionId: "not-a-real-option" }],
+  ["client throws", new Error("client closed")],
+] as const)("relays %s as deny to Gateway approval resolution", async (_name, outcome) => {
+  const requestPermission =
+    outcome instanceof Error
+      ? vi.fn().mockRejectedValue(outcome)
+      : vi.fn().mockResolvedValue({ outcome });
+  const h = await createHarness({ requestPermission });
+  try {
     await h.send(approval(h.runId));
-    await vi.waitFor(() => expect(h.requestPermission).toHaveBeenCalledTimes(1));
-    await h.cleanup();
-    permission.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
     await vi.waitFor(() => {
-      const decisions = resolveCalls(h.request).map(([, params]) => params?.decision);
-      expect(decisions).toContain("deny");
-      expect(decisions).not.toContain("allow-once");
+      expect(h.requestPermission).toHaveBeenCalledTimes(1);
+      expect(h.resolutions()).toEqual([
+        ["exec.approval.resolve", { id: "approval-1", decision: "deny" }],
+      ]);
     });
+  } finally {
+    await h.cleanup();
+  }
+});
+
+it("relays raw approval requests once before the later agent approval event", async () => {
+  const h = await createHarness();
+  await h.send(rawApproval("approval-raw"));
+  await h.send(approval(h.runId, "approval-raw", "tool-late"));
+  await vi.waitFor(() => {
+    expect(h.requestPermission).toHaveBeenCalledTimes(1);
+    expect(h.resolutions()).toHaveLength(1);
+  });
+  expectSingleCall(h.requestPermission, {
+    sessionId: "session-1",
+    toolCall: {
+      toolCallId: "exec:approval-raw",
+      kind: "execute",
+      rawInput: { name: "exec", approvalId: "approval-raw", command: "echo hydrated" },
+    },
+  });
+  expect(h.request).toHaveBeenCalledWith("exec.approval.get", { id: "approval-raw" });
+  h.expectResolution("approval-raw");
+  await h.cleanup();
+});
+
+it("correlates concurrent approvals by a unique execute tool call and fails closed otherwise", async () => {
+  const h = await createHarness({
+    sessions: ["session-1", "session-2"],
+    allowedDecisions: ["allow-once", "deny"],
+  });
+  const secondRun = expectDefined(h.runIds[1], "second Gateway run id");
+  await h.send(approval("other-run"));
+  await h.send(rawApproval("approval-without-tool-id"));
+  expect(h.requestPermission).not.toHaveBeenCalled();
+  expect(h.resolutions()).toHaveLength(0);
+  await h.send(tool(secondRun, "tool-second", "exec", "echo second"));
+  expect(h.requestPermission).not.toHaveBeenCalled();
+  await h.send(rawApproval("approval-shared", "tool-second"));
+  await vi.waitFor(() => {
+    expect(h.requestPermission).toHaveBeenCalledTimes(1);
+    expect(h.resolutions()).toHaveLength(1);
+  });
+  expectSingleCall(h.requestPermission, {
+    sessionId: "session-2",
+    toolCall: { toolCallId: "tool-second", title: expect.stringContaining("echo second") },
+  });
+  h.expectResolution("approval-shared");
+  await h.send(rawApproval("approval-mismatch", "tool-missing"));
+  for (const runId of h.runIds) {
+    await h.send(tool(runId, "tool-duplicate"));
+  }
+  await h.send(rawApproval("approval-duplicate", "tool-duplicate"));
+  await h.send(tool(h.runId, "tool-read", "read"));
+  await h.send(rawApproval("approval-read", "tool-read"));
+  expect(h.requestPermission).toHaveBeenCalledTimes(1);
+  expect(h.resolutions()).toHaveLength(1);
+  await h.cleanup();
+});
+
+it("retries the recorded decision on duplicate approval events instead of re-asking", async () => {
+  const resolveApproval = disconnectedResolution();
+  const h = await createHarness({ resolveApproval });
+  const event = approval(h.runId, "approval-retry");
+  await h.send(event);
+  await vi.waitFor(() =>
+    expect(approvalRelay(h.agent, "approval-retry").decision).toBe("allow-once"),
+  );
+  expect(resolveApproval).toHaveBeenCalledTimes(1);
+  await h.send(event);
+  await vi.waitFor(() => expect(resolveApproval).toHaveBeenCalledTimes(2));
+  expect(h.requestPermission).toHaveBeenCalledTimes(1);
+  expect(h.request).toHaveBeenLastCalledWith("exec.approval.resolve", {
+    id: "approval-retry",
+    decision: "allow-once",
+  });
+  await h.cleanup();
+});
+
+it("replays the user's approval decision on gateway reconnect", async () => {
+  const permission = createDeferredCore<unknown>();
+  const resolveApproval = disconnectedResolution();
+  const h = await createHarness({
+    resolveApproval,
+    requestPermission: vi.fn(() => permission.promise),
+  });
+  await h.send(approval(h.runId, "approval-replay"));
+  await vi.waitFor(() => expect(h.requestPermission).toHaveBeenCalledTimes(1));
+  h.agent.handleGatewayDisconnect("1006: connection lost");
+  permission.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
+  await vi.waitFor(() => expect(resolveApproval).toHaveBeenCalledTimes(1));
+  h.agent.handleGatewayReconnect();
+  await vi.waitFor(() => expect(resolveApproval).toHaveBeenCalledTimes(2));
+  h.expectResolution("approval-replay");
+  expect(h.requestPermission).toHaveBeenCalledTimes(1);
+  await h.cleanup();
+});
+
+it("does not retry a stored decision after prompt cleanup revokes its relay", async () => {
+  const resolveApproval = disconnectedResolution(true);
+  const h = await createHarness({ resolveApproval });
+  const approvalId = "approval-revoked";
+  await h.send(approval(h.runId, approvalId));
+  await vi.waitFor(() => expect(approvalRelay(h.agent, approvalId).decision).toBe("allow-once"));
+  const { retry } = approvalRelay(h.agent, approvalId);
+  await h.cleanup();
+  await retry();
+  expect(resolveApproval.mock.calls).toEqual([
+    [{ id: approvalId, decision: "allow-once" }],
+    [{ id: approvalId, decision: "deny" }],
+  ]);
+});
+
+it("does not allow execution when the prompt is cancelled during client permission UI", async () => {
+  const permission = createDeferredCore<unknown>();
+  const h = await createHarness({ requestPermission: vi.fn(() => permission.promise) });
+  await h.send(approval(h.runId));
+  await vi.waitFor(() => expect(h.requestPermission).toHaveBeenCalledTimes(1));
+  await h.cleanup();
+  permission.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
+  await vi.waitFor(() => {
+    const decisions = h.resolutions().map(([, params]) => params?.decision);
+    expect(decisions).toContain("deny");
+    expect(decisions).not.toContain("allow-once");
   });
 });
