@@ -3,12 +3,12 @@ import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelOutboundContext } from "../../channels/plugins/types.adapters.js";
 import type { ChannelPlugin } from "../../channels/plugins/types.public.js";
-import { resolveCommandSecretRefsViaGateway } from "../../cli/command-secret-gateway.js";
+import * as commandSecretGateway from "../../cli/command-secret-gateway.js";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
 } from "../../config/runtime-snapshot.js";
-import { runMessageAction } from "../../infra/outbound/message-action-runner.js";
+import * as messageActionRunner from "../../infra/outbound/message-action-runner.js";
 import {
   directOutbound,
   workspaceConfig,
@@ -26,13 +26,12 @@ import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { createMessageTool } from "./message-tool-execution.js";
 import type { MessageToolOptions } from "./message-tool-execution.types.js";
 
+const actualRunMessageAction = messageActionRunner.runMessageAction;
 const mocks = {
-  runMessageAction: vi.fn<typeof runMessageAction>(),
-  resolveCommandSecretRefsViaGateway: vi.fn(resolveCommandSecretRefsViaGateway),
-};
-const secretOptions = {
-  getScopedChannelsCommandSecretTargets: () => ({ targetIds: new Set<string>() }),
-  resolveCommandSecretRefsViaGateway: mocks.resolveCommandSecretRefsViaGateway,
+  runMessageAction: vi.fn<typeof actualRunMessageAction>(),
+  resolveCommandSecretRefsViaGateway: vi.fn(
+    commandSecretGateway.resolveCommandSecretRefsViaGateway,
+  ),
 };
 
 function registerPlugins(plugin: ChannelPlugin) {
@@ -44,8 +43,13 @@ beforeEach(() => {
   resetPluginRuntimeStateForTest();
   mocks.runMessageAction.mockReset();
   mocks.resolveCommandSecretRefsViaGateway.mockClear();
+  vi.spyOn(messageActionRunner, "runMessageAction").mockImplementation(mocks.runMessageAction);
+  vi.spyOn(commandSecretGateway, "resolveCommandSecretRefsViaGateway").mockImplementation(
+    mocks.resolveCommandSecretRefsViaGateway,
+  );
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   clearRuntimeConfigSnapshot();
   resetGlobalHookRunner();
   resetPluginRuntimeStateForTest();
@@ -69,7 +73,6 @@ describe("completion source-reply authority", () => {
     });
     return createMessageTool({
       config,
-      ...secretOptions,
       sourceReplyOnly: true,
       sourceReplyDeliveryMode: "message_tool_only",
       currentChannelProvider: "discord",
@@ -77,7 +80,6 @@ describe("completion source-reply authority", () => {
       currentThreadTs: "thread-1",
       currentMessageId: "message-1",
       agentAccountId: "source-account",
-      runMessageAction: mocks.runMessageAction,
       ...overrides,
     });
   }
@@ -169,6 +171,7 @@ describe("completion source-reply authority", () => {
   });
 
   function createCompletionMediaTool() {
+    mocks.runMessageAction.mockImplementation(actualRunMessageAction);
     const config = { ...workspaceConfig, tools: { fs: { workspaceOnly: true } } };
     setRuntimeConfigSnapshot(config);
     const sendMedia = vi.fn(async (_ctx: ChannelOutboundContext) => ({
@@ -198,8 +201,6 @@ describe("completion source-reply authority", () => {
       currentChannelId: "SOURCE",
       currentThreadTs: "thread-1",
       currentMessageId: "message-1",
-      runMessageAction,
-      ...secretOptions,
     });
     return { tool, sendMedia };
   }
