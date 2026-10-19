@@ -1,5 +1,3 @@
-// Doctor repair for repointed workspace aliases: detection, evidence-gated
-// rebind, and refusal when the current target owns its own state.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -57,35 +55,43 @@ function buildPrompter(overrides: Partial<DoctorPrompter> = {}): DoctorPrompter 
       shouldForce: false,
       nonInteractive: true,
       canPrompt: false,
-    } as DoctorPrompter["repairMode"],
+      updateInProgress: false,
+    },
     ...overrides,
   };
 }
 
-function buildAliasCfg(aliasPath: string): OpenClawConfig {
-  return { agents: { entries: { main: { workspace: aliasPath } } } } as OpenClawConfig;
+function buildAliasCfg(aliasPath: string, other?: string): OpenClawConfig {
+  return {
+    agents: {
+      entries: {
+        main: { workspace: aliasPath },
+        ...(other ? { legacy: { workspace: other } } : {}),
+      },
+    },
+  };
 }
 
-async function runWorkspaceRepair(params: { cfg: OpenClawConfig; prompter: DoctorPrompter }) {
-  const repair = createWorkspaceAliasMigrationRepair(params.prompter, vi.fn());
+async function runWorkspaceRepair(cfg: OpenClawConfig, prompter: DoctorPrompter) {
+  const repair = createWorkspaceAliasMigrationRepair(prompter, vi.fn());
   expect(repair).toBeTypeOf("function");
-  await repair!(params.cfg);
+  await repair!(cfg);
 }
 
-async function repointAlias(params: { seedAttestedFile?: boolean; name?: string }): Promise<{
-  alias: string;
-  original: string;
-  replacement: string;
-}> {
+function link(target: string, alias: string) {
+  fs.symlinkSync(target, alias, process.platform === "win32" ? "junction" : "dir");
+}
+async function expectState(directory: string, exists: boolean) {
+  expect((await readWorkspaceStateSnapshot(directory)).setupExists).toBe(exists);
+}
+async function repointAlias(params: { seedAttestedFile?: boolean; name?: string } = {}) {
   const original = params.name ? testState!.path(params.name, "original") : testState!.workspaceDir;
-  const alias = params.name
-    ? testState!.path(params.name, "workspace-link")
-    : testState!.path("workspace-link");
-  const replacement = params.name
-    ? testState!.path(params.name, "replacement-workspace")
-    : testState!.path("replacement-workspace");
+  const localPath = (name: string) =>
+    testState!.path(...(params.name ? [params.name, name] : [name]));
+  const alias = localPath("workspace-link");
+  const replacement = localPath("replacement-workspace");
   fs.mkdirSync(original, { recursive: true });
-  fs.symlinkSync(original, alias, process.platform === "win32" ? "junction" : "dir");
+  link(original, alias);
   await mergeWorkspaceSetupState(alias, { bootstrapSeededAt: "2026-07-16T01:00:00.000Z" }, 1_000);
   if (params.seedAttestedFile) {
     const content = "seeded bootstrap content";
@@ -101,7 +107,7 @@ async function repointAlias(params: { seedAttestedFile?: boolean; name?: string 
   }
   fs.renameSync(original, replacement);
   fs.unlinkSync(alias);
-  fs.symlinkSync(replacement, alias, process.platform === "win32" ? "junction" : "dir");
+  link(replacement, alias);
   return { alias, original, replacement };
 }
 
@@ -112,15 +118,13 @@ describe("doctor workspace alias repair", () => {
     await testState!.writeConfig(cfg);
     const prompter = buildPrompter({
       confirmRuntimeRepair: vi.fn(async () => {
-        await testState!.writeConfig({
-          agents: { entries: { main: { workspace: alias }, other: { workspace: original } } },
-        });
+        await testState!.writeConfig(buildAliasCfg(alias, original));
         return true;
       }),
     });
-    await expect(runWorkspaceRepair({ cfg, prompter })).rejects.toThrow();
-    expect((await readWorkspaceStateSnapshot(original)).setupExists).toBe(true);
-    expect((await readWorkspaceStateSnapshot(replacement)).setupExists).toBe(false);
+    await expect(runWorkspaceRepair(cfg, prompter)).rejects.toThrow();
+    await expectState(original, true);
+    await expectState(replacement, false);
   });
 
   it("does not adopt a target substituted during confirmation", async () => {
@@ -130,13 +134,13 @@ describe("doctor workspace alias repair", () => {
     const prompter = buildPrompter({
       confirmRuntimeRepair: vi.fn(async () => {
         fs.unlinkSync(alias);
-        fs.symlinkSync(changed, alias, process.platform === "win32" ? "junction" : "dir");
+        link(changed, alias);
         return true;
       }),
     });
-    await expect(runWorkspaceRepair({ cfg: buildAliasCfg(alias), prompter })).rejects.toThrow();
-    expect((await readWorkspaceStateSnapshot(original)).setupExists).toBe(true);
-    expect((await readWorkspaceStateSnapshot(changed)).setupExists).toBe(false);
+    await expect(runWorkspaceRepair(buildAliasCfg(alias), prompter)).rejects.toThrow();
+    await expectState(original, true);
+    await expectState(changed, false);
   });
 
   it("shares one private snapshot across alias findings and rereads committed repairs", async () => {
@@ -173,14 +177,13 @@ describe("doctor workspace alias repair", () => {
     const first = aliases[0]!;
     const facts = detectRepointedWorkspaceAlias(first.alias);
     expect(facts).toBeDefined();
-    expect(
-      await rebindRepointedWorkspaceAlias(
-        first.alias,
-        facts!,
-        {},
-        aliases.map(({ alias }) => alias),
-      ),
-    ).toBe("rebound");
+    const outcome = await rebindRepointedWorkspaceAlias(
+      first.alias,
+      facts!,
+      {},
+      aliases.map(({ alias }) => alias),
+    );
+    expect(outcome).toBe("rebound");
     closeOpenClawStateDatabaseForTest();
     prepare.mockClear();
 
@@ -199,29 +202,25 @@ describe("doctor workspace alias repair", () => {
     const { alias, original } = await repointAlias({ seedAttestedFile: true });
     const prompter = buildPrompter();
 
-    await expect(runWorkspaceRepair({ cfg: buildAliasCfg(alias), prompter })).rejects.toThrow();
+    await expect(runWorkspaceRepair(buildAliasCfg(alias), prompter)).rejects.toThrow();
 
     expect(prompter.confirmAutoFix).not.toHaveBeenCalled();
     expect(prompter.confirmRuntimeRepair).toHaveBeenCalledOnce();
-    expect((await readWorkspaceStateSnapshot(original)).setupExists).toBe(true);
+    await expectState(original, true);
 
     const approving = buildPrompter({ confirmRuntimeRepair: vi.fn(async () => true) });
-    await runWorkspaceRepair({ cfg: buildAliasCfg(alias), prompter: approving });
+    await runWorkspaceRepair(buildAliasCfg(alias), approving);
     const snapshot = await readWorkspaceStateSnapshot(alias);
     expect(snapshot.setupExists).toBe(true);
     expect(snapshot.setup.bootstrapSeededAt).toBe("2026-07-16T01:00:00.000Z");
 
-    // A second run finds nothing left to repair.
     const secondPrompter = buildPrompter();
-    await runWorkspaceRepair({
-      cfg: buildAliasCfg(alias),
-      prompter: secondPrompter,
-    });
+    await runWorkspaceRepair(buildAliasCfg(alias), secondPrompter);
     expect(secondPrompter.confirmRuntimeRepair).not.toHaveBeenCalled();
   });
 
   it("refuses to merge when the current target already owns state", async () => {
-    const { alias, original, replacement } = await repointAlias({ seedAttestedFile: false });
+    const { alias, original, replacement } = await repointAlias();
     await mergeWorkspaceSetupState(
       replacement,
       { bootstrapSeededAt: "2026-07-16T02:00:00.000Z" },
@@ -229,12 +228,12 @@ describe("doctor workspace alias repair", () => {
     );
     const prompter = buildPrompter({ confirmRuntimeRepair: vi.fn(async () => true) });
 
-    await expect(runWorkspaceRepair({ cfg: buildAliasCfg(alias), prompter })).rejects.toThrow();
+    await expect(runWorkspaceRepair(buildAliasCfg(alias), prompter)).rejects.toThrow();
 
     expect(prompter.confirmAutoFix).not.toHaveBeenCalled();
     expect(prompter.confirmRuntimeRepair).not.toHaveBeenCalled();
-    expect((await readWorkspaceStateSnapshot(original)).setupExists).toBe(true);
-    expect((await readWorkspaceStateSnapshot(replacement)).setupExists).toBe(true);
+    await expectState(original, true);
+    await expectState(replacement, true);
   });
 
   it("does not move records from diagnostic mode", async () => {
@@ -255,24 +254,15 @@ describe("doctor workspace alias repair", () => {
 
     expect(prompter.confirmAutoFix).not.toHaveBeenCalled();
     expect(prompter.confirmRuntimeRepair).not.toHaveBeenCalled();
-    expect((await readWorkspaceStateSnapshot(original)).setupExists).toBe(true);
+    await expectState(original, true);
   });
 
   it("refuses to transfer state while another configured agent uses the stored target", async () => {
-    const { alias, original } = await repointAlias({ seedAttestedFile: false });
+    const { alias, original } = await repointAlias();
     const prompter = buildPrompter({ confirmRuntimeRepair: vi.fn(async () => true) });
-    const cfg = {
-      agents: {
-        entries: {
-          main: { workspace: alias },
-          legacy: { workspace: original },
-        },
-      },
-    } as OpenClawConfig;
-
-    await expect(runWorkspaceRepair({ cfg, prompter })).rejects.toThrow();
+    await expect(runWorkspaceRepair(buildAliasCfg(alias, original), prompter)).rejects.toThrow();
 
     expect(prompter.confirmRuntimeRepair).not.toHaveBeenCalled();
-    expect((await readWorkspaceStateSnapshot(original)).setupExists).toBe(true);
+    await expectState(original, true);
   });
 });

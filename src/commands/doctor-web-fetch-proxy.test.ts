@@ -18,33 +18,34 @@ function serviceWithEnv(environment?: Record<string, string>) {
   };
 }
 
-async function collectDiagnostic(
-  params: Omit<Parameters<typeof noteWebFetchProxyDiagnostic>[0], "noteFn">,
-): Promise<string | null> {
-  let diagnostic: string | null = null;
-  await noteWebFetchProxyDiagnostic({
-    ...params,
-    noteFn: (message) => {
-      if (typeof message !== "string") {
-        throw new TypeError("expected doctor proxy diagnostic to be a string");
-      }
-      diagnostic = message;
-    },
-  });
-  return diagnostic;
+type DiagnosticOptions = Parameters<typeof noteWebFetchProxyDiagnostic>[0];
+const webFetchDisabled = { web: { fetch: { enabled: false } } };
+async function diagnose(params: DiagnosticOptions) {
+  const noteFn = vi.fn();
+  await noteWebFetchProxyDiagnostic({ ...params, noteFn });
+  return noteFn;
+}
+async function collectDiagnostic(params: DiagnosticOptions) {
+  const noteFn = await diagnose(params);
+  expect(noteFn.mock.calls.length).toBeLessThanOrEqual(1);
+  return noteFn.mock.calls[0]?.[0] ?? null;
+}
+function expectContains(message: unknown, ...parts: string[]) {
+  for (const part of parts) {
+    expect(message).toContain(part);
+  }
 }
 
 describe("web_fetch proxy doctor diagnostic", () => {
   const proxyUrl = "http://private-proxy.example:8080/proxy-value-marker";
-  it.each<
-    [
-      string,
-      NodeJS.ProcessEnv,
-      Record<string, string> | undefined,
-      "reachable" | "unreachable",
-      string[],
-    ]
-  >([
+  type ProxyCase = [
+    string,
+    NodeJS.ProcessEnv,
+    Record<string, string> | undefined,
+    "reachable" | "unreachable",
+    string[],
+  ];
+  it.each<ProxyCase>([
     [
       "service",
       {},
@@ -75,12 +76,10 @@ describe("web_fetch proxy doctor diagnostic", () => {
     "reports %s proxy routing without exposing values",
     async (source, env, serviceEnv, connectivity, sources) => {
       const service = serviceWithEnv(serviceEnv);
-      const noteFn = vi.fn();
-      await noteWebFetchProxyDiagnostic({
+      const noteFn = await diagnose({
         cfg: {},
         env,
         service,
-        noteFn,
         probeDirectConnectivity: vi.fn(async () => connectivity),
       });
       expect(noteFn).toHaveBeenCalledExactlyOnceWith(
@@ -91,12 +90,13 @@ describe("web_fetch proxy doctor diagnostic", () => {
       for (const expected of sources) {
         expect(diagnostic).toContain(`HTTP(S) proxy environment detected in the ${expected}`);
       }
-      expect(diagnostic).toContain("web_fetch still uses direct connections");
-      expect(diagnostic).toContain("tools.web.fetch.useTrustedEnvProxy is not enabled");
-      expect(diagnostic).toContain(
+      expectContains(
+        diagnostic,
+        "web_fetch still uses direct connections",
+        "tools.web.fetch.useTrustedEnvProxy is not enabled",
         `Direct TLS connectivity to docs.openclaw.ai:443 ${connectivity === "reachable" ? "succeeded" : "failed"}`,
+        "openclaw config set tools.web.fetch.useTrustedEnvProxy true",
       );
-      expect(diagnostic).toContain("openclaw config set tools.web.fetch.useTrustedEnvProxy true");
       expect(diagnostic).not.toContain(proxyUrl);
       expect(diagnostic).not.toContain("proxy-value-marker");
       if (source === "Kubernetes") {
@@ -106,20 +106,16 @@ describe("web_fetch proxy doctor diagnostic", () => {
     },
   );
 
-  it.each<{ name: string; cfg: OpenClawConfig; proxy: boolean }>([
-    { name: "no HTTP(S) proxy is effective", cfg: {}, proxy: false },
-    {
-      name: "trusted proxy opt-in is enabled",
-      cfg: { tools: { web: { fetch: { useTrustedEnvProxy: true } } } },
-      proxy: true,
-    },
-    {
-      name: "web_fetch is disabled",
-      cfg: { tools: { web: { fetch: { enabled: false } } } },
-      proxy: true,
-    },
-    { name: "Gateway mode is remote", cfg: { gateway: { mode: "remote" } }, proxy: true },
-  ])("does nothing when $name", async ({ cfg, proxy }) => {
+  it.each<[string, OpenClawConfig, boolean]>([
+    ["no HTTP(S) proxy is effective", {}, false],
+    [
+      "trusted proxy opt-in is enabled",
+      { tools: { web: { fetch: { useTrustedEnvProxy: true } } } },
+      true,
+    ],
+    ["web_fetch is disabled", { tools: webFetchDisabled }, true],
+    ["Gateway mode is remote", { gateway: { mode: "remote" } }, true],
+  ])("does nothing when %s", async (_name, cfg, proxy) => {
     const service = serviceWithEnv(proxy ? { HTTPS_PROXY: proxyUrl } : undefined);
     const probe = vi.fn(async () => "unreachable" as const);
     await expect(
@@ -139,7 +135,6 @@ describe("web_fetch proxy doctor diagnostic", () => {
 
 describe("managed proxy loopback doctor diagnostic", () => {
   const proxyUrl = "http://proxy.example.test:8080";
-  const webFetchDisabled = { web: { fetch: { enabled: false } } };
 
   it.each([
     { name: "a proxy HTTP error", response: new Response("private-value", { status: 502 }) },
@@ -151,12 +146,9 @@ describe("managed proxy loopback doctor diagnostic", () => {
     } else {
       vi.mocked(fetchWithRuntimeDispatcher).mockRejectedValue(new Error(proxyUrl));
     }
-    const noteFn = vi.fn();
-
-    await noteWebFetchProxyDiagnostic({
+    const noteFn = await diagnose({
       cfg: { tools: webFetchDisabled },
       env: { OPENCLAW_PROXY_URL: proxyUrl },
-      noteFn,
     });
 
     expect(noteFn).toHaveBeenCalledExactlyOnceWith(
@@ -164,21 +156,21 @@ describe("managed proxy loopback doctor diagnostic", () => {
       "Managed proxy loopback",
     );
     const message = String(noteFn.mock.calls[0]?.[0]);
-    expect(message).toContain("openclaw config get proxy");
-    expect(message).toContain("openclaw config set proxy.enabled false");
-    expect(message).toContain("openclaw gateway restart");
+    expectContains(
+      message,
+      "openclaw config get proxy",
+      "openclaw config set proxy.enabled false",
+      "openclaw gateway restart",
+    );
     expect(message).not.toContain("private-value");
     expect(message).not.toContain("proxy.example");
   });
 
   it("stays silent when the runtime reaches its own loopback listener", async () => {
     vi.mocked(fetchWithRuntimeDispatcher).mockImplementation((input, init) => fetch(input, init));
-    const noteFn = vi.fn();
-
-    await noteWebFetchProxyDiagnostic({
+    const noteFn = await diagnose({
       cfg: { proxy: { enabled: true, proxyUrl }, tools: webFetchDisabled },
       env: {},
-      noteFn,
     });
 
     expect(fetchWithRuntimeDispatcher).toHaveBeenCalledOnce();
