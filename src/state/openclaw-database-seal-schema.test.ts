@@ -13,6 +13,31 @@ const inputs = vi.hoisted(() => ({
   build: "first",
   agent: "CREATE TABLE session_nodes (session_key TEXT);",
   state: "CREATE TABLE user_profiles (id TEXT);",
+  agentVersion: 31,
+  stateVersion: 28,
+  storageIdentity: "sqlite-3.53.4-source-build" as string | undefined,
+}));
+vi.mock("../infra/node-sqlite.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../infra/node-sqlite.js")>();
+  return {
+    ...actual,
+    captureSqliteNativeRuntimeAdmission: () => ({
+      ...actual.captureSqliteNativeRuntimeAdmission(),
+      storageIdentity: inputs.storageIdentity,
+    }),
+  };
+});
+vi.mock("./openclaw-agent-db-contract.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./openclaw-agent-db-contract.js")>()),
+  get OPENCLAW_AGENT_SCHEMA_VERSION() {
+    return inputs.agentVersion;
+  },
+}));
+vi.mock("./openclaw-state-db-contract.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./openclaw-state-db-contract.js")>()),
+  get OPENCLAW_STATE_SCHEMA_VERSION() {
+    return inputs.stateVersion;
+  },
 }));
 vi.mock("./openclaw-agent-schema.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./openclaw-agent-schema.js")>()),
@@ -39,6 +64,9 @@ beforeEach(() => {
   inputs.version = "2026.10.1";
   inputs.agent = "CREATE TABLE session_nodes (session_key TEXT);";
   inputs.state = "CREATE TABLE user_profiles (id TEXT);";
+  inputs.agentVersion = 31;
+  inputs.stateVersion = 28;
+  inputs.storageIdentity = "sqlite-3.53.4-source-build";
 });
 
 it.each(["agent", "state"] as const)(
@@ -60,14 +88,14 @@ it.each(["agent", "state"] as const)(
   },
 );
 
-it("reuses a clean seal across builds but validates again after a version change", async () => {
+it("reuses a clean seal across builds and app-version changes", async () => {
   vi.resetModules();
   const pathname = path.join(tempDirs.make("seal-build-identity-"), "database.sqlite");
   fs.writeFileSync(pathname, "unchanged synthetic database");
   const file = fs.statSync(pathname, { bigint: true });
   const proof = { verifiedAt: Date.now(), facts: "validated facts" };
   const first = await import("./openclaw-database-seal-schema.js");
-  const schemaIdentity = first.sqliteDatabaseSealSchemaFor("agent");
+  const schemaIdentity = first.sqliteDatabaseSealSchemaFor("agent")!;
   expect(writeSqliteCleanCloseSeal(pathname, schemaIdentity, file, proof)).toBe(true);
   expect(readSqliteCleanCloseSeal(pathname, file)).toEqual({ ...proof, schemaIdentity });
 
@@ -83,7 +111,28 @@ it("reuses a clean seal across builds but validates again after a version change
   inputs.version = "2026.10.2";
   vi.resetModules();
   const upgraded = await import("./openclaw-database-seal-schema.js");
-  expect(readSqliteCleanCloseSeal(pathname, file)?.schemaIdentity).not.toBe(
+  expect(readSqliteCleanCloseSeal(pathname, file)?.schemaIdentity).toBe(
     upgraded.sqliteDatabaseSealSchemaFor("agent"),
   );
+});
+
+it.each(["agent", "state"] as const)(
+  "invalidates %s proof when its schema version changes",
+  async (kind) => {
+    const { sqliteDatabaseSealSchemaFor } = await import("./openclaw-database-seal-schema.js");
+    const before = sqliteDatabaseSealSchemaFor(kind);
+    inputs[kind === "agent" ? "stateVersion" : "agentVersion"]++;
+    expect(sqliteDatabaseSealSchemaFor(kind)).toBe(before);
+    inputs[kind === "agent" ? "agentVersion" : "stateVersion"]++;
+    expect(sqliteDatabaseSealSchemaFor(kind)).not.toBe(before);
+  },
+);
+
+it("invalidates proof for a different or unknown SQLite storage stack", async () => {
+  const { sqliteDatabaseSealSchemaFor } = await import("./openclaw-database-seal-schema.js");
+  const before = sqliteDatabaseSealSchemaFor("agent");
+  inputs.storageIdentity = "sqlite-3.54.0-source-build";
+  expect(sqliteDatabaseSealSchemaFor("agent")).not.toBe(before);
+  inputs.storageIdentity = undefined;
+  expect(sqliteDatabaseSealSchemaFor("agent")).toBeUndefined();
 });

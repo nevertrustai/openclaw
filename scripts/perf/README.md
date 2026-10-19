@@ -76,6 +76,47 @@ reference time. Generate a fresh fixture for each startup comparison. Cron jobs,
 heartbeats, channels, plugins, browser automation and network discovery are
 disabled so this workload does not call models or external integrations.
 
+## Measure clean-close seals across app versions
+
+`seal-version-restart.ts` measures the real cold-process agent database open,
+including its integrity gate, without launching a Gateway. Run it only on the
+authorized Linux benchmark host with separate baseline/candidate checkouts and
+state directories. Seed the two fixtures **sequentially**, under the host's
+non-measurement CPU allocation:
+
+```sh
+node --import ./scripts/tsx.mjs scripts/perf/seal-version-restart.ts seed \
+  --state-dir /srv/perf-sandbox/seal-version/base-state --mib 2048
+node --import ./scripts/tsx.mjs scripts/perf/seal-version-restart.ts open \
+  --state-dir /srv/perf-sandbox/seal-version/base-state \
+  --refresh-proof --expect-version 2026.10.4 --expect-full-scans 1
+```
+
+The seed refuses existing directories, writes deterministic high-entropy JSON
+into the existing `cache_entries` table in paced 2 MiB transactions, and uses the
+database owner's checkpoint and close paths. It pauses above 1 GiB of Linux
+`Dirty` memory and stops at 2 GiB. It never copies a database or runs `VACUUM`.
+The fresh `open --refresh-proof` process establishes full verification of the
+populated database. Subsequent `open` commands require the completed fixture
+marker and a physical agent database of at least 2 GiB.
+
+Before each pair, set only `package.json`'s version to the old value in **each
+isolated sandbox checkout**, then run `open --refresh-proof` separately to
+reseal both fixtures. Change only that package version to the new value and run
+the two measured opens concurrently with the same future `--start-at <epoch-ms>`.
+Use `--expect-version` on every open: `OPENCLAW_VERSION` does not override the
+package version in the seal policy, and a nearby `build-info.json` can take
+precedence. Baseline expects `--expect-full-scans 1`; candidate expects `0`.
+
+Hold `/srv/perf-sandbox/.quiet.lock` around the concurrent pair. Use A on CPUs
+96–111 and B on 112–127, then swap those halves for the next pair; take at least
+two pairs and record `mpstat -P 96-127` alongside them. Prepare fixtures and
+reseal on CPUs 64–95. Compare B minus A within each pair. JSON reports include
+effective version, database bytes, seal-match state, full-scan count, integrity
+gate milliseconds, and total cold-open milliseconds including seal lookup.
+This is cold process admission, not cold OS page cache; it does not measure
+Gateway readiness or model/channel startup. Record those limits with results.
+
 ## Shared writer contention from audit retention
 
 `scripts/bench-channel-ingress-writer.ts` measures the real audit FIFO, ingress

@@ -115,6 +115,7 @@ type SqliteNativeRuntimeAdmission = {
   format: 1;
   runtime: ReturnType<typeof sqliteNativeRuntimeIdentity>;
   version: string;
+  storageIdentity?: string;
   extensionLoadingSupported: boolean;
   iteratorBehavior: SqliteIteratorBehavior;
 };
@@ -141,6 +142,7 @@ function parseSqliteNativeRuntimeAdmission(
     format: 1,
     runtime,
     version: value.version,
+    storageIdentity: typeof value.storageIdentity === "string" ? value.storageIdentity : undefined,
     extensionLoadingSupported: value.extensionLoadingSupported,
     iteratorBehavior: {
       nextAfterDoneIsTerminal: value.iteratorBehavior.nextAfterDoneIsTerminal,
@@ -191,15 +193,33 @@ function assertSafeSqliteRuntime(sqlite: typeof import("node:sqlite")): SqliteIt
   // reports, so query the loaded library before callers open real state databases.
   const database = new sqlite.DatabaseSync(":memory:");
   let version: string;
+  let storageIdentity: string | undefined;
   let extensions: boolean;
   let iteratorBehavior: SqliteIteratorBehavior;
   try {
     const statement = database.prepare(
-      "SELECT sqlite_version() AS version, sqlite_compileoption_used('OMIT_LOAD_EXTENSION') AS omitted",
+      "SELECT sqlite_version() AS version, sqlite_source_id() AS sourceId, " +
+        "(SELECT group_concat(compile_options, ',') FROM (SELECT compile_options FROM pragma_compile_options ORDER BY compile_options)) AS compileOptions, " +
+        "sqlite_compileoption_used('OMIT_LOAD_EXTENSION') AS omitted",
     );
-    const row = statement.get() as { version?: unknown; omitted?: unknown } | undefined;
+    const row = statement.get();
     version = typeof row?.version === "string" ? row.version : "unknown";
     assertSqliteWalResetSafeVersion(version, process.versions.node);
+    // Bind restart proof to the library actually loaded, including custom builds.
+    // Missing introspection disables seals, not ordinary full validation.
+    if (
+      typeof row?.sourceId === "string" &&
+      row.sourceId &&
+      typeof row.compileOptions === "string"
+    ) {
+      storageIdentity = JSON.stringify([
+        version,
+        row.sourceId,
+        row.compileOptions,
+        process.versions.node,
+        process.versions.bun ?? null,
+      ]);
+    }
     extensions = row?.omitted === 0;
     iteratorBehavior = probeSqliteIteratorBehavior(statement);
   } finally {
@@ -212,6 +232,7 @@ function assertSafeSqliteRuntime(sqlite: typeof import("node:sqlite")): SqliteIt
     format: 1,
     runtime: sqliteNativeRuntimeIdentity(),
     version,
+    storageIdentity,
     extensionLoadingSupported: extensions,
     iteratorBehavior,
   });
