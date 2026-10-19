@@ -1,21 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MSTeamsConfig } from "../../runtime-api.js";
-import type {
-  downloadMSTeamsAttachments,
-  downloadMSTeamsBotFrameworkAttachments,
-  downloadMSTeamsGraphMedia,
-} from "../attachments.js";
 import { resolveMSTeamsRequestTimeoutMs } from "../request-timeout.js";
 import { getMSTeamsRuntime } from "../runtime.js";
 import type { MSTeamsTurnContext } from "../sdk-types.js";
+type Downloads = typeof import("../attachments.js");
+type GetTeamDetails = NonNullable<MSTeamsTurnContext["getTeamDetails"]>;
 // Preserve module setup before modules that consume it.
 // oxfmt-ignore
 import { getRuntimeApiMockState } from "./message-handler-mock-support.test-support.js";
 
 const { media, graphMedia, botFrameworkMedia } = vi.hoisted(() => ({
-  media: vi.fn<typeof downloadMSTeamsAttachments>(),
-  graphMedia: vi.fn<typeof downloadMSTeamsGraphMedia>(),
-  botFrameworkMedia: vi.fn<typeof downloadMSTeamsBotFrameworkAttachments>(),
+  media: vi.fn<Downloads["downloadMSTeamsAttachments"]>(),
+  graphMedia: vi.fn<Downloads["downloadMSTeamsGraphMedia"]>(),
+  botFrameworkMedia: vi.fn<Downloads["downloadMSTeamsBotFrameworkAttachments"]>(),
 }));
 vi.mock("../attachments.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../attachments.js")>()),
@@ -31,20 +28,16 @@ import {
 } from "./message-handler.test-support.js";
 
 const dispatch = getRuntimeApiMockState().dispatchReplyWithBufferedBlockDispatcher;
+type Activity = Partial<MSTeamsTurnContext["activity"]>;
 const html = (content: string) => [{ contentType: "text/html", content }];
 const dmConfig: MSTeamsConfig = { dmPolicy: "open", allowFrom: ["*"] };
 const dmConversation = { id: "a:bot-framework-dm", conversationType: "personal" };
-const document = (path: string) => ({
-  path,
-  contentType: "application/pdf",
-  kind: "document" as const,
-});
+const pdf = { contentType: "application/pdf", kind: "document" as const };
+const document = (path: string) => ({ path, ...pdf });
 const teamData = (id: string) => ({ team: { id }, channel: { id: "19:channel@thread.tacv2" } });
 function setup(
   config: MSTeamsConfig = {},
-  getTeamDetails: NonNullable<MSTeamsTurnContext["getTeamDetails"]> = vi.fn<
-    NonNullable<MSTeamsTurnContext["getTeamDetails"]>
-  >(async () => ({ aadGroupId: "team-aad-group" })),
+  getTeamDetails: GetTeamDetails = vi.fn(async () => ({ aadGroupId: "team-aad-group" })),
 ) {
   const msteams: MSTeamsConfig = {
     groupPolicy: "open",
@@ -54,25 +47,19 @@ function setup(
   };
   const fixture = createMessageHandlerDeps({ channels: { msteams } });
   const handler = createMSTeamsMessageHandler(fixture.deps);
-  return {
-    ...fixture,
-    getTeamDetails,
-    handle: (overrides: Partial<MSTeamsTurnContext["activity"]> = {}) =>
-      handler({
-        ...createTurnContext(
-          buildChannelActivity({
-            text: "<at>Bot</at>",
-            attachments: html("<div><at>Bot</at></div>"),
-            channelData: {
-              team: { id: "19:team@thread.skype", aadGroupId: "team-aad" },
-              channel: { id: "19:channel@thread.tacv2" },
-            },
-            ...overrides,
-          }),
-        ),
-        getTeamDetails,
-      }),
+  const handle = (overrides: Activity = {}) => {
+    const activity = buildChannelActivity({
+      text: "<at>Bot</at>",
+      attachments: html("<div><at>Bot</at></div>"),
+      channelData: {
+        team: { id: "19:team@thread.skype", aadGroupId: "team-aad" },
+        channel: { id: "19:channel@thread.tacv2" },
+      },
+      ...overrides,
+    });
+    return handler({ ...createTurnContext(activity), getTeamDetails });
   };
+  return { ...fixture, getTeamDetails, handle };
 }
 function context() {
   expect(dispatch).toHaveBeenCalledTimes(1);
@@ -86,10 +73,8 @@ describe("Teams inbound media recovery", () => {
     botFrameworkMedia.mockReset().mockResolvedValue({ media: [] });
     dispatch.mockClear();
   });
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.useRealTimers();
-  });
+  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => vi.useRealTimers());
   it("dispatches recovered tagless files without logging instruction text", async () => {
     graphMedia.mockResolvedValue({ media: [document("/tmp/from-graph.pdf")] });
     const { handle, getTeamDetails, deps } = setup();
@@ -99,11 +84,9 @@ describe("Teams inbound media recovery", () => {
       text: `<at>Bot</at> ${privateText}`,
       channelData: teamData("19:raw-team@thread.skype"),
     });
-    expect(graphMedia).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({
-        messageUrl:
-          "https://graph.microsoft.com/v1.0/teams/team-aad-group/channels/19%3Achannel%40thread.tacv2/messages/msg-1",
-      }),
+    expect(graphMedia).toHaveBeenCalledTimes(1);
+    expect(graphMedia.mock.calls[0]?.[0].messageUrl).toBe(
+      "https://graph.microsoft.com/v1.0/teams/team-aad-group/channels/19%3Achannel%40thread.tacv2/messages/msg-1",
     );
     expect(getTeamDetails).toHaveBeenCalledExactlyOnceWith("19:raw-team@thread.skype");
     expect(context()).toMatchObject({
@@ -112,13 +95,10 @@ describe("Teams inbound media recovery", () => {
       media: [expect.objectContaining(document("/tmp/from-graph.pdf"))],
     });
     expect(JSON.stringify(context())).not.toContain("19:raw-team@thread.skype/");
-    const logs = JSON.stringify([
-      vi.mocked(deps.log.info).mock.calls,
-      vi.mocked(deps.log.debug!).mock.calls,
-      vi.mocked(deps.log.error).mock.calls,
-      vi.mocked(deps.runtime.error).mock.calls,
-    ]);
-    expect(logs).not.toContain("Private launch note");
+    const loggers = [deps.log.info, deps.log.debug!, deps.log.error, deps.runtime.error];
+    expect(JSON.stringify(loggers.map((logger) => vi.mocked(logger).mock.calls))).not.toContain(
+      "Private launch note",
+    );
   });
   it("recovers explicit personal attachments without opting into Graph fallback or rewriting the Bot Framework ID", async () => {
     botFrameworkMedia.mockResolvedValue({ media: [document("/tmp/explicit.pdf")] });
@@ -146,10 +126,12 @@ describe("Teams inbound media recovery", () => {
     });
     expect(context().MessageThreadId).toBeUndefined();
   });
-  it("does not emit a ghost event when Graph recovery is empty", async () => {
-    const { handle, getTeamDetails, enqueueSystemEvent } = setup();
-    await handle();
-    expect(media).toHaveBeenCalledTimes(1);
+  it.each([false, true])("emits no ghost event (mention required: %s)", async (requireMention) => {
+    const { handle, getTeamDetails, enqueueSystemEvent } = setup({ requireMention });
+    await handle(
+      requireMention ? { text: "", entities: [], attachments: html("<div></div>") } : {},
+    );
+    expect(media).toHaveBeenCalledTimes(requireMention ? 0 : 1);
     expect(getTeamDetails).not.toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
@@ -176,70 +158,53 @@ describe("Teams inbound media recovery", () => {
     expect(graphMedia).not.toHaveBeenCalled();
     expect(context()).toMatchObject({ BodyForAgent: "keep this text", NativeChannelId: undefined });
   });
-  it.each([
-    {
-      name: "DM download",
-      config: dmConfig,
-      input: {
-        conversation: dmConversation,
-        channelData: {},
-        text: "what is this?",
-        entities: [],
-        attachments: [
-          {
-            contentType: "image/*",
-            contentUrl: "https://smba.trafficmanager.net/au/tenant/v3/attachments/a/views/original",
-          },
-        ],
-      },
-      expected: { BodyForAgent: "what is this?" },
-      team: undefined,
-    },
-    {
-      name: "team identity after download",
-      config: {},
-      input: {
-        text: "<at>Bot</at> see image",
-        channelData: teamData("19:slow-media-team@thread.skype"),
-      },
-      expected: { NativeChannelId: "team-aad-group/19:channel@thread.tacv2" },
-      team: "19:slow-media-team@thread.skype",
-    },
-  ])("preserves the budget for $name", async ({ config, input, expected, team }) => {
-    const transferMs = 45_000;
-    vi.useFakeTimers();
-    // Mirror a guarded fetch: the per-request timeout comes from the deadline it was handed.
-    media.mockImplementation(async ({ deadline }) => {
-      if (resolveMSTeamsRequestTimeoutMs(deadline) < transferMs) {
-        throw new Error("request timed out");
-      }
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, transferMs);
+  it.each([true, false])(
+    "preserves slow download and enrichment budgets (personal: %s)",
+    async (personal) => {
+      const team = "19:slow-media-team@thread.skype";
+      const input: Activity = personal
+        ? {
+            conversation: dmConversation,
+            channelData: {},
+            text: "what is this?",
+            entities: [],
+            attachments: [
+              {
+                contentType: "image/*",
+                contentUrl:
+                  "https://smba.trafficmanager.net/au/tenant/v3/attachments/a/views/original",
+              },
+            ],
+          }
+        : {
+            text: "<at>Bot</at> see image",
+            channelData: teamData(team),
+          };
+      const transferMs = 45_000;
+      vi.useFakeTimers();
+      // Mirror a guarded fetch: the per-request timeout comes from the deadline it was handed.
+      media.mockImplementation(async ({ deadline }) => {
+        if (resolveMSTeamsRequestTimeoutMs(deadline) < transferMs) {
+          throw new Error("request timed out");
+        }
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, transferMs);
+        });
+        return [{ path: "/tmp/pasted.png", contentType: "image/png", kind: "image" }];
       });
-      return [{ path: "/tmp/pasted.png", contentType: "image/png", kind: "image" }];
-    });
-    const { handle, getTeamDetails } = setup(config);
-    const run = handle(input);
-    await vi.advanceTimersByTimeAsync(transferMs);
-    await run;
-    expect(context()).toMatchObject({
-      ...expected,
-      media: [expect.objectContaining({ path: "/tmp/pasted.png", kind: "image" })],
-    });
-    if (team) {
-      expect(getTeamDetails).toHaveBeenCalledExactlyOnceWith(team);
-    }
-  });
-  it("drops unmentioned empty HTML before media recovery", async () => {
-    const { handle, getTeamDetails, enqueueSystemEvent } = setup({ requireMention: true });
-    await handle({
-      text: "",
-      entities: [],
-      attachments: html("<div></div>"),
-    });
-    expect(getTeamDetails).not.toHaveBeenCalled();
-    expect(media).not.toHaveBeenCalled();
-    expect(enqueueSystemEvent).not.toHaveBeenCalled();
-    expect(dispatch).not.toHaveBeenCalled();
-  });
+      const { handle, getTeamDetails } = setup(personal ? dmConfig : {});
+      const run = handle(input);
+      await vi.advanceTimersByTimeAsync(transferMs);
+      await run;
+      expect(context()).toMatchObject({
+        ...(personal
+          ? { BodyForAgent: "what is this?" }
+          : { NativeChannelId: "team-aad-group/19:channel@thread.tacv2" }),
+        media: [expect.objectContaining({ path: "/tmp/pasted.png", kind: "image" })],
+      });
+      if (!personal) {
+        expect(getTeamDetails).toHaveBeenCalledExactlyOnceWith(team);
+      }
+    },
+  );
 });
