@@ -66,22 +66,8 @@ function approvalClient(
 }
 
 function deviceContext(clients: ReturnType<typeof makeDeviceClient>[]) {
-  const invalidateSessionsForDevice = vi.fn();
-  const disconnectSessionsForDevice = vi.fn();
-  const invalidateConnectionForPairingChange = vi.fn();
-  const context = createGatewayRequestContext(
-    makeContextParams({
-      clients: new Set(clients) as never,
-      watchNodeHttpRuntime: { invalidateSessionsForDevice, disconnectSessionsForDevice },
-      nodeRegistry: { invalidateConnectionForPairingChange } as never,
-    }),
-  );
-  return {
-    context,
-    invalidateSessionsForDevice,
-    disconnectSessionsForDevice,
-    invalidateConnectionForPairingChange,
-  };
+  const params = makeContextParams({ clients: new Set(clients) as never });
+  return { context: createGatewayRequestContext(params), runtime: params.runtime };
 }
 
 describe("createGatewayRequestContext", () => {
@@ -94,6 +80,8 @@ describe("createGatewayRequestContext", () => {
         .spyOn(deletionJournal, "readAgentDeletionJournalStatusInWorker")
         .mockResolvedValue("absent");
       const preparation = createDeferredCore();
+      const startupReason = "synthetic transport startup inspection";
+      const assertAdmitted = () => assertAgentDatabaseAdmitted("main", { env: state.env });
       try {
         await withAgentDatabaseStartupAdmission(async (admission) => {
           recordAgentDatabaseAdmissions(
@@ -105,7 +93,7 @@ describe("createGatewayRequestContext", () => {
                   result: Promise.resolve({ incompatible: [], indeterminate: [] }),
                 },
               ],
-              reason: "synthetic transport startup inspection",
+              reason: startupReason,
             }),
             { env: state.env, source: "startup" },
           );
@@ -122,16 +110,14 @@ describe("createGatewayRequestContext", () => {
           context.getRuntimeConfig = () => config;
           const respond = vi.fn();
           const handler = vi.fn<GatewayRequestHandler>(({ respond: reply }) => {
-            assertAgentDatabaseAdmitted("main", { env: state.env });
+            assertAdmitted();
             reply(true, { sessions: [] });
           });
           let request: Promise<void> | undefined;
           try {
             request = runInDetachedAsyncContext(() => {
               expect(getAgentDatabaseStartupAdmission()).toBeUndefined();
-              expect(() => assertAgentDatabaseAdmitted("main", { env: state.env })).toThrow(
-                "synthetic transport startup inspection",
-              );
+              expect(assertAdmitted).toThrow(startupReason);
               return handleGatewayRequest({
                 req: {
                   type: "req",
@@ -153,9 +139,7 @@ describe("createGatewayRequestContext", () => {
             await vi.advanceTimersByTimeAsync(0);
             expect(handler).not.toHaveBeenCalled();
             expect(respond).not.toHaveBeenCalled();
-            expect(() => assertAgentDatabaseAdmitted("main", { env: state.env })).toThrow(
-              "synthetic transport startup inspection",
-            );
+            expect(assertAdmitted).toThrow(startupReason);
             preparation.resolve();
             await request;
             expect(handler).toHaveBeenCalledOnce();
@@ -218,8 +202,6 @@ describe("createGatewayRequestContext", () => {
         });
       }
       const peers = [...clients];
-      const profiles = await userProfileCatalog.prepareUserProfileCatalog();
-      onTestFinished(profiles.release);
       const broadcaster = createGatewayBroadcaster({
         clients,
         preparePresenceProjection: (presence) => () => presence,
@@ -252,13 +234,13 @@ describe("createGatewayRequestContext", () => {
       try {
         linkEmail("event-source@example.test", target.id);
         for (const [index, profileId] of [target.id, target.id, third.id].entries()) {
-          const first = frames.find((frame) => frame.connId === `event-${index}`);
-          expect(first).toMatchObject({ recipientProfileId: profileId });
           expect(
-            frames
-              .filter((frame) => frame.connId === `event-${index}`)
-              .every((frame) => frame.recipientProfileId === profileId),
-          ).toBe(true);
+            new Set(
+              frames
+                .filter((frame) => frame.connId === `event-${index}`)
+                .map((frame) => frame.recipientProfileId),
+            ),
+          ).toEqual(new Set([profileId]));
         }
         expect(frames.some((frame) => frame.event === "sessions.changed")).toBe(true);
         const authenticated = peers.map((peer) => peer.authenticatedUserProfile);
@@ -269,9 +251,11 @@ describe("createGatewayRequestContext", () => {
           });
         try {
           context.refreshConnectedUserProfile?.();
-          expect(peers[0]!.preparedRecipientProfileId).toBeUndefined();
-          expect(peers[1]!.preparedRecipientProfileId).toBe(target.id);
-          expect(peers[2]!.preparedRecipientProfileId).toBe(third.id);
+          expect(peers.map((peer) => peer.preparedRecipientProfileId)).toEqual([
+            undefined,
+            target.id,
+            third.id,
+          ]);
           peers.forEach((peer, index) => {
             expect(peer.authenticatedUserProfile).toBe(authenticated[index]);
             expect(peer.invalidated).not.toBe(true);
@@ -299,32 +283,27 @@ describe("createGatewayRequestContext", () => {
   });
 
   it("cleans connection-scoped replace-sets with the other session subscriptions", () => {
-    const order: string[] = [];
-    const unsubscribeAllSessionEvents = vi.fn(() => order.push("session-events"));
-    const unsubscribeMessages = vi.fn(() => order.push("messages"));
-    const removeObserver = vi.fn(() => order.push("observer"));
-    const unsubscribePullRequests = vi.fn(() => order.push("pull-requests"));
-    const unsubscribeViewerPresence = vi.fn(() => order.push("presence"));
+    const calls: [string, string][] = [];
+    const record = (name: string) => (connId: string) => {
+      calls.push([name, connId]);
+    };
     const params = makeContextParams();
-    params.runtime.sessionEventSubscribers.unsubscribe = unsubscribeAllSessionEvents;
-    params.runtime.sessionMessageSubscribers.unsubscribeAll = unsubscribeMessages;
-    params.runtime.sessionObserver.removeConnection = removeObserver;
+    params.runtime.sessionEventSubscribers.unsubscribe = record("session-events");
+    params.runtime.sessionMessageSubscribers.unsubscribeAll = record("messages");
+    params.runtime.sessionObserver.removeConnection = record("observer");
     params.runtime.runtimeState.controlUiSessionPullRequests = {
-      unsubscribe: unsubscribePullRequests,
+      unsubscribe: record("pull-requests"),
     } as never;
     params.runtime.runtimeState.sessionViewerPresence = {
-      unsubscribe: unsubscribeViewerPresence,
+      unsubscribe: record("presence"),
     } as never;
-    const context = createGatewayRequestContext(params);
-
-    context.unsubscribeAllSessionEvents("conn-control-ui");
-
-    expect(unsubscribeAllSessionEvents).toHaveBeenCalledWith("conn-control-ui");
-    expect(unsubscribeMessages).toHaveBeenCalledWith("conn-control-ui");
-    expect(removeObserver).toHaveBeenCalledWith("conn-control-ui");
-    expect(unsubscribePullRequests).toHaveBeenCalledWith("conn-control-ui");
-    expect(unsubscribeViewerPresence).toHaveBeenCalledWith("conn-control-ui");
-    expect(order).toEqual(["session-events", "messages", "observer", "pull-requests", "presence"]);
+    createGatewayRequestContext(params).unsubscribeAllSessionEvents("conn-control-ui");
+    expect(calls).toEqual(
+      ["session-events", "messages", "observer", "pull-requests", "presence"].map((name) => [
+        name,
+        "conn-control-ui",
+      ]),
+    );
   });
 
   it("reads the portal service after its transport becomes available", () => {
@@ -418,141 +397,111 @@ describe("createGatewayRequestContext", () => {
     );
   });
 
-  it("does not treat scoped CLI or backend callers as approval delivery routes", () => {
-    const clients = new Set([
+  it.each([false, true])("selects capable approval routes (delivery clients: %s)", (delivery) => {
+    const clients = [
       approvalClient("cli", GATEWAY_CLIENT_IDS.CLI, { scopes: ["operator.admin"] }),
       approvalClient("backend", GATEWAY_CLIENT_IDS.GATEWAY_CLIENT, {
         mode: GATEWAY_CLIENT_MODES.BACKEND,
       }),
-    ]) as never;
-    const context = createGatewayRequestContext(makeContextParams({ clients }));
-
-    expect(context.hasExecApprovalClients?.()).toBe(false);
-    expect(context.getApprovalClientConnIds?.()).toEqual(new Set());
-    expect(context.getApprovalClientConnIds?.({ approvalKind: "plugin" })).toEqual(new Set());
+      ...(delivery
+        ? [
+            approvalClient("control-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, {
+              mode: GATEWAY_CLIENT_MODES.WEBCHAT,
+            }),
+            approvalClient("ios", GATEWAY_CLIENT_IDS.IOS_APP, {
+              mode: GATEWAY_CLIENT_MODES.UI,
+              scopes: ["operator.admin"],
+            }),
+            approvalClient("bridge", GATEWAY_CLIENT_IDS.CLI, {
+              caps: [GATEWAY_CLIENT_CAPS.APPROVALS],
+            }),
+            approvalClient("acp", GATEWAY_CLIENT_IDS.CLI, {
+              caps: [GATEWAY_CLIENT_CAPS.EXEC_APPROVALS],
+            }),
+            approvalClient("tui", GATEWAY_CLIENT_IDS.TUI),
+            approvalClient("plugin-bridge", GATEWAY_CLIENT_IDS.CLI, {
+              caps: [GATEWAY_CLIENT_CAPS.PLUGIN_APPROVALS],
+            }),
+            approvalClient("runtime", GATEWAY_CLIENT_IDS.GATEWAY_CLIENT, {
+              mode: GATEWAY_CLIENT_MODES.BACKEND,
+              approvalRuntime: true,
+            }),
+            approvalClient("invalidated-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, { invalidated: true }),
+            approvalClient("unscoped-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, { scopes: [] }),
+          ]
+        : []),
+    ];
+    const context = createGatewayRequestContext(
+      makeContextParams({ clients: new Set(clients) as never }),
+    );
+    expect(context.hasExecApprovalClients?.()).toBe(delivery);
+    for (const [approvalKind, recipients] of [
+      [undefined, ["control-ui", "ios", "bridge", "acp", "runtime"]],
+      ["plugin", ["control-ui", "bridge", "tui", "plugin-bridge", "runtime"]],
+      ["system-agent", ["control-ui", "bridge", "runtime"]],
+    ] as const) {
+      expect(
+        context.getApprovalClientConnIds?.(approvalKind ? { approvalKind } : undefined),
+      ).toEqual(new Set(delivery ? recipients : []));
+    }
+    if (delivery) {
+      expect(context.hasExecApprovalClients?.("control-ui")).toBe(true);
+      expect(
+        context.getApprovalClientConnIds?.({
+          excludeConnId: "control-ui",
+          filter: (client) => client.connect.client.id === GATEWAY_CLIENT_IDS.IOS_APP,
+        }),
+      ).toEqual(new Set(["ios"]));
+    }
   });
 
-  it("preserves only clients that handle each approval kind", () => {
-    const clients = new Set([
-      approvalClient("control-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, {
-        mode: GATEWAY_CLIENT_MODES.WEBCHAT,
-      }),
-      approvalClient("ios", GATEWAY_CLIENT_IDS.IOS_APP, {
-        mode: GATEWAY_CLIENT_MODES.UI,
-        scopes: ["operator.admin"],
-      }),
-      approvalClient("bridge", GATEWAY_CLIENT_IDS.CLI, {
-        caps: [GATEWAY_CLIENT_CAPS.APPROVALS],
-      }),
-      approvalClient("acp", GATEWAY_CLIENT_IDS.CLI, {
-        caps: [GATEWAY_CLIENT_CAPS.EXEC_APPROVALS],
-      }),
-      approvalClient("tui", GATEWAY_CLIENT_IDS.TUI),
-      approvalClient("plugin-bridge", GATEWAY_CLIENT_IDS.CLI, {
-        caps: [GATEWAY_CLIENT_CAPS.PLUGIN_APPROVALS],
-      }),
-      approvalClient("runtime", GATEWAY_CLIENT_IDS.GATEWAY_CLIENT, {
-        mode: GATEWAY_CLIENT_MODES.BACKEND,
-        approvalRuntime: true,
-      }),
-      approvalClient("invalidated-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, { invalidated: true }),
-      approvalClient("unscoped-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, { scopes: [] }),
-    ]) as never;
-    const context = createGatewayRequestContext(makeContextParams({ clients }));
-
-    expect(context.hasExecApprovalClients?.()).toBe(true);
-    expect(context.getApprovalClientConnIds?.()).toEqual(
-      new Set(["control-ui", "ios", "bridge", "acp", "runtime"]),
-    );
-    expect(context.getApprovalClientConnIds?.({ approvalKind: "plugin" })).toEqual(
-      new Set(["control-ui", "bridge", "tui", "plugin-bridge", "runtime"]),
-    );
-    expect(context.getApprovalClientConnIds?.({ approvalKind: "system-agent" })).toEqual(
-      new Set(["control-ui", "bridge", "runtime"]),
-    );
-    expect(context.hasExecApprovalClients?.("control-ui")).toBe(true);
-    expect(
-      context.getApprovalClientConnIds?.({
-        excludeConnId: "control-ui",
-        filter: (client) => client.connect.client.id === GATEWAY_CLIENT_IDS.IOS_APP,
-      }),
-    ).toEqual(new Set(["ios"]));
-  });
-
-  it("invalidateClientsForDevice sets the flag on matching clients without closing the socket", () => {
+  it.each([false, true])("invalidates matching device authority (disconnect: %s)", (disconnect) => {
     const target = makeDeviceClient("conn-target", "device-1");
     const unrelated = makeDeviceClient("conn-unrelated", "device-2");
-    const { context, invalidateSessionsForDevice, invalidateConnectionForPairingChange } =
-      deviceContext([target, unrelated]);
+    const { context, runtime } = deviceContext([target, unrelated]);
     const detached = captureGatewayDeviceRevocation(context, { deviceId: "device-1" }, () => true);
     onTestFinished(detached.release);
     expect(detached.isCurrent()).toBe(true);
-    context.invalidateClientsForDevice?.("device-1", { reason: "device-token-rotated" });
+    const reason = disconnect ? "device-removed" : "device-token-rotated";
+    if (disconnect) {
+      context.disconnectClientsForDevice?.("device-1");
+      expect(target.socket.close).toHaveBeenCalledWith(4001, "device removed");
+      expect(runtime.watchNodeHttpRuntime.disconnectSessionsForDevice).toHaveBeenCalledWith(
+        "device-1",
+        undefined,
+      );
+    } else {
+      context.invalidateClientsForDevice?.("device-1", { reason });
+      expect(target.socket.close).not.toHaveBeenCalled();
+      expect(runtime.nodeRegistry.invalidateConnectionForPairingChange).toHaveBeenCalledWith(
+        "conn-target",
+        reason,
+      );
+      expect(runtime.watchNodeHttpRuntime.invalidateSessionsForDevice).toHaveBeenCalledWith(
+        "device-1",
+        { reason },
+      );
+    }
     expect(detached.isCurrent()).toBe(false);
-
-    expect((target as { invalidated?: boolean }).invalidated).toBe(true);
-    expect((target as { invalidatedReason?: string }).invalidatedReason).toBe(
-      "device-token-rotated",
-    );
-    expect(target.socket.close).not.toHaveBeenCalled();
-    expect(invalidateConnectionForPairingChange).toHaveBeenCalledWith(
-      "conn-target",
-      "device-token-rotated",
-    );
-
+    expect(target).toMatchObject({ invalidated: true, invalidatedReason: reason });
     expect((unrelated as { invalidated?: boolean }).invalidated).toBeUndefined();
     expect(unrelated.socket.close).not.toHaveBeenCalled();
-    expect(invalidateSessionsForDevice).toHaveBeenCalledWith("device-1", {
-      reason: "device-token-rotated",
-    });
-  });
-
-  it("disconnectClientsForDevice also marks the invalidated flag before closing", () => {
-    const target = makeDeviceClient("conn-target", "device-1");
-    const { context, disconnectSessionsForDevice } = deviceContext([target]);
-    const detached = captureGatewayDeviceRevocation(context, { deviceId: "device-1" }, () => true);
-    onTestFinished(detached.release);
-    expect(detached.isCurrent()).toBe(true);
-    context.disconnectClientsForDevice?.("device-1");
-    expect(detached.isCurrent()).toBe(false);
-
-    expect((target as { invalidated?: boolean }).invalidated).toBe(true);
-    expect((target as { invalidatedReason?: string }).invalidatedReason).toBe("device-removed");
-    expect(target.socket.close).toHaveBeenCalledWith(4001, "device removed");
-    expect(disconnectSessionsForDevice).toHaveBeenCalledWith("device-1", undefined);
   });
 
   it.each(["live", "disconnected"])(
     "disconnects only authority for the reassigned durable profile (%s transport)",
     (transport) => {
       const target = {
-        ...makeGatewayClient({
-          connId: "profile-target",
-          clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
+        ...approvalClient("profile-target", GATEWAY_CLIENT_IDS.CONTROL_UI, {
           scopes: ["operator.admin"],
         }),
-        authenticatedUserProfile: {
-          profileId: "profile-ada",
-          displayName: "Ada",
-          hasAvatar: false,
-          updatedAt: 1,
-        },
+        authenticatedUserProfile: { profileId: "profile-ada" },
       };
       const unrelated = {
-        ...makeGatewayClient({
-          connId: "profile-unrelated",
-          clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
-        }),
-        authenticatedUserProfile: {
-          profileId: "profile-grace",
-          displayName: "Grace",
-          hasAvatar: false,
-          updatedAt: 1,
-        },
+        ...approvalClient("profile-unrelated", GATEWAY_CLIENT_IDS.CONTROL_UI, { scopes: [] }),
+        authenticatedUserProfile: { profileId: "profile-grace" },
       };
-      const unidentified = makeGatewayClient({
-        connId: "shared-secret",
-        clientId: GATEWAY_CLIENT_IDS.CLI,
+      const unidentified = approvalClient("shared-secret", GATEWAY_CLIENT_IDS.CLI, {
         scopes: ["operator.admin"],
       });
       const clients = new GatewayClientRegistry([target, unrelated, unidentified] as never);
@@ -575,10 +524,10 @@ describe("createGatewayRequestContext", () => {
       }
       context.disconnectClientsForUserProfile?.("profile-ada");
 
-      expect((target as { invalidated?: boolean }).invalidated).toBe(true);
-      expect((target as { invalidatedReason?: string }).invalidatedReason).toBe(
-        "operator-role-changed",
-      );
+      expect(target).toMatchObject({
+        invalidated: true,
+        invalidatedReason: "operator-role-changed",
+      });
       expect(target.socket.close).toHaveBeenCalledWith(4001, "operator role changed");
       expect(unrelated.socket.close).not.toHaveBeenCalled();
       expect(unidentified.socket.close).not.toHaveBeenCalled();
@@ -588,9 +537,7 @@ describe("createGatewayRequestContext", () => {
   it("invalidateClientsForDevice filters by role when provided", () => {
     const primary = makeDeviceClient("conn-primary", "device-1");
     const secondary = makeDeviceClient("conn-secondary", "device-1", "secondary");
-    const clients = new Set([primary, secondary]) as never;
-
-    const context = createGatewayRequestContext(makeContextParams({ clients }));
+    const { context } = deviceContext([primary, secondary]);
     context.invalidateClientsForDevice?.("device-1", { role: "primary" });
 
     expect((primary as { invalidated?: boolean }).invalidated).toBe(true);
