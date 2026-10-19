@@ -141,6 +141,10 @@ export function resolvePluginActivationStateShared(params: {
   if (explicitReason) {
     return decision("explicit", { explicitlyEnabled: true, reason: explicitReason });
   }
+  // Auto-enable must not mask an owner's existing bundled startup eligibility.
+  if (params.origin === "bundled" && params.enabledByDefault === true) {
+    return decision("default", { explicitlyEnabled: false, reason: "bundled default enablement" });
+  }
   if (params.autoEnabledReason) {
     return decision("auto", { explicitlyEnabled: false, reason: params.autoEnabledReason });
   }
@@ -152,9 +156,6 @@ export function resolvePluginActivationStateShared(params: {
     resolveChannelConfigEnablement(params.rootConfig, params.id, params.channelIds) === true
   ) {
     return decision("auto", { explicitlyEnabled: false, reason: "channel configured" });
-  }
-  if (params.origin === "bundled" && params.enabledByDefault === true) {
-    return decision("default", { explicitlyEnabled: false, reason: "bundled default enablement" });
   }
   if (params.origin === "bundled") {
     return decision("disabled", {
