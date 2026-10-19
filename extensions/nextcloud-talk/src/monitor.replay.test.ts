@@ -210,18 +210,8 @@ describe("Nextcloud Talk Gateway webhook payload validation", () => {
   });
 
   it("rejects malformed webhook payloads after signature verification", async () => {
-    const payload = {
-      type: "Create",
-      actor: { type: "Person", id: "alice", name: "Alice" },
-      object: {
-        type: "Note",
-        id: "msg-1",
-        name: "hello",
-        content: "hello",
-        mediaType: "text/plain",
-      },
-      target: { type: "Collection", id: "", name: "Room 1" },
-    };
+    const payload: { target: { id: string } } = JSON.parse(createSignedCreateMessageRequest().body);
+    payload.target.id = "";
     const body = JSON.stringify(payload);
     const harness = await startWebhookServer({
       path: "/nextcloud-invalid-payload",
@@ -346,42 +336,36 @@ describe("Nextcloud Talk accounts sharing a Gateway route", () => {
     }
   });
 
-  it.each([
-    [
-      { port: 8788, host: "127.0.0.1" },
-      { port: 8788, host: "127.0.0.2" },
-    ],
-  ])(
-    "retains account selection for explicit legacy endpoints %j and %j",
-    async (firstEndpoint, secondEndpoint) => {
-      const path = "/nextcloud-legacy-accounts";
-      const first = vi.fn();
-      const second = vi.fn();
-      const isBackendAllowed = (backend: string) => backend === "https://nextcloud.example";
-      await startWebhookServer({
-        path,
-        legacyListener: firstEndpoint,
-        isBackendAllowed,
-        onMessage: first,
-      });
-      await startWebhookServer({
-        path,
-        legacyListener: secondEndpoint,
-        isBackendAllowed,
-        onMessage: second,
-      });
-      const invoke = createInvoker(path);
-      expect((await invoke({ legacyListener: firstEndpoint })).status).toBe(200);
-      expect(first).toHaveBeenCalledOnce();
-      expect(second).not.toHaveBeenCalled();
-      expect((await invoke({ legacyListener: secondEndpoint })).status).toBe(200);
-      expect(first).toHaveBeenCalledOnce();
-      expect(second).toHaveBeenCalledOnce();
-      expect((await invoke()).status).toBe(401);
-      expect(first).toHaveBeenCalledOnce();
-      expect(second).toHaveBeenCalledOnce();
-    },
-  );
+  it("retains account selection for explicit legacy endpoints with distinct hosts", async () => {
+    const firstEndpoint = { port: 8788, host: "127.0.0.1" };
+    const secondEndpoint = { port: 8788, host: "127.0.0.2" };
+    const path = "/nextcloud-legacy-accounts";
+    const first = vi.fn();
+    const second = vi.fn();
+    const isBackendAllowed = (backend: string) => backend === "https://nextcloud.example";
+    await startWebhookServer({
+      path,
+      legacyListener: firstEndpoint,
+      isBackendAllowed,
+      onMessage: first,
+    });
+    await startWebhookServer({
+      path,
+      legacyListener: secondEndpoint,
+      isBackendAllowed,
+      onMessage: second,
+    });
+    const invoke = createInvoker(path);
+    expect((await invoke({ legacyListener: firstEndpoint })).status).toBe(200);
+    expect(first).toHaveBeenCalledOnce();
+    expect(second).not.toHaveBeenCalled();
+    expect((await invoke({ legacyListener: secondEndpoint })).status).toBe(200);
+    expect(first).toHaveBeenCalledOnce();
+    expect(second).toHaveBeenCalledOnce();
+    expect((await invoke()).status).toBe(401);
+    expect(first).toHaveBeenCalledOnce();
+    expect(second).toHaveBeenCalledOnce();
+  });
 
   it("isolates legacy authentication failures while Gateway accounts share a quota", async () => {
     const path = "/nextcloud-legacy-auth-budgets";
