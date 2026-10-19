@@ -28,20 +28,18 @@ const ORIGIN = `chrome-extension://${EXTENSION_ID}/`;
 const OTHER_ORIGIN = `chrome-extension://${"p".repeat(32)}/`;
 const NONCE = Buffer.alloc(16, 7).toString("base64url");
 const PAIRING = `ws://127.0.0.1:18799/extension#${relayTestKey(1)}`;
-const REQUEST_MAX_BYTES = 4 * 1024;
 const tempDirs = useAutoCleanupTempDirTracker(afterAll);
 let defaultFixture: ReturnType<typeof nativeFixture> | undefined;
 
+function lengthHeader(length: number) {
+  const header = Buffer.alloc(4);
+  header[os.endianness() === "LE" ? "writeUInt32LE" : "writeUInt32BE"](length);
+  return header;
+}
+
 function frame(payload: Buffer | string): Buffer {
   const body = typeof payload === "string" ? Buffer.from(payload) : payload;
-  const result = Buffer.alloc(body.length + 4);
-  if (os.endianness() === "LE") {
-    result.writeUInt32LE(body.length);
-  } else {
-    result.writeUInt32BE(body.length);
-  }
-  body.copy(result, 4);
-  return result;
+  return Buffer.concat([lengthHeader(body.length), body]);
 }
 
 function requestJson(overrides: Record<string, unknown> = {}): string {
@@ -67,18 +65,10 @@ describe("native messaging framing", () => {
 
   it("returns a complete request without waiting for Chrome to close stdin", async () => {
     const expected = frame(requestJson());
-    let first = true;
     const openPipe = {
-      [Symbol.asyncIterator]() {
-        return {
-          next: async () => {
-            if (first) {
-              first = false;
-              return { done: false as const, value: expected };
-            }
-            return await new Promise<IteratorResult<Buffer>>(() => {});
-          },
-        };
+      async *[Symbol.asyncIterator]() {
+        yield expected;
+        await new Promise<void>(() => {});
       },
     };
     const result = await withTimeout(
@@ -91,34 +81,20 @@ describe("native messaging framing", () => {
   });
 
   it("rejects an oversized length before allocating its payload", async () => {
-    const header = Buffer.alloc(4);
-    if (os.endianness() === "LE") {
-      header.writeUInt32LE(REQUEST_MAX_BYTES + 1);
-    } else {
-      header.writeUInt32BE(REQUEST_MAX_BYTES + 1);
-    }
-
-    await expect(readBrowserNativeFrame(chunks(header))).rejects.toThrow("invalid_frame");
-  });
-
-  it("rejects fatal UTF-8", () => {
-    expect(decodeBrowserNativeFrame(frame(Buffer.from([0xc3, 0x28])))).toEqual({
-      ok: false,
-      code: "invalid_utf8",
-    });
+    await expect(readBrowserNativeFrame(chunks(lengthHeader(4 * 1024 + 1)))).rejects.toThrow(
+      "invalid_frame",
+    );
   });
 });
 
 describe("native bootstrap request schema", () => {
   it.each([
-    ["array", JSON.stringify([{ v: 1, op: "bootstrap", nonce: NONCE }])],
-    ["padded nonce", JSON.stringify({ v: 1, op: "bootstrap", nonce: `${NONCE}=` })],
-    ["short nonce", JSON.stringify({ v: 1, op: "bootstrap", nonce: "AA" })],
-  ])("rejects $0", (_label, raw) => {
-    expect(decodeBrowserNativeFrame(frame(raw))).toEqual({
-      ok: false,
-      code: "invalid_request",
-    });
+    ["fatal UTF-8", Buffer.from([0xc3, 0x28]), "invalid_utf8"],
+    ["array", `[${requestJson()}]`, "invalid_request"],
+    ["padded nonce", requestJson({ nonce: `${NONCE}=` }), "invalid_request"],
+    ["short nonce", requestJson({ nonce: "AA" }), "invalid_request"],
+  ] as const)("rejects %s", (_label, raw, code) => {
+    expect(decodeBrowserNativeFrame(frame(raw))).toEqual({ ok: false, code });
   });
 });
 
@@ -149,19 +125,33 @@ async function nativeFixture(allowedOrigins = [ORIGIN]) {
 async function invokeHost(overrides: Partial<Parameters<typeof runBrowserNativeHost>[0]> = {}) {
   // Callers that mutate manifests or credentials supply their own private fixture.
   const fixture = await (defaultFixture ??= nativeFixture());
-  const writes: Buffer[] = [];
-  const response = await runBrowserNativeHost({
+  return runBrowserNativeHost({
     ...fixture,
     callerOrigin: ORIGIN,
     expectedOrigins: [ORIGIN],
     input: chunks(frame(requestJson())),
-    write: (value) => writes.push(value),
+    write: () => {},
     buildPairing: pairing,
     ensureRelay: async () => "skipped",
     ...overrides,
   });
-  return { response, writes, fixture };
 }
+
+async function expectManifestRejected(fixture: Awaited<ReturnType<typeof nativeFixture>>) {
+  const buildPairing = vi.fn(pairing);
+  expect(await invokeHost({ ...fixture, buildPairing })).toEqual(failure("manifest_invalid"));
+  expect(buildPairing).not.toHaveBeenCalled();
+}
+
+const relayInput = (relayPort: number) =>
+  chunks(frame(requestJson({ op: "ensure_relay", relayPort })));
+const configuredRelay =
+  (cfg: Parameters<typeof ensureExtensionRelayDaemonProcess>[0]["cfg"]) => (port: number) =>
+    ensureExtensionRelayDaemonProcess({
+      port,
+      cfg,
+      entryPath: "/opt/openclaw/dist/extensions/browser/relay-daemon-entry.js",
+    });
 
 describe("native host origin and topology boundary", () => {
   it("parses a nonempty sorted unique expected-origin list before the caller origin", () => {
@@ -186,84 +176,60 @@ describe("native host origin and topology boundary", () => {
     expect(() => parseBrowserNativeHostOrigins(argv)).toThrow();
   });
 
-  it.skipIf(process.platform === "win32")(
-    "accepts owned private hardlinked artifacts",
-    async () => {
-      const fixture = await nativeFixture();
-      for (const file of [fixture.manifestPath, fixture.launcherPath]) {
-        await fs.link(file, `${file}.link`);
-      }
-      const result = await invokeHost(fixture);
-      expect(result.response).toEqual({ v: 1, ok: true, nonce: NONCE, pairingString: PAIRING });
-    },
-  );
-
-  it.skipIf(process.platform === "win32")(
-    "rejects an unsafe manifest substituted before its bytes are opened",
-    async () => {
-      const fixture = await nativeFixture();
-      const replacement = `${fixture.manifestPath}.replacement`;
-      await fs.writeFile(replacement, await fs.readFile(fixture.manifestPath), { mode: 0o644 });
-      await fs.chmod(replacement, 0o644);
-      let substituted = false;
-      const substitute = async (file: unknown) => {
-        if (file === fixture.manifestPath && !substituted) {
-          substituted = true;
-          await fs.rename(replacement, fixture.manifestPath);
-        }
-      };
-      const readFile = fs.readFile.bind(fs);
-      const open = fs.open.bind(fs);
-      const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
-        await substitute(args[0]);
-        return readFile(...args);
-      });
-      const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
-        await substitute(args[0]);
-        return open(...args);
-      });
-      const buildPairing = vi.fn(pairing);
-      try {
-        const result = await invokeHost({ ...fixture, buildPairing });
-        expect(substituted).toBe(true);
-        expect(result.response).toEqual(failure("manifest_invalid"));
-        expect(buildPairing).not.toHaveBeenCalled();
-      } finally {
-        openSpy.mockRestore();
-        readSpy.mockRestore();
-      }
-    },
-  );
-
-  it.skipIf(process.platform === "win32").each([["launcherPath", 0o600]] as const)(
-    "rejects %s with mode %o before pairing",
-    async (file, mode) => {
-      const fixture = await nativeFixture();
-      await fs.chmod(fixture[file], mode);
-      const buildPairing = vi.fn(pairing);
-      const result = await invokeHost({ ...fixture, buildPairing });
-      expect(result.response).toEqual(failure("manifest_invalid"));
-      expect(buildPairing).not.toHaveBeenCalled();
-    },
-  );
-
-  it("rejects a manifest with an extra valid origin before building pairing", async () => {
-    const fixture = await nativeFixture([ORIGIN, OTHER_ORIGIN]);
-    const buildPairing = vi.fn(pairing);
-    const { response } = await invokeHost({ ...fixture, buildPairing });
-    expect(response).toEqual(failure("manifest_invalid"));
-    expect(buildPairing).not.toHaveBeenCalled();
+  it.skipIf(process.platform === "win32")("accepts private hardlinks", async () => {
+    const fixture = await nativeFixture();
+    for (const file of [fixture.manifestPath, fixture.launcherPath]) {
+      await fs.link(file, `${file}.link`);
+    }
+    expect(await invokeHost(fixture)).toEqual({
+      v: 1,
+      ok: true,
+      nonce: NONCE,
+      pairingString: PAIRING,
+    });
   });
 
-  it("returns manual_required for direct remote topology and Windows", async () => {
-    await expect(
-      invokeHost({
-        buildPairing: async () => ({ pairingString: PAIRING, topology: "direct-remote" }),
-      }).then((result) => result.response),
-    ).resolves.toEqual(failure("manual_required"));
-    await expect(
-      invokeHost({ platform: "win32" }).then((result) => result.response),
-    ).resolves.toEqual(failure("manual_required"));
+  it.skipIf(process.platform === "win32")("rejects unsafe manifest substitution", async () => {
+    const fixture = await nativeFixture();
+    const replacement = `${fixture.manifestPath}.replacement`;
+    await fs.writeFile(replacement, await fs.readFile(fixture.manifestPath), { mode: 0o644 });
+    await fs.chmod(replacement, 0o644);
+    let substituted = false;
+    const substitute = async (file: unknown) => {
+      if (file === fixture.manifestPath && !substituted) {
+        substituted = true;
+        await fs.rename(replacement, fixture.manifestPath);
+      }
+    };
+    const readFile = fs.readFile.bind(fs);
+    const open = fs.open.bind(fs);
+    vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      await substitute(args[0]);
+      return readFile(...args);
+    });
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      await substitute(args[0]);
+      return open(...args);
+    });
+    await expectManifestRejected(fixture);
+    expect(substituted).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("rejects non-executable launchers", async () => {
+    const fixture = await nativeFixture();
+    await fs.chmod(fixture.launcherPath, 0o600);
+    await expectManifestRejected(fixture);
+  });
+
+  it("rejects a manifest with an extra valid origin before building pairing", async () => {
+    await expectManifestRejected(await nativeFixture([ORIGIN, OTHER_ORIGIN]));
+  });
+
+  it.each([
+    { buildPairing: async () => ({ pairingString: PAIRING, topology: "direct-remote" }) },
+    { platform: "win32" as const },
+  ])("returns manual_required for unsupported topology/platform: %o", async (overrides) => {
+    await expect(invokeHost(overrides)).resolves.toEqual(failure("manual_required"));
   });
 });
 
@@ -278,95 +244,76 @@ describe("native host ensure_relay", () => {
   ])("rejects %s without invoking the relay launcher", async (_label, raw) => {
     const ensureRelay = vi.fn(async () => "spawned" as const);
     const result = await invokeHost({ input: chunks(frame(raw)), ensureRelay });
-    expect(result.response).toEqual(failure("invalid_request"));
+    expect(result).toEqual(failure("invalid_request"));
     expect(ensureRelay).not.toHaveBeenCalled();
   });
 
-  it.each([["remote browser", 29443]])(
-    "rejects the %s port before probing or spawning",
-    async (_label, relayPort) => {
-      const probe = vi.spyOn(net, "connect");
-      const result = await invokeHost({
-        input: chunks(frame(requestJson({ op: "ensure_relay", relayPort }))),
-        ensureRelay: async (port) =>
-          await ensureExtensionRelayDaemonProcess({
-            port,
-            cfg: { browser: { profiles: { remote: { cdpUrl: "https://browser.example:29443" } } } },
-            entryPath: "/opt/openclaw/dist/extensions/browser/relay-daemon-entry.js",
-          }),
-      });
-      expect(result.response).toEqual(failure("relay_unavailable"));
-      expect(probe).not.toHaveBeenCalled();
-      expect(spawn).not.toHaveBeenCalled();
-    },
-  );
+  it("rejects the remote browser port before probing or spawning", async () => {
+    const probe = vi.spyOn(net, "connect");
+    const result = await invokeHost({
+      input: relayInput(29443),
+      ensureRelay: configuredRelay({
+        browser: { profiles: { remote: { cdpUrl: "https://browser.example:29443" } } },
+      }),
+    });
+    expect(result).toEqual(failure("relay_unavailable"));
+    expect(probe).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
 
-  it.each(["non-first automatic"])(
-    "wakes the %s profile through the native frame and config boundary",
-    async () => {
-      const fixture = await nativeFixture();
-      const relayPort = await getFreePort();
-      await fs.mkdir(path.join(fixture.stateDir, "credentials"), { mode: 0o700 });
-      await fs.writeFile(
-        path.join(fixture.stateDir, "credentials", "browser-extension-relay.secret"),
-        relayTestKey(1),
-        { mode: 0o600 },
-      );
-      await withEnvAsync(
-        { OPENCLAW_STATE_DIR: fixture.stateDir, OPENCLAW_GATEWAY_PORT: undefined },
-        async () => {
-          let daemon: ReturnType<typeof runExtensionRelayDaemon> | undefined;
-          // Keep config, port probing, credential reads and the relay server real;
-          // replace only OS process creation so the test owns daemon cleanup.
-          vi.mocked(spawn).mockImplementation((_command, args) => {
-            daemon = runExtensionRelayDaemon({
-              port: Number(Array.isArray(args) ? args[2] : undefined),
-            });
-            return new ChildProcess();
+  it("wakes the non-first automatic profile through the native frame and config boundary", async () => {
+    const fixture = await nativeFixture();
+    const relayPort = await getFreePort();
+    await fs.mkdir(path.join(fixture.stateDir, "credentials"), { mode: 0o700 });
+    await fs.writeFile(
+      path.join(fixture.stateDir, "credentials", "browser-extension-relay.secret"),
+      relayTestKey(1),
+      { mode: 0o600 },
+    );
+    await withEnvAsync(
+      { OPENCLAW_STATE_DIR: fixture.stateDir, OPENCLAW_GATEWAY_PORT: undefined },
+      async () => {
+        let daemon: ReturnType<typeof runExtensionRelayDaemon> | undefined;
+        // Only process creation is mocked; config, credentials and relay stay real.
+        vi.mocked(spawn).mockImplementation((_command, args) => {
+          daemon = runExtensionRelayDaemon({
+            port: Number(Array.isArray(args) ? args[2] : undefined),
           });
-          try {
-            const result = await invokeHost({
-              ...fixture,
-              input: chunks(frame(requestJson({ op: "ensure_relay", relayPort }))),
-              ensureRelay: async (port) =>
-                await ensureExtensionRelayDaemonProcess({
-                  port,
-                  cfg: {
-                    gateway: { port: relayPort - 9 },
-                    browser: {
-                      profiles: {
-                        chrome: { driver: "extension" },
-                        work: { driver: "extension" },
-                      },
-                    },
-                  },
-                  entryPath: "/opt/openclaw/dist/extensions/browser/relay-daemon-entry.js",
-                }),
-            });
-            expect(result.response).toEqual({ v: 1, ok: true, nonce: NONCE, relay: "spawned" });
-            const run = await daemon;
-            expect(run?.port).toBe(relayPort);
-            const response = await fetch(`http://127.0.0.1:${relayPort}/json/version`);
-            expect(response.status).toBe(401);
-            expect(await response.json()).toEqual({ error: "Unauthorized" });
-          } finally {
-            const run = await daemon;
-            run?.stop();
-            await run?.done;
-          }
-        },
-      );
-    },
-  );
+          return new ChildProcess();
+        });
+        try {
+          const extension = { driver: "extension" as const };
+          const result = await invokeHost({
+            ...fixture,
+            input: relayInput(relayPort),
+            ensureRelay: configuredRelay({
+              gateway: { port: relayPort - 9 },
+              browser: { profiles: { chrome: extension, work: extension } },
+            }),
+          });
+          expect(result).toEqual({ v: 1, ok: true, nonce: NONCE, relay: "spawned" });
+          const run = await daemon;
+          expect(run?.port).toBe(relayPort);
+          const response = await fetch(`http://127.0.0.1:${relayPort}/json/version`);
+          expect(response.status).toBe(401);
+          expect(await response.json()).toEqual({ error: "Unauthorized" });
+        } finally {
+          const run = await daemon;
+          run?.stop();
+          await run?.done;
+        }
+      },
+    );
+  });
 
   it("still validates the manifest before ensuring the relay", async () => {
     const ensureRelay = vi.fn(async () => "spawned" as const);
     const result = await invokeHost({
-      input: chunks(frame(requestJson({ op: "ensure_relay", relayPort: 18799 }))),
+      input: relayInput(18799),
       callerOrigin: OTHER_ORIGIN,
       ensureRelay,
     });
-    expect(result.response).toEqual(failure("origin_forbidden"));
+    expect(result).toEqual(failure("origin_forbidden"));
     expect(ensureRelay).not.toHaveBeenCalled();
   });
 });

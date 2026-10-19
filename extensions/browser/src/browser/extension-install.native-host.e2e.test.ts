@@ -25,6 +25,12 @@ const writePrivate = (file: string, content: string, mode = 0o600) =>
   fs.writeFile(file, content, { mode });
 const writeJson = (file: string, value: unknown) =>
   writePrivate(file, `${JSON.stringify(value)}\n`);
+const extensionArgs = (...args: string[]) => [
+  path.resolve("openclaw.mjs"),
+  "browser",
+  "extension",
+  ...args,
+];
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 function cli(value: Fixture, config: string, args: string[], input?: Buffer) {
@@ -35,7 +41,6 @@ function cli(value: Fixture, config: string, args: string[], input?: Buffer) {
       HOME: value.homeDir,
       OPENCLAW_STATE_DIR: value.stateDir,
       OPENCLAW_CONFIG_PATH: config,
-      // Bun's transpiler cache is not OpenClaw state.
       BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
     },
   });
@@ -44,34 +49,27 @@ function cli(value: Fixture, config: string, args: string[], input?: Buffer) {
 function nativeFrame(request: unknown): Buffer {
   const payload = Buffer.from(JSON.stringify(request));
   const frame = Buffer.alloc(payload.length + 4);
-  if (os.endianness() === "LE") {
-    frame.writeUInt32LE(payload.length);
-  } else {
-    frame.writeUInt32BE(payload.length);
-  }
+  frame[os.endianness() === "LE" ? "writeUInt32LE" : "writeUInt32BE"](payload.length);
   payload.copy(frame, 4);
   return frame;
 }
 
 function nativeResponse(child: SpawnSyncReturns<Buffer>): unknown {
-  expect(child.status, child.stderr.toString("utf8")).toBe(0);
-  const length =
-    os.endianness() === "LE" ? child.stdout.readUInt32LE() : child.stdout.readUInt32BE();
-  expect(child.stdout).toHaveLength(length + 4);
-  return JSON.parse(child.stdout.subarray(4).toString("utf8"));
+  const { status, stderr, stdout } = child;
+  expect(status, stderr.toString("utf8")).toBe(0);
+  const length = os.endianness() === "LE" ? stdout.readUInt32LE() : stdout.readUInt32BE();
+  expect(stdout).toHaveLength(length + 4);
+  return JSON.parse(stdout.subarray(4).toString("utf8"));
 }
 
 function nativeArgs(
   manifest: string,
   launcher: string,
-  expectedOrigins: string[],
-  caller: string,
+  expectedOrigins = [origin],
+  caller = origin,
   ...extraArgs: string[]
 ) {
-  return [
-    path.resolve("openclaw.mjs"),
-    "browser",
-    "extension",
+  return extensionArgs(
     "native-host",
     "--manifest",
     manifest,
@@ -80,7 +78,7 @@ function nativeArgs(
     ...expectedOrigins.flatMap((expected) => ["--expected-origin", expected]),
     ...extraArgs,
     caller,
-  ];
+  );
 }
 
 // POSIX launcher/CLI proof. The Windows PE/ACL/registry lane needs a real Windows host.
@@ -96,8 +94,6 @@ describe.skipIf(process.platform === "win32")("native host registration", () => 
       nativeArgs(
         path.join(value.root, "not-read-before-framing.json"),
         path.join(value.root, "not-read-before-framing-host"),
-        [origin],
-        origin,
       ),
       nativeFrame({ v: 1, op: "bootstrap", nonce: "!" }),
     );
@@ -159,12 +155,7 @@ describe.skipIf(process.platform === "win32")("native host registration", () => 
     const value = await fixture();
     const config = path.join(value.root, "invalid-config.json");
     await writePrivate(config, "{ invalid config");
-    const child = cli(value, config, [
-      path.resolve("openclaw.mjs"),
-      "browser",
-      "extension",
-      ...args,
-    ]);
+    const child = cli(value, config, extensionArgs(...args));
     expect(child.status).toBe(1);
     const stderr = child.stderr.toString("utf8");
     expect(stderr).toContain("[openclaw] The CLI command failed.");
@@ -182,18 +173,14 @@ describe.skipIf(process.platform === "win32")("native host registration", () => 
       const value = await fixture();
       const stateDir = path.join(value.root, "custom state's dir");
       const configPath = path.join(value.root, "custom config's dir", "openclaw.json");
-      const launchFixture = await nativeHostFixture(value.root, BUILT_NATIVE_HOST_PATH);
+      const context = { OPENCLAW_STATE_DIR: stateDir, OPENCLAW_CONFIG_PATH: configPath };
       const relayPort = 19_031;
       const token = relayTestKey(4);
       const deps = {
         ...value.deps,
         stateDir,
-        ...launchFixture,
-        env: {
-          ...value.deps.env,
-          OPENCLAW_STATE_DIR: stateDir,
-          OPENCLAW_CONFIG_PATH: configPath,
-        },
+        ...(await nativeHostFixture(value.root, BUILT_NATIVE_HOST_PATH)),
+        env: { ...value.deps.env, ...context },
       };
       const install = (
         options: Partial<Parameters<typeof installChromeExtensionBootstrap>[0]> = {},
@@ -219,23 +206,23 @@ describe.skipIf(process.platform === "win32")("native host registration", () => 
         entries: { [extensionId]: { location: 4, path: installed } },
       });
       const status = await install({ browserProfile: "e2e" });
-      const registration = status.registrations.find((entry) => entry.product === "chromium");
+      const registration = status.registrations.find((entry) => entry.product === "chromium")!;
       expect(registration, status.issues.join("\n")).toMatchObject({ state: "owned" });
-      const manifest = JSON.parse(await fs.readFile(registration?.manifestPath ?? "", "utf8")) as {
+      const manifest = JSON.parse(await fs.readFile(registration.manifestPath, "utf8")) as {
         path: string;
       };
 
       const cliArgs = nativeArgs(
-        registration?.manifestPath ?? "",
+        registration.manifestPath,
         manifest.path,
-        registration!.extensionIds.map((id) => `chrome-extension://${id}/`),
+        registration.extensionIds.map((id) => `chrome-extension://${id}/`),
         `chrome-extension://${extensionId}/`,
         "--browser-profile",
         "e2e",
       );
       // Documented ordinary repair must retain the canonical setup's saved profile.
       await install();
-      const savedManifest = await fs.readFile(registration!.manifestPath);
+      const savedManifest = await fs.readFile(registration.manifestPath);
       const savedLauncher = await fs.readFile(manifest.path);
       await expect(
         install({
@@ -244,7 +231,7 @@ describe.skipIf(process.platform === "win32")("native host registration", () => 
           deps: { ...deps, env: { ...deps.env, OPENCLAW_CONFIG_PATH: undefined } },
         }),
       ).rejects.toThrow("OPENCLAW_CONFIG_PATH");
-      expect(await fs.readFile(registration!.manifestPath)).toEqual(savedManifest);
+      expect(await fs.readFile(registration.manifestPath)).toEqual(savedManifest);
       expect(await fs.readFile(manifest.path)).toEqual(savedLauncher);
       const gatewayStatePath = path.join(stateDir, "state", "openclaw.sqlite");
       const configBefore = await fs.readFile(configPath);
@@ -257,9 +244,7 @@ describe.skipIf(process.platform === "win32")("native host registration", () => 
           env: {
             HOME: value.homeDir,
             TMPDIR: os.tmpdir(),
-            ...(entryMode === "cli"
-              ? { OPENCLAW_STATE_DIR: stateDir, OPENCLAW_CONFIG_PATH: configPath }
-              : {}),
+            ...(entryMode === "cli" ? context : {}),
           },
           timeout: 20_000,
         },

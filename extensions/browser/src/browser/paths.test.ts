@@ -33,14 +33,6 @@ afterEach(async () => {
   await fs.rm(fixture.baseDir, { recursive: true, force: true });
 });
 
-async function createAliasedUploadsRoot(baseDir: string) {
-  const canonicalUploadsDir = path.join(baseDir, "canonical", "uploads");
-  const aliasedUploadsDir = path.join(baseDir, "uploads-link");
-  await fs.mkdir(canonicalUploadsDir, { recursive: true });
-  await fs.symlink(canonicalUploadsDir, aliasedUploadsDir);
-  return { canonicalUploadsDir, aliasedUploadsDir };
-}
-
 describe("resolveExistingPathsWithinRoot", () => {
   function expectInvalidResult(
     result: Awaited<ReturnType<typeof resolveExistingPathsWithinRoot>>,
@@ -103,7 +95,10 @@ describe("resolveExistingPathsWithinRoot", () => {
     "rejects canonical absolute paths outside symlinked upload root",
     async () => {
       const { baseDir } = fixture;
-      const { aliasedUploadsDir } = await createAliasedUploadsRoot(baseDir);
+      const canonicalUploadsDir = path.join(baseDir, "canonical", "uploads");
+      const aliasedUploadsDir = path.join(baseDir, "uploads-link");
+      await fs.mkdir(canonicalUploadsDir, { recursive: true });
+      await fs.symlink(canonicalUploadsDir, aliasedUploadsDir);
 
       const outsideDir = path.join(baseDir, "outside");
       await fs.mkdir(outsideDir, { recursive: true });
