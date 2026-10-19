@@ -46,7 +46,7 @@ async function sendChannelMessage(params: {
 }) {
   const create = vi.fn(async () => ({ id: params.messageId }));
   const activities = vi.fn((_conversationId: string) => ({ create }));
-  const serviceUrl = "https://smba.trafficmanager.net/amer/";
+  const serviceUrl = "https://smba.trafficmanager.net/amer";
   const app = { api: { serviceUrl, conversations: { activities } } };
   await sendMSTeamsActivityWithReference(
     app as unknown as MSTeamsApp,

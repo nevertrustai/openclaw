@@ -41,9 +41,12 @@ function createLocalSandbox(
     },
     ...overrides,
   };
-  const sandbox = createSandboxTestContext({
-    overrides: { workspaceDir: root, agentWorkspaceDir: root, containerWorkdir: root, backend },
-  });
+  const sandbox = {
+    ...createSandboxTestContext({
+      overrides: { workspaceDir: root, agentWorkspaceDir: root, containerWorkdir: root, backend },
+    }),
+    backend,
+  };
   const bridge = createSandboxFsBridge({ sandbox });
   sandbox.fsBridge = bridge;
   const bind = (projection: Partial<Parameters<typeof bindLocalSandboxWorkspace>[1]> = {}) =>

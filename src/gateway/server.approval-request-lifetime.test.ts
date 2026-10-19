@@ -26,7 +26,7 @@ function lifetimeResources(signal: AbortSignal) {
   const sockets: WebSocket[] = [];
   const handlers: Promise<void>[] = [];
   const rpcs: Promise<unknown>[] = [];
-  const releases: Array<() => void | Promise<void>> = [];
+  const releases: Array<() => Promise<void>> = [];
   const unblocks: Array<() => void> = [];
   const spies = new DisposableStack();
   const outcomes = new Map<string, "fulfilled" | "rejected">();
@@ -140,7 +140,7 @@ describe("public Gateway close approval lifetime", () => {
       const originalWait = approvalShared.handleApprovalWaitDecision;
       fixture.observeRequest((params) => {
         if (params.approvalKind !== kind) {
-          return;
+          return undefined;
         }
         approvalId = params.record.id;
         return "request";

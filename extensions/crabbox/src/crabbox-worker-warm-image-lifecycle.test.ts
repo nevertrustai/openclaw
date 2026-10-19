@@ -72,9 +72,15 @@ it("renews through capture, then stops before release", async () => {
   } finally {
     inspection.release();
     capturing.release();
-    await Promise.resolve(teardown)
-      .finally(() => s.provider.dispose())
-      .finally(() => vi.useRealTimers());
+    try {
+      await teardown;
+    } finally {
+      try {
+        await s.provider.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
+    }
   }
 });
 

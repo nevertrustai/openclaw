@@ -126,7 +126,7 @@ describe("maybePruneSandboxes", () => {
   });
 
   it("removes the registry entry after runtime removal succeeds", async () => {
-    await maybePruneSandboxes(buildPruneConfig());
+    await maybePruneSandboxes(pruneConfig);
 
     expect(backendMocks.removeRuntime).toHaveBeenCalledTimes(1);
     expect(registryMocks.removeRegistryEntry).toHaveBeenCalledWith("sandbox-1");
@@ -245,7 +245,7 @@ describe("maybePruneSandboxes", () => {
     // runtime was removed.
     backendMocks.removeRuntime.mockRejectedValueOnce(new Error("docker rm failed"));
 
-    await maybePruneSandboxes(buildPruneConfig());
+    await maybePruneSandboxes(pruneConfig);
 
     expect(registryMocks.removeRegistryEntry).not.toHaveBeenCalled();
     expect(runtimeMocks.error).toHaveBeenCalledWith(

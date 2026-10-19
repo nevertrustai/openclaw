@@ -113,7 +113,7 @@ export function createWorkboardProof(
       const video = page.video();
       return {
         page,
-        async close() {
+        async close(this: void) {
           await openedContext.close();
           if (video) {
             const videoPath = path.join(directory, `${label}.webm`);

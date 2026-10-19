@@ -130,7 +130,7 @@ describe("managed mount plan", () => {
   it.each(["none", "ro", "rw"] as const)(
     "maps all managed roots with %s permissions",
     async (access) => {
-      const plan = await prepareSandboxMountPlan(params(access));
+      const plan = await prepare(access);
       if (access === "none") {
         expect(plan.binds).toEqual([
           "/host/state/private:/workspace:z",
@@ -193,8 +193,7 @@ describe("managed mount plan", () => {
 
   it("honors a normalized custom override without translating the replaced source", async () => {
     vi.mocked(resolveDockerSourceNamespace).mockResolvedValue([]);
-    const plan = await prepareSandboxMountPlan({
-      ...params("ro"),
+    const plan = await prepare("ro", {
       workspaceDir: path.join(root, "agent"),
       binds: ["/custom/project:/workspace/:ro"],
     });
@@ -254,7 +253,7 @@ describe("managed mount plan", () => {
         writable: false,
       },
     ]);
-    expect((await prepareSandboxMountPlan(params("rw"))).binds).toContain(
+    expect((await prepare("rw")).binds).toContain(
       "/host/skills/skills:/workspace/.openclaw/sandbox-skills/skills:ro,z",
     );
   });
@@ -279,29 +278,25 @@ describe("retained mount identity", () => {
   it.each(["tmpfs", "volume"])(
     "distinguishes configured tmpfs removal from implicit %s below a bind",
     async (type) => {
-      const plan = await prepareSandboxMountPlan({
-        ...params("none"),
-        workspaceDir: path.join(root, "empty"),
-      });
-      expect(
-        await matchesContainer(
-          plan,
-          [
-            { Type: "bind", Source: "/host/state/empty", Destination: "/workspace", RW: true },
-            ...(type === "tmpfs"
-              ? []
-              : [
-                  {
-                    Type: type,
-                    Source: "/engine/storage",
-                    Destination: "/workspace/cache",
-                    RW: true,
-                  },
-                ]),
-          ],
-          type === "tmpfs" ? { "/workspace/cache": "rw" } : null,
-        ),
-      ).toBe(type !== "tmpfs");
+      const plan = await prepareEmpty();
+      await expectMounts(
+        plan,
+        [
+          { Type: "bind", Source: "/host/state/empty", Destination: "/workspace", RW: true },
+          ...(type === "tmpfs"
+            ? []
+            : [
+                {
+                  Type: type,
+                  Source: "/engine/storage",
+                  Destination: "/workspace/cache",
+                  RW: true,
+                },
+              ]),
+        ],
+        type === "tmpfs" ? { "/workspace/cache": "rw" } : null,
+        type !== "tmpfs",
+      );
     },
   );
 

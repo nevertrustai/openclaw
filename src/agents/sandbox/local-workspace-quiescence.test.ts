@@ -126,6 +126,7 @@ it("records each released generation before a later resume failure and re-fences
     if (action === "unpause" && target === id && failFirst) {
       return { code: 1, stdout: "", stderr: "temporary engine fault" };
     }
+    return undefined;
   });
   const { resume } = await quiesce();
   await expect(resume()).rejects.toThrow("resume failed");
@@ -209,6 +210,7 @@ it.each([
     if (action === "resume-inspect" && removed) {
       return { code: 1, stdout: "", stderr: "no such container" };
     }
+    return undefined;
   });
   const assertCurrent = () => authority.signal.throwIfAborted();
   mocks.current.mockImplementation(owner === "registry" ? assertCurrent : () => {});

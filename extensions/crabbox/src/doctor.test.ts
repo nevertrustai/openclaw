@@ -76,15 +76,22 @@ describe("Crabbox worker doctor", () => {
               : { status: "outdated", version: kind === "sandbox" ? "0.76.0" : "0.51.0" },
         );
       }
-      const ctx = workerContext(kind === "wsl2" ? "windows/wsl2" : "linux");
-      if (kind === "unconfigured") {
-        ctx.cfg = {};
-      }
-      if (kind === "sandbox") {
-        const sandbox = { binary: process.execPath };
-        ctx.cfg = { plugins: { entries: { crabbox: { config: { sandbox } } } } };
-        ctx.env = { OPENCLAW_STATE_DIR: tempDirs.make("crabbox-doctor-sandbox-"), PATH: "" };
-      }
+      const ctx =
+        kind === "unconfigured"
+          ? context({}, { cfg: {} })
+          : kind === "sandbox"
+            ? context(
+                {},
+                {
+                  cfg: {
+                    plugins: {
+                      entries: { crabbox: { config: { sandbox: { binary: process.execPath } } } },
+                    },
+                  },
+                  env: { OPENCLAW_STATE_DIR: tempDirs.make("crabbox-doctor-sandbox-"), PATH: "" },
+                },
+              )
+            : workerContext(kind === "wsl2" ? "windows/wsl2" : "linux");
       const before = structuredClone(ctx.cfg);
       const expected =
         kind === "sandbox"

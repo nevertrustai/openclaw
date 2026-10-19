@@ -18,10 +18,14 @@ const { configMocks, registryMocks, backendMocks, bridgeMocks } = vi.hoisted(() 
   bridgeMocks: { stopBrowserBridgeServer: vi.fn(async () => undefined) },
 }));
 
+// mock-isolation: Runtime config is supplied by each management scenario.
 vi.mock("../../config/config.js", () => configMocks);
+// mock-isolation: Browser cleanup is observed without opening a real bridge.
 vi.mock("../../plugin-sdk/browser-bridge.js", () => bridgeMocks);
+// mock-isolation: Synthetic registry rows isolate management from durable state.
 vi.mock("./registry.js", () => registryMocks);
 
+// mock-isolation: Backend effects are observed without creating containers.
 vi.mock("./docker-backend.js", () => ({
   createDockerSandboxBackend: vi.fn(),
   createPodmanSandboxBackend: vi.fn(),

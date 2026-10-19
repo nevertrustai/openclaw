@@ -40,7 +40,7 @@ function checkpointCatalog(state: "available" | "completed" = "available") {
     captures: 0,
     failDeletion: true,
     missing: false,
-    command({ argv }: CommandCall): ReturnType<typeof commandResult> | undefined {
+    command(this: void, { argv }: CommandCall): ReturnType<typeof commandResult> | undefined {
       if (argv[2] === "create") {
         const id = `chk_capture_${++catalog.captures}`;
         catalog.resources.add(id);

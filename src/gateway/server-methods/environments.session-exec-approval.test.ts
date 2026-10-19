@@ -10,6 +10,7 @@ import { registerCronRunExecSource } from "../../infra/cron-run-exec-source.js";
 import {
   resolveExecApprovalRequestAllowedDecisions,
   type ExecApprovalRequest,
+  type ExecApprovalRequestPayload,
 } from "../../infra/exec-approvals.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { createTestApprovalManager } from "../exec-approval-manager.test-support.js";
@@ -45,7 +46,9 @@ it.for([
   async ({ route, outcome }, test) => {
     const run = createOperationalRunInstanceRef(`approval-${route}-${outcome}`);
     const authority = claimAgentRunDelegatedAuthority(run);
-    test.onTestFinished(() => releaseAgentRunDelegatedAuthority(authority));
+    test.onTestFinished(() => {
+      releaseAgentRunDelegatedAuthority(authority);
+    });
     if (outcome === "cron") {
       test.onTestFinished(
         registerCronRunExecSource(run.runId, {
@@ -56,7 +59,7 @@ it.for([
         }),
       );
     }
-    const manager = createTestApprovalManager(test, {
+    const manager = createTestApprovalManager<ExecApprovalRequestPayload>(test, {
       resolveAllowedDecisions: resolveExecApprovalRequestAllowedDecisions,
       validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
     });
@@ -205,7 +208,7 @@ it.for([
 
 for (const decision of ["allow-once", "deny"] as const) {
   it(`shows stdin and honors ${decision} exactly once`, async (test) => {
-    const manager = createTestApprovalManager(test, {
+    const manager = createTestApprovalManager<ExecApprovalRequestPayload>(test, {
       resolveAllowedDecisions: resolveExecApprovalRequestAllowedDecisions,
     });
     const broadcast = vi.fn(async (_event: string, request: ExecApprovalRequest) => {

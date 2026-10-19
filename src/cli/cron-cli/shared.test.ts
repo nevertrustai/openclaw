@@ -73,6 +73,7 @@ function captureError(error: unknown): unknown {
   } catch (caught) {
     return caught;
   }
+  return undefined;
 }
 
 function renderJsonError(

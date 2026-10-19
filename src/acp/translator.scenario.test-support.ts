@@ -32,7 +32,7 @@ export function createTranslatorScenario(
     sessionStore.createSession({ sessionId, sessionKey, cwd: "/tmp" });
   }
   const connection = createAcpConnection({ requestPermission });
-  const sessionUpdate = vi.mocked(connection.sessionUpdate);
+  const sessionUpdate = vi.spyOn(connection, "sessionUpdate");
   const agent = createAcpGatewayAgent(
     connection,
     createAcpGateway(request as GatewayClient["request"]),

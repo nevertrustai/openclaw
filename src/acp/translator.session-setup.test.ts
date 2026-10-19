@@ -228,6 +228,8 @@ async function configFixture() {
   const { agent, request, sessionUpdate } = harness({
     row: {
       key: "session",
+      kind: "direct",
+      updatedAt: 1_710_000_000_000,
       thinkingLevel: "minimal",
       modelProvider: "openai",
       model: "gpt-5.4",

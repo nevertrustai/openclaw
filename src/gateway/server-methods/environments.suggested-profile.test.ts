@@ -152,12 +152,16 @@ function adoptionHarness(getRuntimeConfig = () => storedConfig) {
   });
 }
 
-it.each([
+const profileScenarios: {
+  profiles: NonNullable<OpenClawConfig["cloudWorkers"]>["profiles"];
+  suggested: boolean;
+}[] = [
   { profiles: undefined, suggested: true },
   { profiles: {}, suggested: true },
   { profiles: undefined, suggested: false },
   { profiles: { custom: { provider: "static-ssh" } }, suggested: false },
-] as const)(
+];
+it.each(profileScenarios)(
   "lists $profiles with suggestion=$suggested without admitting a destination",
   async ({ profiles, suggested: available }) => {
     storedConfig = { cloudWorkers: { profiles } };

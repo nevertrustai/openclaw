@@ -43,7 +43,6 @@ const { runtime, callGatewayFromCli } = mocks;
 const listRequests = () =>
   callGatewayFromCli.mock.calls.filter(([method]) => method === "cron.list");
 const listOffsets = () => listRequests().map((call) => (call[2] as { offset: number }).offset);
-const jsonResult = <T>() => runtime.writeJson.mock.calls.at(-1)?.[0] as T;
 const output = (stream: "log" | "error") => runtime[stream].mock.calls.flat().join("\n");
 function expectIncludes(text: string, ...parts: string[]) {
   for (const part of parts) {
@@ -312,10 +311,10 @@ describe("cron CLI with the real Gateway pagination contract", () => {
       );
 
       if (json) {
-        const result = jsonResult<{
+        const result = runtime.writeJson.mock.calls.at(-1)?.[0] as {
           jobs: CronJob[];
           deliveryPreviews?: Record<string, unknown>;
-        }>();
+        };
         expect(result.jobs.map((job) => job.id).toSorted()).toEqual(
           matching.map((job) => job.id).toSorted(),
         );
@@ -373,7 +372,7 @@ describe("cron CLI with the real Gateway pagination contract", () => {
       },
     });
     await runCron(["list", "--json"]);
-    const result = jsonResult<{ jobs: CronJob[] }>();
+    const result = runtime.writeJson.mock.calls.at(-1)?.[0] as { jobs: CronJob[] };
     expect(result.jobs).toHaveLength(count);
     expect(result.jobs.some((job) => job.id === "job-000")).toBe(false);
     if (change === "replacement") {
@@ -388,7 +387,7 @@ describe("cron CLI with the real Gateway pagination contract", () => {
     installRealCronGateway(createJobs(count), { transformListPage: unversionedPage });
     disableCronGetForProtocolV4Gateway();
     await runCron(["list", "--json"]);
-    const result = jsonResult<{ jobs: CronJob[] }>();
+    const result = runtime.writeJson.mock.calls.at(-1)?.[0] as { jobs: CronJob[] };
     expect(result.jobs).toHaveLength(count);
     expectRpc("cron.get", {
       id: count ? "job-000" : expect.any(String),
@@ -502,7 +501,10 @@ describe("cron CLI with the real Gateway pagination contract", () => {
 
     await runCron(["show", id, "--json"]);
 
-    expect(jsonResult<CronJob>()).toMatchObject({ id: "job-200", name: "Actual ID owner" });
+    expect(runtime.writeJson.mock.calls.at(-1)?.[0]).toMatchObject({
+      id: "job-200",
+      name: "Actual ID owner",
+    });
     expectRpc("cron.get", { id });
     expect(listRequests().length > 0).toBe(id !== actualId.id);
   });
@@ -657,7 +659,7 @@ describe("cron CLI with the real Gateway pagination contract", () => {
 
     await runCron(["show", job.id, "--json"]);
 
-    const result = jsonResult<CronJob>();
+    const result = runtime.writeJson.mock.calls.at(-1)?.[0] as CronJob;
     expect(result).toMatchObject({ id: job.id, name, payload: { model }, state: { lastError } });
   });
 

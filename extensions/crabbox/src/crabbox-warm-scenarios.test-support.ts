@@ -1,5 +1,4 @@
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import type { WorkerProvider } from "openclaw/plugin-sdk/plugin-entry";
 import {
   resetPluginStateStoreForTests,
   createPluginStateSyncKeyedStoreForTests,
@@ -21,7 +20,7 @@ export const checkpointArgs = (calls: CommandCall[], action: string) =>
 export const commandArgs = (calls: CommandCall[], action: string) =>
   calls.filter(({ argv }) => argv[1] === action).map(({ argv }) => argv);
 
-export async function closeWarmState(provider: WorkerProvider) {
+export async function closeWarmState(provider: { dispose(): Promise<void> }) {
   await provider.dispose();
   await closeOpenClawStateDatabaseAsync();
   resetPluginStateStoreForTests();
@@ -83,7 +82,7 @@ export function pause() {
   return {
     entered: entered.promise,
     release: () => released.resolve(),
-    async wait() {
+    async wait(this: void) {
       entered.resolve();
       await released.promise;
     },
