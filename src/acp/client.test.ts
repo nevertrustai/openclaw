@@ -6,6 +6,7 @@ import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 
+// mock-isolation: use a fixed provider-key inventory rather than installed provider state.
 vi.mock("../secrets/provider-env-vars.js", () => ({
   listKnownProviderAuthEnvVarNamesCore: () => ["OPENAI_API_KEY"],
   resolveProviderAuthLookupMaps: () => ({ aliasMap: {}, envCandidateMap: {}, authEvidenceMap: {} }),

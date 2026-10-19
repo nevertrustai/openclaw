@@ -30,7 +30,9 @@ const authStatus: ModelAuthStatusResult = {
       provider: "radius",
       apiKeySupported: false,
       quickApiKeySetup: false,
-      loginOptions: [{ ...authOption("radius/radius", "Radius account"), brandId: "radius" }],
+      loginOptions: [
+        { ...authOption("radius/radius", "Radius account"), kind: "oauth", brandId: "radius" },
+      ],
     },
   ],
 };

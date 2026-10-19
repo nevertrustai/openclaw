@@ -19,7 +19,9 @@ const resolveSecretRefValuesMock = vi.hoisted(() => vi.fn());
 const secretRefKeyMock = vi.hoisted(() => vi.fn(() => "env:default:OPENCLAW_GATEWAY_TOKEN"));
 const randomTokenMock = vi.hoisted(() => vi.fn(() => "generated-token"));
 
+// mock-isolation: token installation must not write the operator's config.
 vi.mock("../config/mutate.js", () => ({ replaceConfigFile: replaceConfigFileMock }));
+// mock-isolation: exercise explicitly supplied auth outcomes without live credential resolution.
 vi.mock("../gateway/auth.js", () => ({ resolveGatewayAuth: resolveGatewayAuthMock }));
 
 vi.mock("../gateway/auth-install-policy.js", () => ({
@@ -31,7 +33,9 @@ vi.mock("../secrets/ref-contract.js", async (importOriginal) => ({
   secretRefKey: secretRefKeyMock,
 }));
 
+// mock-isolation: use fixture secret values without accessing real credential providers.
 vi.mock("../secrets/resolve.js", () => ({ resolveSecretRefValues: resolveSecretRefValuesMock }));
+// mock-isolation: generated tokens must be deterministic fixture values.
 vi.mock("./random-token.js", () => ({ randomToken: randomTokenMock }));
 
 function createGeneration(config: OpenClawConfig = {}) {

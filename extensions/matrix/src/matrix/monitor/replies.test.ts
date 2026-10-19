@@ -8,6 +8,7 @@ import type { MatrixSendResult } from "../send/types.js";
 type MatrixSend = typeof import("../send.js").sendMessageMatrix;
 const sendMessageMatrixMock = vi.hoisted(() => vi.fn<MatrixSend>());
 
+// mock-isolation: delivery fixtures record sends without starting a Matrix transport.
 vi.mock("../send.js", () => ({
   sendMessageMatrix: sendMessageMatrixMock,
 }));

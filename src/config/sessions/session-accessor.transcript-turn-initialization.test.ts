@@ -98,8 +98,12 @@ describe("first transcript turn initialization", () => {
   it("creates the first session, Goal, input and run receipt atomically and replays after reopen", async () => {
     expect(loadSessionEntry(scope())).toBeUndefined();
     const onMessageCommitted = vi.fn(({ messageId }: { messageId: string }) => {
-      const event = loadTranscriptEventsSync(scope()).find((row) => row.id === messageId);
-      expect(event).toMatchObject({ id: messageId, message: { role: "user" } });
+      expect(loadTranscriptEventsSync(scope())).toContainEqual(
+        expect.objectContaining({
+          id: messageId,
+          message: expect.objectContaining({ role: "user" }),
+        }),
+      );
     });
     const turn = await admit({ onMessageCommitted });
     expect(turn.sessionEntry?.status).toBeUndefined();

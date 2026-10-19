@@ -155,7 +155,7 @@ describe("createDraftStreamLoop", () => {
     const latest = { text: "latest", blocks: ["latest-blocks"] };
     const { pending, send } = blockedSend<typeof initial>();
     send.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
-    const loop = createLoop(send, {
+    const loop = createLoop<typeof initial>(send, {
       emptyValue: { text: "", blocks: [] },
       isEmpty: (update) => !update.text,
     });

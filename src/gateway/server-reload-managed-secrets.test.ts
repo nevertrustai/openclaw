@@ -454,7 +454,7 @@ describe("managed reload authored source", () => {
     async (insideCallback) => {
       const [initial, candidate] = await prepareCandidates();
       const descendant = await prepare({ gateway: { port: 18790, bind: "lan" } });
-      const merged = { gateway: { port: 18789, bind: "lan" } };
+      const merged = { gateway: { port: 18789, bind: "lan" } } satisfies OpenClawConfig;
       const beforeSnapshotPublication = vi.fn(async (config: OpenClawConfig | null) => {
         expect(getActiveSecretsRuntimeSnapshotState()?.config).toEqual(
           config === candidate.config ? initial.config : descendant.config,

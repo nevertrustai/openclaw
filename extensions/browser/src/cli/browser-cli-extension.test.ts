@@ -9,9 +9,13 @@ import { createBrowserCliCapture } from "./browser-cli-extension.test-support.js
 const rejectRuntimeImport = vi.hoisted(() => () => {
   throw new Error("Browser extension metadata must not load execution runtimes");
 });
+// mock-isolation: fail if metadata commands load the browser control runtime.
 vi.mock("../control-service.js", rejectRuntimeImport);
+// mock-isolation: fail if metadata commands load the agent execution runtime.
 vi.mock("openclaw/plugin-sdk/agent-harness-runtime", rejectRuntimeImport);
+// mock-isolation: fail if metadata commands load the media execution runtime.
 vi.mock("openclaw/plugin-sdk/media-runtime", rejectRuntimeImport);
+// mock-isolation: fail if metadata commands load the media understanding runtime.
 vi.mock("openclaw/plugin-sdk/media-understanding-runtime", rejectRuntimeImport);
 
 const relayMocks = vi.hoisted(() => {

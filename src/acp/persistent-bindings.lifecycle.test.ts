@@ -14,6 +14,7 @@ const managerMocks = vi.hoisted(() => ({
   setSessionConfigOption: vi.fn(),
 }));
 
+// mock-isolation: lifecycle assertions must not create real ACP sessions or workers.
 vi.mock("./control-plane/manager.js", () => ({
   getAcpSessionManager: () => managerMocks,
 }));
@@ -138,7 +139,7 @@ describe("ensureConfiguredAcpBindingSession", () => {
         runtimeOptions: { model: "anthropic/claude-sonnet-4-6", thinking: "off" },
       }),
     );
-    expect(managerMocks.initializeSession.mock.calls[0][0]).not.toHaveProperty("modelExplicit");
+    expect(managerMocks.initializeSession.mock.calls[0]?.[0]).not.toHaveProperty("modelExplicit");
   });
 
   it("reinitializes a matching session when the stored ACP session is in error state", async () => {

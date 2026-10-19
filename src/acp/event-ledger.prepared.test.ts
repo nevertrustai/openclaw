@@ -45,7 +45,7 @@ async function fixture(
 }
 
 describe("ACP replay worker", () => {
-  afterEach(closeOpenClawStateDatabaseAsync);
+  afterEach(() => closeOpenClawStateDatabaseAsync());
 
   it("binds fresh metadata, sequence and payload values across worker appends", async ({ dir }) => {
     let now = 100;

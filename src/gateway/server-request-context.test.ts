@@ -460,10 +460,9 @@ describe("createGatewayRequestContext", () => {
     } else {
       context.invalidateClientsForDevice?.("device-1", { reason });
       expect(target.socket.close).not.toHaveBeenCalled();
-      expect(runtime.nodeRegistry.invalidateConnectionForPairingChange).toHaveBeenCalledWith(
-        "conn-target",
-        reason,
-      );
+      expect(
+        vi.mocked(runtime.nodeRegistry).invalidateConnectionForPairingChange,
+      ).toHaveBeenCalledWith("conn-target", reason);
       expect(runtime.watchNodeHttpRuntime.invalidateSessionsForDevice).toHaveBeenCalledWith(
         "device-1",
         { reason },

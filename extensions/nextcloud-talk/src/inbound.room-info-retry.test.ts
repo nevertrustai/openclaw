@@ -20,10 +20,10 @@ type Payload = Parameters<Queue["enqueue"]>[1];
 
 type Spool = ReturnType<typeof createNextcloudTalkWebhookSpool>;
 type Fixture = ReturnType<typeof createRuntime> & { queue: Queue; spool: Spool };
-type ProofServer = Awaited<ReturnType<typeof startRoomInfoServer>>;
+type ProofServer = { baseUrl: string; requests: string[]; stop: () => Promise<void> };
 const servers: ProofServer[] = [];
 
-async function startRoomInfoServer() {
+async function startRoomInfoServer(): Promise<ProofServer> {
   const requests: string[] = [];
   const server = http.createServer((req, res) => {
     requests.push(req.url ?? "");

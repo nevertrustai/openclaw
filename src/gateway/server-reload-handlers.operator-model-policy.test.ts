@@ -246,7 +246,7 @@ it("commits model-only role changes without retiring permitted models or origina
       ]);
       expect(getCommittedRuntimeConfig()).toBe(initialConfig);
       expect([modelA.signal.aborted, modelB.signal.aborted]).toEqual([false, false]);
-      expect(original.authority.assertCurrent).not.toThrow();
+      expect(() => original.authority.assertCurrent()).not.toThrow();
       releasePreparation.resolve();
       await expect(rejected).resolves.toBe("failed");
       // The receipt precedes lease cleanup; join the scheduler turn before the next wake.

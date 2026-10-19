@@ -7,6 +7,7 @@ import { createDoctorPrompter, type DoctorPrompter } from "./doctor-prompter.js"
 import { createTestRuntime } from "./test-runtime-config-helpers.js";
 
 const note = vi.hoisted(() => vi.fn());
+// mock-isolation: capture doctor notes without writing to the interactive terminal.
 vi.mock("../../packages/terminal-core/src/note.js", () => ({ note }));
 
 import {

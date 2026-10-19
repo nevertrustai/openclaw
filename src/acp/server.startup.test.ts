@@ -138,6 +138,7 @@ vi.mock("@agentclientprotocol/sdk", () => ({
   })),
 }));
 
+// mock-isolation: startup fixtures use a fixed config without reading operator files.
 vi.mock("../config/config.js", () => {
   const loadConfig = () => ({ gateway: { mode: "local" } });
   return {
@@ -147,6 +148,7 @@ vi.mock("../config/config.js", () => {
   };
 });
 
+// mock-isolation: startup fixtures must not contact an operator Gateway.
 vi.mock("../gateway/call.js", () => ({
   callGateway: vi.fn(),
   buildGatewayConnectionDetails: ({ url }: { url?: string }) => {
@@ -197,15 +199,18 @@ vi.mock("../state/openclaw-state-db.js", () => ({
   closeOpenClawStateDatabaseAsync: () => mockState.closeOpenClawStateDatabaseAsync(),
 }));
 
+// mock-isolation: startup ordering does not open a persistent replay database.
 vi.mock("./event-ledger.js", () => ({
   createSqliteAcpEventLedger: vi.fn(() => ({ kind: "sqlite-acp-event-ledger" })),
 }));
 
+// mock-isolation: startup ordering must not install process-wide proxy state.
 vi.mock("../infra/net/proxy/proxy-lifecycle.js", () => ({
   startProxy: async (_config: unknown) => null,
   stopProxy: async (_handle: unknown) => {},
 }));
 
+// mock-isolation: startup tests record translator lifecycle without running agent sessions.
 vi.mock("./translator.js", () => ({
   AcpGatewayAgent: class {
     start(): void {}

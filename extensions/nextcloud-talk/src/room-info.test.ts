@@ -10,6 +10,7 @@ import { resolveNextcloudTalkRoomKind } from "./room-info.js";
 
 const fetchWithSsrFGuard = vi.hoisted(() => vi.fn());
 
+// mock-isolation: room lookup uses controlled HTTP responses without loading plugin runtime state.
 vi.mock("../runtime-api.js", () => ({ fetchWithSsrFGuard }));
 
 afterEach(() => {

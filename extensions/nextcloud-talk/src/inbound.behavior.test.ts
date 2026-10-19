@@ -33,6 +33,7 @@ vi.mock("../runtime-api.js", async () => {
   };
 });
 
+// mock-isolation: inbound fixtures must not send replies to a real Talk server.
 vi.mock("./send.js", () => ({
   sendMessageNextcloudTalk: mocks.send,
 }));

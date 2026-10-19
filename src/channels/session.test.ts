@@ -9,6 +9,7 @@ const { recordMeta, updateRoute } = vi.hoisted(() => ({
   updateRoute: vi.fn<InboundRuntime["updateSessionLastRoute"]>(),
 }));
 
+// mock-isolation: routing assertions record writes without opening durable session stores.
 vi.mock("../config/sessions/inbound.runtime.js", () => ({
   recordInboundSessionMeta: recordMeta,
   updateSessionLastRoute: updateRoute,

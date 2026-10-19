@@ -194,7 +194,7 @@ it("updates keyed progress lines in place", () => {
     throw new Error("expected preamble progress lines");
   }
 
-  const lines = mergeLine(["Exec"], first, { maxLines: 4 });
+  const lines = mergeLine<string | NonNullable<typeof first>>(["Exec"], first, { maxLines: 4 });
   const updated = mergeLine(lines, second, { maxLines: 4 });
 
   expect(updated).toMatchObject(["Exec", { id: "preamble-1", text: "Checking stream" }]);

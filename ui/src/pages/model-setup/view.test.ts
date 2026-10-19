@@ -20,7 +20,7 @@ import {
   type ModelSetupViewProps,
 } from "./test-helpers/view.test-support.tsx";
 
-const find = <T extends Element = Element>(root: ParentNode, selector: string) =>
+const find = <T extends Element = Element>(root: ParentNode, selector: string): T | null =>
   root.querySelector<T>(selector);
 
 function mountDetected(
