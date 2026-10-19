@@ -26,15 +26,22 @@ import { readTranscriptStorageRows } from "./session-accessor.sqlite-read.js";
 import { replaceTranscriptEventsSync } from "./session-accessor.sqlite-transcript-write.test-support.js";
 import { markCanonicalSessionValidationPending } from "./session-canonical-key.js";
 import { seedCanonicalSessionValidation } from "./session-canonical-validation.js";
+import type { SessionEntry } from "./types.js";
 
 const tempDirs: string[] = [];
-function createEnv(prefix: string): NodeJS.ProcessEnv {
+function createScope(prefix: string) {
   const env = { OPENCLAW_STATE_DIR: makeTempDir(tempDirs, prefix) };
   setRuntimeConfigSnapshot({
     session: { store: resolveSessionStorePathCore(undefined, { agentId: "main", env }) },
   });
-  return env;
+  return { agentId: "main", env, sessionKey: "agent:main:target" };
 }
+const savedEntry = (prompt: string): SessionEntry => ({
+  sessionId: "target",
+  updatedAt: 1,
+  skillsSnapshot: { prompt, skills: [] },
+});
+const inspectOnly = () => ({ ok: false as const, error: "inspection complete" });
 afterEach(async () => {
   vi.restoreAllMocks();
   await closeOpenClawAgentDatabasesAsync();
@@ -47,8 +54,7 @@ afterEach(async () => {
 
 describe("session creation snapshot", () => {
   it("preserves a competing creation committed while the initial entry is prepared", async () => {
-    const env = createEnv("creation-conflict-");
-    const scope = { agentId: "main", env, sessionKey: "agent:main:target" };
+    const scope = createScope("creation-conflict-");
     const competing = { sessionId: "competing", updatedAt: 1, label: "retained" };
     openOpenClawAgentDatabase(scope);
 
@@ -63,8 +69,7 @@ describe("session creation snapshot", () => {
   });
 
   it("preserves adopted history without selecting a new projection", async () => {
-    const env = createEnv("creation-history-");
-    const scope = { agentId: "main", env, sessionKey: "agent:main:target", sessionId: "target" };
+    const scope = { ...createScope("creation-history-"), sessionId: "target" };
     const entry = { sessionId: "target", updatedAt: 1 };
     replaceSessionEntrySync(scope, entry);
     const database = openOpenClawAgentDatabase(scope);
@@ -88,12 +93,9 @@ describe("session creation snapshot", () => {
   });
 
   it("prepares and adopts a complete target without decoding sibling entries", async () => {
-    const env = createEnv("creation-snapshot-");
-    const scope = { agentId: "main", env, sessionKey: "agent:main:target" };
+    const scope = createScope("creation-snapshot-");
     const target = {
-      sessionId: "target",
-      updatedAt: 1,
-      skillsSnapshot: { prompt: "target-saved-prompt", skills: [] },
+      ...savedEntry("target-saved-prompt"),
       systemPromptReport: {
         source: "run" as const,
         generatedAt: 1,
@@ -148,15 +150,13 @@ describe("session creation snapshot", () => {
     });
   });
   it("preserves normalized and opaque target identities after reopening", async () => {
-    const env = createEnv("creation-identities-");
-    const scope = { agentId: "main", env };
+    const { agentId, env } = createScope("creation-identities-");
+    const scope = { agentId, env };
     const key = "agent:main:matrix:group:!Room:example.org";
     const sibling = "agent:main:matrix:group:!room:example.org";
     const entry = {
-      sessionId: "target",
-      updatedAt: 1,
+      ...savedEntry("preserved target"),
       label: "own",
-      skillsSnapshot: { prompt: "preserved target", skills: [] },
     };
     replaceSessionEntrySync({ ...scope, sessionKey: key }, entry);
     replaceSessionEntrySync(
@@ -180,7 +180,7 @@ describe("session creation snapshot", () => {
         expect(context.existingEntry).toMatchObject(entry);
         expect(context.targetEntry).toMatchObject(entry);
         expect(context.labelInUse).toBe(false);
-        return { ok: false, error: "inspection complete" };
+        return inspectOnly();
       },
       { label: "own" },
     );
@@ -201,14 +201,8 @@ describe("session creation snapshot", () => {
   it.each(["mismatched-time", "nul"])(
     "preserves native warm listing but refuses corrupt worker input for a %s target",
     async (kind) => {
-      const env = createEnv("creation-warm-rows-");
-      const scope = { agentId: "main", env, sessionKey: "agent:main:target" };
-      const entry = {
-        sessionId: "target",
-        updatedAt: 1,
-        label: "target",
-        skillsSnapshot: { prompt: "saved target", skills: [] },
-      };
+      const scope = createScope("creation-warm-rows-");
+      const entry = { ...savedEntry("saved target"), label: "target" };
       replaceSessionEntrySync(scope, entry);
       replaceSessionEntrySync(
         { ...scope, sessionKey: "agent:main:sibling" },
@@ -242,25 +236,23 @@ describe("session creation snapshot", () => {
       runSqliteImmediateTransactionSync(db, () =>
         markCanonicalSessionValidationPending(database, [scope.sessionKey]),
       );
-      await expect(
-        createSessionEntryWithTranscript(scope, () => ({ ok: false, error: "unreachable" })),
-      ).rejects.toThrow("openclaw doctor --fix");
+      const rejectsCorrupt = () =>
+        expect(createSessionEntryWithTranscript(scope, inspectOnly)).rejects.toThrow(
+          "openclaw doctor --fix",
+        );
+      await rejectsCorrupt();
       await closeOpenClawAgentDatabasesAsync();
       closeOpenClawAgentDatabasesForTest();
-      await expect(
-        createSessionEntryWithTranscript(scope, () => ({ ok: false, error: "unreachable" })),
-      ).rejects.toThrow("openclaw doctor --fix");
+      await rejectsCorrupt();
     },
   );
 
   it("keeps the target and sibling labels on one snapshot across an external commit and callback await", async () => {
-    const env = createEnv("creation-concurrent-snapshot-");
-    const scope = { agentId: "main", env, sessionKey: "agent:main:a-target" };
-    const entry = {
-      sessionId: "target",
-      updatedAt: 1,
-      skillsSnapshot: { prompt: "snapshot-target-marker", skills: [] },
+    const scope = {
+      ...createScope("creation-concurrent-snapshot-"),
+      sessionKey: "agent:main:a-target",
     };
+    const entry = savedEntry("snapshot-target-marker");
     const sibling = { sessionId: "sibling", updatedAt: 1, label: "old label" };
     replaceSessionEntrySync(scope, entry);
     replaceSessionEntrySync({ ...scope, sessionKey: "agent:main:z-sibling" }, sibling);
@@ -299,20 +291,14 @@ describe("session creation snapshot", () => {
       expect(changed).toBe(true);
       expect(context.targetEntry).toMatchObject(entry);
       expect(context.labelInUse).toBe(true);
-      expect(
+      const labelInUse = (label: string) =>
         readSessionCreationSnapshotInDatabase(
           openOpenClawAgentDatabase(scope),
           scope.sessionKey,
-          "new label",
-        ).labelInUse,
-      ).toBe(true);
-      expect(
-        readSessionCreationSnapshotInDatabase(
-          openOpenClawAgentDatabase(scope),
-          scope.sessionKey,
-          "old label",
-        ).labelInUse,
-      ).toBe(false);
+          label,
+        ).labelInUse;
+      expect(labelInUse("new label")).toBe(true);
+      expect(labelInUse("old label")).toBe(false);
     } finally {
       external.close();
     }

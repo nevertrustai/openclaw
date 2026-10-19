@@ -38,16 +38,22 @@ const sessionKey = "agent:main:artifact-plan-victim";
 const sessionId = "artifact-plan-victim";
 const entry = { sessionId, updatedAt: 1 };
 const event = { type: "metadata", runId: "artifact-plan-marker" };
+const cleanupInput = () => ({
+  sessionKeySegmentPrefix: "artifact-plan-",
+  transcriptContentMarker: "artifact-plan-marker",
+  orphanTranscriptMinAgeMs: 0,
+  archiveRemovedEntryTranscripts: false,
+});
+const planInput = () => ({ ...cleanupInput(), archiveDirectory: state.sessionsDir() });
+const writeEntry = (key: string, value: SessionEntry) =>
+  runOpenClawAgentWriteTransaction((db) => writeSessionEntry(db, key, value), options);
 
 beforeEach(async () => {
   state = await createOpenClawTestState({ prefix: "artifact-planning-", layout: "state-only" });
   storePath = path.join(state.sessionsDir(), "sessions.json");
   const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
   options = { agentId: "main", path: database.path, env: state.env };
-  runOpenClawAgentWriteTransaction(
-    (transaction) => writeSessionEntry(transaction, sessionKey, entry),
-    options,
-  );
+  writeEntry(sessionKey, entry);
   await replaceTranscriptEvents({ storePath, sessionKey, sessionId }, [event]);
 });
 
@@ -60,12 +66,10 @@ afterEach(async () => {
 it("skips unused candidate reads and observes a later matching entry", () => {
   const database = openOpenClawAgentDatabase(options);
   const input = {
+    ...planInput(),
     agentId: "main",
-    archiveRemovedEntryTranscripts: false,
-    archiveDirectory: state.sessionsDir(),
     pluginOwnerId: "memory-core",
     sessionKeySegmentPrefix: "idle-cleanup-",
-    transcriptContentMarker: "artifact-plan-marker",
     orphanTranscriptMinAgeMs: 300_000,
     nowMs: Date.now() + 600_000,
   };
@@ -105,10 +109,7 @@ it("skips unused candidate reads and observes a later matching entry", () => {
     updatedAt: 1,
     pluginOwnerId: "memory-core",
   };
-  runOpenClawAgentWriteTransaction(
-    (transaction) => writeSessionEntry(transaction, candidateKey, candidate),
-    options,
-  );
+  writeEntry(candidateKey, candidate);
   const next = planWithReadCounts();
   expect(next.plan.entries).toHaveLength(1);
   expect(next.plan.entries).toMatchObject([{ sessionKey: candidateKey, expectedEntry: candidate }]);
@@ -178,13 +179,10 @@ it("hydrates only old scoped candidates while protecting out-of-scope history re
   try {
     const plan = runSqliteDeferredTransactionSync(database.db, () =>
       artifactPlanning.planSessionLifecycleArtifactCleanup(database, {
+        ...planInput(),
         agentId: "main",
-        sessionKeySegmentPrefix: "artifact-plan-",
-        transcriptContentMarker: "artifact-plan-marker",
         orphanTranscriptMinAgeMs: 300_000,
         nowMs,
-        archiveRemovedEntryTranscripts: false,
-        archiveDirectory: state.sessionsDir(),
       }),
     );
     expect(plan.entries).toEqual([{ sessionKey, expectedEntry }]);
@@ -217,14 +215,8 @@ it.each(["admitted", "revoked", "referenced"] as const)(
     const nativePlanning = vi
       .spyOn(artifactPlanning, "prepareSessionLifecycleArtifactCleanupForMaintenance")
       .mockRejectedValue(new Error("artifact planning ran on the calling thread"));
-    const cleanup = cleanupSessionLifecycleArtifactsCore({
-      storePath,
-      sessionKeySegmentPrefix: "artifact-plan-",
-      transcriptContentMarker: "artifact-plan-marker",
-      orphanTranscriptMinAgeMs: 0,
-      archiveRemovedEntryTranscripts: false,
-    });
-    const settled = cleanup.then(
+    const pending = cleanupSessionLifecycleArtifactsCore({ storePath, ...cleanupInput() });
+    const settled = pending.then(
       (value) => ({ value }),
       (error: unknown) => ({ error }),
     );
@@ -234,7 +226,7 @@ it.each(["admitted", "revoked", "referenced"] as const)(
     try {
       await awaitGateBeforeSettlement(
         reached.promise,
-        cleanup,
+        pending,
         "Artifact worker read was bypassed",
       );
       if (outcome === "admitted") {
@@ -246,15 +238,11 @@ it.each(["admitted", "revoked", "referenced"] as const)(
       } else if (outcome === "revoked") {
         closing = closeOpenClawAgentDatabaseByPathAsync(options.path);
       } else if (outcome === "referenced") {
-        runOpenClawAgentWriteTransaction(
-          (database) =>
-            writeSessionEntry(database, "agent:main:survivor", {
-              sessionId: "survivor",
-              previousSessionId: sessionId,
-              updatedAt: 2,
-            }),
-          options,
-        );
+        writeEntry("agent:main:survivor", {
+          sessionId: "survivor",
+          previousSessionId: sessionId,
+          updatedAt: 2,
+        });
         let followingEntered = false;
         following = runExclusiveSqliteSessionWrite(
           options,
@@ -344,11 +332,8 @@ it("keeps orphan plans across page boundaries and protects retained references",
     }
   }, options);
   const plan = artifactPlanning.planSessionLifecycleArtifactCleanup(database, {
-    archiveRemovedEntryTranscripts: false,
-    archiveDirectory: state.sessionsDir(),
+    ...planInput(),
     sessionKeySegmentPrefix: "unrelated-",
-    transcriptContentMarker: "artifact-plan-marker",
-    orphanTranscriptMinAgeMs: 0,
     nowMs: Date.now(),
   });
   expect(database.db.isTransaction).toBe(false);

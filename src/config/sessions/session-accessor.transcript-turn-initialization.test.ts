@@ -49,6 +49,9 @@ describe("first transcript turn initialization", () => {
     createdActor: { type: "human", source: "profile", id: "operator-profile" },
     sandbox: "required",
   };
+  const userMessage = () => ({ role: "user" as const, content: operation.objective });
+  const receiptRows = () =>
+    database().db.prepare("SELECT * FROM session_goal_operations ORDER BY operation_id").all();
   const database = () => openOpenClawAgentDatabase(toDatabaseOptions(resolveSqliteScope(scope())));
   const counts = () =>
     database()
@@ -68,8 +71,7 @@ describe("first transcript turn initialization", () => {
       messages: [
         {
           message: {
-            role: "user",
-            content: operation.objective,
+            ...userMessage(),
             idempotencyKey: `${operation.operationId}:user`,
           },
         },
@@ -157,7 +159,7 @@ describe("first transcript turn initialization", () => {
       const append = admit({
         updateMode: "inline",
         messages: [
-          { message: { role: "user", content: operation.objective } },
+          { message: userMessage() },
           { message: { role: "assistant", content: "Committed reply" } },
         ],
         onMessageCommitted: (_receipt, acceptCompletion) => {
@@ -192,22 +194,17 @@ describe("first transcript turn initialization", () => {
           ]),
           test.signal,
         );
-        expect(order).toEqual(["accepted:1", "accepted:2"]);
+        const acceptedOrder = ["accepted:1", "accepted:2"];
+        const completedOrder = [...acceptedOrder, "completed:1", "completed:2"];
+        expect(order).toEqual(acceptedOrder);
         release.resolve();
         const result = await outcome;
         if (mode === "success") {
           expect(result).toMatchObject({ value: { appendedCount: 2 } });
-          expect(order).toEqual([
-            "accepted:1",
-            "accepted:2",
-            "completed:1",
-            "completed:2",
-            "published",
-            "published",
-          ]);
+          expect(order).toEqual([...completedOrder, "published", "published"]);
         } else {
           expect(result).toEqual({ error: failure });
-          expect(order).toEqual(["accepted:1", "accepted:2", "completed:1", "completed:2"]);
+          expect(order).toEqual(completedOrder);
         }
         expect(counts()).toEqual({ nodes: 1, windows: 1, events: 3, receipts: 1 });
       } finally {
@@ -225,7 +222,7 @@ describe("first transcript turn initialization", () => {
       const turn = await admit({
         messages: [
           {
-            message: { role: "user", content: operation.objective },
+            message: userMessage(),
             shouldAppend: () => {
               // Direct/cross-process writers bypass the process-local queue.
               replaceSessionEntrySync(scope(), competing);
@@ -250,15 +247,11 @@ describe("first transcript turn initialization", () => {
       ) INSERT INTO session_goal_operations
         SELECT ?, 'retained-' || i, ?, 'fingerprint', '{}', ? FROM receipts`,
     ).run(scope().sessionKey, sessionId, Number.MAX_SAFE_INTEGER);
-    const retained = db
-      .prepare("SELECT * FROM session_goal_operations ORDER BY operation_id")
-      .all();
+    const retained = receiptRows();
     await expect(admit()).rejects.toMatchObject({ code: "capacity" });
     expect(loadSessionEntry(scope())).toBeUndefined();
     expect(counts()).toEqual({ nodes: 0, windows: 0, events: 0, receipts: 4096 });
-    expect(db.prepare("SELECT * FROM session_goal_operations ORDER BY operation_id").all()).toEqual(
-      retained,
-    );
+    expect(receiptRows()).toEqual(retained);
     db.exec("DELETE FROM session_goal_operations");
     await expect(admit()).resolves.toMatchObject({ appendedCount: 1 });
   });
@@ -298,7 +291,7 @@ describe("first transcript turn initialization", () => {
         },
         messages: [
           {
-            message: { role: "user", content: operation.objective },
+            message: userMessage(),
             shouldAppend: async () => {
               current = false;
               return true;
