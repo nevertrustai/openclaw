@@ -52,18 +52,15 @@ function createFixture() {
     },
   };
   publishGatewaySnapshot(connectedSnapshot);
-  const setGatewayPhase = (phase: "connected" | "reconnecting") => {
-    publishGatewaySnapshot({
-      ...connectedSnapshot,
-      phase,
-      hello: phase === "connected" ? { ...connectedSnapshot.hello } : null,
-    });
-  };
   return {
     context,
     request,
-    runtimeConfig: context.runtimeConfig,
-    setGatewayPhase,
+    setGatewayPhase: (phase: "connected" | "reconnecting") =>
+      publishGatewaySnapshot({
+        ...connectedSnapshot,
+        phase,
+        hello: phase === "connected" ? { ...connectedSnapshot.hello } : null,
+      }),
     detectCalls: () => callsFor(request, "openclaw.setup.detect"),
   };
 }
@@ -81,54 +78,52 @@ async function mountPage(context: ApplicationContext, visit = true): Promise<Tes
   return page;
 }
 
-function selectedModelDetail(page: TestModelSetupPage): string | undefined {
-  return page.querySelector(".model-setup__current-copy > .muted")?.textContent?.trim();
-}
+const selectedModelDetail = (page: TestModelSetupPage) =>
+  page.querySelector(".model-setup__current-copy > .muted")?.textContent?.trim();
 
 describe("ModelSetupPage detection ownership", () => {
+  let fixture: ReturnType<typeof createFixture>;
   beforeEach(async () => {
+    fixture = createFixture();
     await i18n.setLocale("en");
   });
 
   afterEach(() => {
+    fixture.context.runtimeConfig.dispose();
     document.body.replaceChildren();
     vi.restoreAllMocks();
   });
 
-  it("starts one detection when the visit arrives after mounting on a connected Gateway", async () => {
-    const { context, request, runtimeConfig } = createFixture();
-    request.mockResolvedValue(detection);
-    const page = await mountPage(context, false);
+  it.each(["route", "gateway"] as const)(
+    "waits for %s readiness before detection",
+    async (ready) => {
+      const { context, request, setGatewayPhase, detectCalls } = fixture;
+      request.mockImplementation(async (method) =>
+        method === "openclaw.setup.detect" ? detection : {},
+      );
+      if (ready === "gateway") {
+        setGatewayPhase("reconnecting");
+      }
+      const page = await mountPage(context, ready !== "route");
+      expect(request).not.toHaveBeenCalled();
+      if (ready === "gateway") {
+        expect(authButton(page, "provider-auth")).toBeNull();
+        setGatewayPhase("connected");
+      } else {
+        page.routeData = { firstRun: false };
+      }
+      await vi.waitFor(() => {
+        expect(detectCalls()).toHaveLength(1);
+        expect(authButton(page, "provider-auth")).not.toBeNull();
+        if (ready === "route") {
+          expect(request).toHaveBeenCalledOnce();
+        }
+      });
+    },
+  );
 
-    expect(request).not.toHaveBeenCalled();
-    page.routeData = { firstRun: false };
-    await vi.waitFor(() => {
-      expect(request).toHaveBeenCalledOnce();
-      expect(page.querySelector('[data-auth-choice="provider-auth"]')).not.toBeNull();
-    });
-    runtimeConfig.dispose();
-  });
-
-  it("waits for the connected Gateway when the page mounts during reconnect", async () => {
-    const { context, request, runtimeConfig, setGatewayPhase, detectCalls } = createFixture();
-    request.mockImplementation(async (method) =>
-      method === "openclaw.setup.detect" ? detection : {},
-    );
-    setGatewayPhase("reconnecting");
-    const page = await mountPage(context);
-
-    expect(page.querySelector('[data-auth-choice="provider-auth"]')).toBeNull();
-    expect(request).not.toHaveBeenCalled();
-    setGatewayPhase("connected");
-    await vi.waitFor(() => {
-      expect(detectCalls()).toHaveLength(1);
-      expect(page.querySelector('[data-auth-choice="provider-auth"]')).not.toBeNull();
-    });
-    runtimeConfig.dispose();
-  });
-
-  it("cancels stale detection on reattach and accepts only the replacement result", async () => {
-    const { context, request, runtimeConfig, detectCalls } = createFixture();
+  it("rejects stale detection after reattach", async () => {
+    const { context, request, detectCalls } = fixture;
     const stale = createDeferred<SystemAgentSetupDetectResult>();
     let signal: AbortSignal | undefined;
     request.mockImplementationOnce(async (_method, _params, options) => {
@@ -157,16 +152,14 @@ describe("ModelSetupPage detection ownership", () => {
       { agentId: "main" },
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     ]);
-    // A server can finish after local cancellation; it cannot publish into the next visit.
     stale.resolve({ ...detection, configuredModel: "provider/stale-model", setupComplete: true });
     await vi.waitFor(() => expect(request.mock.settledResults[0]?.type).toBe("fulfilled"));
     await page.updateComplete;
     expect(selectedModelDetail(page)).toBe("current-model");
-    runtimeConfig.dispose();
   });
 
-  it("recovers the selected provider wizard across a same-Gateway reconnect", async () => {
-    const { context, request, runtimeConfig, setGatewayPhase } = createFixture();
+  it("resumes the provider wizard after reconnect", async () => {
+    const { context, request, setGatewayPhase } = fixture;
     let oldWizardSignal: AbortSignal | undefined;
     let nextCalls = 0;
     request.mockImplementation(async (method, _params, options) => {
@@ -210,6 +203,5 @@ describe("ModelSetupPage detection ownership", () => {
     expect(request.mock.calls.findLast(([method]) => method === "wizard.next")?.[1]).toEqual({
       sessionId: (start[1] as { sessionId: string }).sessionId,
     });
-    runtimeConfig.dispose();
   });
 });

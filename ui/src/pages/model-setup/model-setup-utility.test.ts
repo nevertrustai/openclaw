@@ -19,6 +19,7 @@ import {
   waitForText,
   pageButton,
   authOption,
+  mockRequests,
 } from "./model-setup-first-run.test-support.ts";
 
 const utility = {
@@ -36,6 +37,17 @@ const utilitySelection = {
   modelTarget: "utility",
 };
 const onboarding = { search: "?onboarding=1" };
+const primaryModel = { configuredModel: "cloud/primary", setupComplete: true };
+const configuredUtility = { candidates: [utility], utilityModel: utility.modelRef };
+const utilityAuth = {
+  ...authOption("utility-login", "Utility account"),
+  modelTarget: "utility" as const,
+};
+const utilityKey = {
+  id: "manual-utility",
+  label: "Utility API key",
+  modelTarget: "utility" as const,
+};
 
 function expectRequest(
   request: ReturnType<typeof createFirstRunContext>["request"],
@@ -59,7 +71,7 @@ function createUtilityContext() {
 describe("ModelSetupPage utility roles", () => {
   useFirstRunFixtures("synthetic-utility-device-key");
 
-  it("opens the setup assistant after explicit utility activation outside first run", async () => {
+  it("opens the assistant after utility activation outside first run", async () => {
     const { context, request, mount } = createUtilityContext();
     request.mockResolvedValue(activatedUtility);
     const { page } = await mount({ candidates: [utility] }, false);
@@ -80,16 +92,13 @@ describe("ModelSetupPage utility roles", () => {
   });
 
   it.each([false, true])(
-    "keeps the configured utility available for reopening and repair (primary: %s)",
+    "reopens and repairs a configured utility (primary: %s)",
     async (primary) => {
       const { context, request, mount } = createUtilityContext();
       request.mockResolvedValue(activatedUtility);
       const { page } = await mount({
-        candidates: [utility],
-        utilityModel: utility.modelRef,
-        ...(primary
-          ? { configuredModel: "cloud/primary", setupComplete: true }
-          : { setupModel: utility.modelRef }),
+        ...configuredUtility,
+        ...(primary ? primaryModel : { setupModel: utility.modelRef }),
       });
 
       expect(page.querySelector(".model-setup__current") !== null).toBe(primary);
@@ -127,36 +136,26 @@ describe("ModelSetupPage utility roles", () => {
       if (oauth) {
         vi.spyOn(window, "open").mockReturnValue(null);
       }
-      request.mockImplementation(async (called, actual) => {
-        if (called === method) {
+      mockRequests(request, {
+        [method]: (actual) => {
           expect(actual).toMatchObject(params);
           return oauth ? { done: false, status: "running" } : activatedUtility;
-        }
-        if (oauth && called === "wizard.next") {
-          expect(readFirstRunActivationReceipt(context)).toMatchObject({
-            kind: "provider-auth",
-            modelTarget: "utility",
-            modelRef: null,
-          });
-          return activatedUtility;
-        }
-        throw new Error(`Unexpected method ${called}`);
+        },
+        ...(oauth
+          ? {
+              "wizard.next": () => {
+                expect(readFirstRunActivationReceipt(context)).toMatchObject({
+                  kind: "provider-auth",
+                  modelTarget: "utility",
+                  modelRef: null,
+                });
+                return activatedUtility;
+              },
+            }
+          : {}),
       });
       const { page } = await mount(
-        oauth
-          ? {
-              authOptions: [
-                {
-                  ...authOption("utility-login", "Utility account"),
-                  modelTarget: "utility",
-                },
-              ],
-            }
-          : {
-              manualProviders: [
-                { id: "manual-utility", label: "Utility API key", modelTarget: "utility" },
-              ],
-            },
+        oauth ? { authOptions: [utilityAuth] } : { manualProviders: [utilityKey] },
       );
       if (oauth) {
         authButton(page, "utility-login")!.click();
@@ -176,35 +175,32 @@ describe("ModelSetupPage utility roles", () => {
   );
 
   it.each(["direct", "detected", "missing"] as const)(
-    "retains the utility role when preparation returns a %s model",
+    "keeps the utility role for %s preparation",
     async (outcome) => {
       const { context, request, mount } = createUtilityContext();
       const direct = outcome === "direct";
       const usable = outcome !== "missing";
       const prepared = {
         ...detection,
-        ...(direct ? {} : { configuredModel: "cloud/primary", setupComplete: true }),
+        ...(direct ? {} : primaryModel),
         prepareOptions: [{ id: "local", label: "Local utility", modelTarget: "utility" as const }],
       };
-      request.mockImplementation(async (method) => {
-        if (method === "openclaw.setup.prepare.start") {
-          return {
-            done: true,
-            status: "done",
-            ...(direct ? { preparedModelRef: utility.modelRef } : {}),
-          };
-        }
-        if (!direct && method === "openclaw.setup.detect") {
-          return {
-            ...prepared,
-            utilityModel: utility.modelRef,
-            candidates: usable ? [utility] : [],
-          };
-        }
-        if (method === "openclaw.setup.activate.start") {
-          return activatedUtility;
-        }
-        throw new Error(`Unexpected method ${method}`);
+      mockRequests(request, {
+        "openclaw.setup.prepare.start": () => ({
+          done: true,
+          status: "done",
+          ...(direct ? { preparedModelRef: utility.modelRef } : {}),
+        }),
+        ...(!direct
+          ? {
+              "openclaw.setup.detect": () => ({
+                ...prepared,
+                utilityModel: utility.modelRef,
+                candidates: usable ? [utility] : [],
+              }),
+            }
+          : {}),
+        "openclaw.setup.activate.start": () => activatedUtility,
       });
       const { page } = await mount(prepared, direct);
       pageButton(page, '[data-prepare-choice="local"] button')!.click();
@@ -238,7 +234,7 @@ describe("ModelSetupPage utility roles", () => {
     { replyTarget: "utility" as const, expected: true },
     { replyTarget: undefined, expected: false },
   ])(
-    "recovers only the owned utility verification alongside a primary with reply=$replyTarget",
+    "recovers utility verification only with reply=$replyTarget",
     async ({ replyTarget, expected }) => {
       const { context, request, mount } = createUtilityContext();
       persistFirstRunActivationReceipt(context, utility);
@@ -247,12 +243,7 @@ describe("ModelSetupPage utility roles", () => {
         modelRef: utility.modelRef,
         ...(replyTarget ? { modelTarget: replyTarget } : {}),
       });
-      const { page } = await mount({
-        candidates: [utility],
-        utilityModel: utility.modelRef,
-        configuredModel: "cloud/primary",
-        setupComplete: true,
-      });
+      const { page } = await mount({ ...configuredUtility, ...primaryModel });
       await waitForFast(() => expect(request).toHaveResolved());
       await page.updateComplete;
 

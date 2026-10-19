@@ -3,7 +3,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SystemAgentSetupDetectResult, WizardStep } from "../../api/types.ts";
 import { i18n } from "../../i18n/index.ts";
-import { detection as emptyDetection } from "./model-setup-first-run.test-support.ts";
+import {
+  detection as emptyDetection,
+  candidate,
+  authOption,
+} from "./model-setup-first-run.test-support.ts";
 import { activationTargetId } from "./state.ts";
 import {
   detected,
@@ -75,7 +79,7 @@ describe("renderModelSetup", () => {
     delete (document as unknown as { execCommand?: unknown }).execCommand;
   });
 
-  it("shows detected authentication without credential values", () => {
+  it("redacts detected credential values", () => {
     const detail = "logged in · ChatGPT account · alex@example.com";
     const secret = "synthetic-private-token";
     const container = mountDetected({
@@ -87,7 +91,7 @@ describe("renderModelSetup", () => {
     expect(text(row)).not.toContain(secret);
   });
 
-  it("derives prepare rows from accepted choice ids and hides usable local candidates", () => {
+  it("renders prepare choices except usable local models", () => {
     const onStartPrepare = vi.fn();
     const container = mount(props({ onStartPrepare }));
 
@@ -110,18 +114,16 @@ describe("renderModelSetup", () => {
       candidates: [
         ...detected.candidates,
         {
-          kind: "provider-auto:ollama",
+          ...candidate("provider-auto:ollama", "ollama/qwen3:8b"),
           label: "Ollama",
           detail: "available locally",
-          modelRef: "ollama/qwen3:8b",
-          recommended: false,
         },
       ],
     });
     expect(find(withUsableOllama, '[data-prepare-choice="ollama"]')).toBeNull();
   });
 
-  it("renders recommended install cards only when candidates and sign-ins are empty", () => {
+  it("recommends installs only without candidates or sign-ins", () => {
     const container = mountDetected({ candidates: [], authOptions: [] });
 
     expect(text(container)).toContain("Recommended installs");
@@ -142,7 +144,7 @@ describe("renderModelSetup", () => {
     expect(find(withSignIn, ".model-setup__empty")).toBeNull();
   });
 
-  it("uses explicit brand identity without guessing from labels or opaque ids", () => {
+  it("uses explicit brand identity", () => {
     const container = mountManual(
       {
         id: "custom-login",
@@ -157,7 +159,7 @@ describe("renderModelSetup", () => {
     expect(find<HTMLImageElement>(container, ".model-setup__manual img")).toBeNull();
   });
 
-  it("uses proxied artwork for unknown providers and invalidates broken blobs", () => {
+  it("uses proxied artwork and invalidates broken blobs", () => {
     const iconUrl = "https://cdn.example.com/acme.png";
     const onIconError = vi.fn();
     const container = mountManual(
@@ -172,16 +174,13 @@ describe("renderModelSetup", () => {
     expect(container.innerHTML).not.toContain(iconUrl);
   });
 
-  it("keeps saved replacement credentials selectable without repeating the current route", () => {
+  it("offers saved credentials without duplicating the current model", () => {
     const onActivateCandidate = vi.fn();
     const savedCandidate: SystemAgentSetupDetectResult["candidates"][number] = {
-      kind: "saved-auth:openai:replacement",
+      ...candidate("saved-auth:openai:replacement", "openai/gpt-5", true),
       brandId: "openai",
       label: "Saved OpenAI credentials",
       detail: "Saved for retry after a failed setup test",
-      modelRef: "openai/gpt-5",
-      recommended: false,
-      credentials: true,
     };
     const container = mountDetected(
       {
@@ -226,29 +225,32 @@ describe("renderModelSetup", () => {
     expect(onActivateCandidate).toHaveBeenCalledExactlyOnceWith(savedCandidate);
   });
 
-  it("renders connection verification progress", () => {
+  it.each([false, true])("renders connection verification (checking: %s)", (checking) => {
     const container = mountDetected(
       { configuredModel: "openai/gpt-5" },
-      { verify: { phase: "checking" }, actionsDisabled: true },
+      {
+        verify: checking
+          ? { phase: "checking" }
+          : { phase: "ok", modelRef: "anthropic/claude-opus-4-8", latencyMs: 1234 },
+        actionsDisabled: checking,
+      },
     );
-    expect(text(container)).toContain("Checking — asking openai/gpt-5 for a quick reply…");
-    expect(find<HTMLButtonElement>(container, ".model-setup__current button")?.disabled).toBe(true);
+    if (checking) {
+      expect(text(container)).toContain("Checking — asking openai/gpt-5 for a quick reply…");
+      expect(find<HTMLButtonElement>(container, ".model-setup__current button")?.disabled).toBe(
+        true,
+      );
+    } else {
+      expect(text(container)).toContain("Ready · 1234 ms");
+      const current = find(container, ".model-setup__current");
+      expect(current?.textContent).toContain("Anthropic");
+      expect(current?.textContent).toContain("claude-opus-4-8");
+      expect(current?.textContent).not.toContain("openai/gpt-5");
+      expect(current?.querySelector('[data-provider-icon="claude"]')).not.toBeNull();
+    }
   });
 
-  it("renders successful connection verification with the answering model", () => {
-    const container = mountDetected(
-      { configuredModel: "openai/gpt-5" },
-      { verify: { phase: "ok", modelRef: "anthropic/claude-opus-4-8", latencyMs: 1234 } },
-    );
-    expect(text(container)).toContain("Ready · 1234 ms");
-    const current = find(container, ".model-setup__current");
-    expect(current?.textContent).toContain("Anthropic");
-    expect(current?.textContent).toContain("claude-opus-4-8");
-    expect(current?.textContent).not.toContain("openai/gpt-5");
-    expect(current?.querySelector('[data-provider-icon="claude"]')).not.toBeNull();
-  });
-
-  it("shows the current model without verification controls for non-admin and unsupported gateways", () => {
+  it("hides verification without access or Gateway support", () => {
     const result = { ...detected, configuredModel: "openai/gpt-5" };
     const nonAdmin = mount(
       props({ page: { phase: "ready", result }, canAdmin: false, canVerify: false }),
@@ -306,7 +308,7 @@ describe("renderModelSetup", () => {
     { sensitive: false, expectedType: "text" },
     { sensitive: true, expectedType: "password" },
   ])(
-    "labels a $expectedType input and associates validation errors until recovery",
+    "labels $expectedType input and clears recovered validation errors",
     ({ sensitive, expectedType }) => {
       const container = document.body.appendChild(document.createElement("div"));
       const renderStep = (validationError: string | null) =>
@@ -343,7 +345,7 @@ describe("renderModelSetup", () => {
   );
 
   it.each([{ canAdmin: false }, { gatewayTooOld: true }])(
-    "keeps activation feedback behind setup access: %j",
+    "gates activation feedback on access: %j",
     (access) => {
       const container = mount(
         props({
@@ -365,124 +367,108 @@ describe("renderModelSetup", () => {
   it.each([
     { entry: "discovered", targetId: activationTargetId("codex-cli", "openai/gpt-5") },
     { entry: "manual", targetId: "manual:openai" },
-  ])(
-    "keeps one activation status and failure visible for $entry targets",
-    ({ entry, targetId }) => {
-      const viewProps = props({
-        activation: { phase: "testing", targetId },
-        actionsDisabled: true,
-        manualApiKey: "test-only-secret",
-      });
-      const container = mount(viewProps);
-      expect(container.querySelectorAll('[role="status"]')).toHaveLength(1);
-      expect(text(find(container, '[role="status"]')!)).toContain("Testing");
-      expect(text(container)).not.toContain("test-only-secret");
-      const button = find<HTMLButtonElement>(
-        container,
-        entry === "discovered"
-          ? '[data-candidate-kind="codex-cli"] button'
-          : ".model-setup__manual .btn.primary",
-      )!;
-      expect(button.disabled).toBe(true);
-      expect(text(button)).toBe("Testing…");
+  ])("retains activation feedback for $entry targets", ({ entry, targetId }) => {
+    const viewProps = props({
+      activation: { phase: "testing", targetId },
+      actionsDisabled: true,
+      manualApiKey: "test-only-secret",
+    });
+    const container = mount(viewProps);
+    expect(container.querySelectorAll('[role="status"]')).toHaveLength(1);
+    expect(text(find(container, '[role="status"]')!)).toContain("Testing");
+    expect(text(container)).not.toContain("test-only-secret");
+    const button = find<HTMLButtonElement>(
+      container,
+      entry === "discovered"
+        ? '[data-candidate-kind="codex-cli"] button'
+        : ".model-setup__manual .btn.primary",
+    )!;
+    expect(button.disabled).toBe(true);
+    expect(text(button)).toBe("Testing…");
 
-      viewProps.activation = {
-        phase: "failure",
-        targetId,
-        status: "timeout",
-        error: "No reply received",
-      };
-      viewProps.actionsDisabled = false;
-      renderSetup(viewProps, container);
-      expect(container.querySelectorAll('[role="status"]')).toHaveLength(0);
-      expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
-      expect(text(find(container, '[role="alert"]')!)).toContain("No reply received");
-      expect(text(find(container, '[role="alert"]')!)).toContain(
-        "Warm it or choose a faster model, then retry.",
-      );
-      expect(button.disabled).toBe(false);
-      if (entry === "discovered") {
-        expect(text(button)).toBe("Retry test");
-        button.click();
-        expect(viewProps.onActivateCandidate).toHaveBeenCalledWith(detected.candidates[0]);
-      } else {
-        expect(text(button)).toBe("Connect & verify");
-        button.click();
-        expect(viewProps.onManualConnect).toHaveBeenCalledOnce();
-      }
+    viewProps.activation = {
+      phase: "failure",
+      targetId,
+      status: "timeout",
+      error: "No reply received",
+    };
+    viewProps.actionsDisabled = false;
+    renderSetup(viewProps, container);
+    expect(container.querySelectorAll('[role="status"]')).toHaveLength(0);
+    expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
+    expect(text(find(container, '[role="alert"]')!)).toContain("No reply received");
+    expect(text(find(container, '[role="alert"]')!)).toContain(
+      "Warm it or choose a faster model, then retry.",
+    );
+    expect(button.disabled).toBe(false);
+    if (entry === "discovered") {
+      expect(text(button)).toBe("Retry test");
+      button.click();
+      expect(viewProps.onActivateCandidate).toHaveBeenCalledWith(detected.candidates[0]);
+    } else {
+      expect(text(button)).toBe("Connect & verify");
+      button.click();
+      expect(viewProps.onManualConnect).toHaveBeenCalledOnce();
+    }
 
-      viewProps.page = { phase: "ready", result: { ...detected, candidates: [] } };
-      viewProps.manualProviderId = "gemini-api-key";
-      renderSetup(viewProps, container);
-      expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
-      expect(text(find(container, '[role="alert"]')!)).toContain("No reply received");
-      viewProps.page = { phase: "loading" };
-      renderSetup(viewProps, container);
-      expect(text(find(container, '[role="alert"]')!)).toContain("No reply received");
-      viewProps.page = { phase: "ready", result: { ...detected, candidates: [] } };
-      viewProps.activation = { phase: "testing", targetId };
-      renderSetup(viewProps, container);
-      expect(container.querySelectorAll('[role="status"]')).toHaveLength(1);
-      expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
-    },
-  );
+    viewProps.page = { phase: "ready", result: { ...detected, candidates: [] } };
+    viewProps.manualProviderId = "gemini-api-key";
+    renderSetup(viewProps, container);
+    expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
+    expect(text(find(container, '[role="alert"]')!)).toContain("No reply received");
+    viewProps.page = { phase: "loading" };
+    renderSetup(viewProps, container);
+    expect(text(find(container, '[role="alert"]')!)).toContain("No reply received");
+    viewProps.page = { phase: "ready", result: { ...detected, candidates: [] } };
+    viewProps.activation = { phase: "testing", targetId };
+    renderSetup(viewProps, container);
+    expect(container.querySelectorAll('[role="status"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
+  });
 
-  it.each([false, true])(
-    "filters credential choices while retaining setup-only methods: %s",
-    (setupOnly) => {
-      const onStartAuth = vi.fn();
-      const onManualConnect = vi.fn();
-      const install = {
-        id: "install-provider",
-        label: "Installable provider",
-        kind: "install" as const,
-        featured: false,
-      };
-      const custom = {
-        id: "custom-endpoint",
-        label: "Compatible endpoint",
-        kind: "custom" as const,
-        featured: false,
-      };
-      const container = mountDetected(
-        {
-          configuredModel: "openai/gpt-5.6-luna",
-          authOptions: [...(detected.authOptions ?? []), install, custom],
-          manualProviders: setupOnly
-            ? [{ id: "special-token", brandId: "openai", label: "Special account token" }]
-            : detected.manualProviders,
-        },
-        {
-          embedded: true,
-          agentLabel: "Writer",
-          credentialChoices: ["openai-oauth", "other-device", "openai", "gemini-api-key"],
-          manualProviderId: "special-token",
-          manualApiKey: "synthetic-token",
-          onStartAuth,
-          onManualConnect,
-        },
-      );
-      expect(find(container, ".content-header")).toBeNull();
-      expect(find(container, ".model-setup__current")).toBeNull();
-      expect(text(container)).toContain("for Writer");
-      expect(text(container)).toContain("not the global defaults");
-      expect(find(container, '[data-auth-choice="openai-oauth"]')).toBeNull();
-      expect(find(container, '[data-prepare-choice="ollama"]')).not.toBeNull();
-      for (const option of [install, custom]) {
-        find<HTMLButtonElement>(container, `[data-auth-choice="${option.id}"] button`)!.click();
-        expect(onStartAuth).toHaveBeenLastCalledWith(option);
-      }
-      if (setupOnly) {
-        expect(find(container, '[data-manual-provider="special-token"]')).not.toBeNull();
-        find<HTMLButtonElement>(container, ".model-setup__manual button.primary")!.click();
-        expect(onManualConnect).toHaveBeenCalledOnce();
-      } else {
-        expect(find(container, ".model-setup__manual")).toBeNull();
-      }
-    },
-  );
+  it.each([false, true])("filters credentials but retains setup methods: %s", (setupOnly) => {
+    const onStartAuth = vi.fn();
+    const onManualConnect = vi.fn();
+    const install = authOption("install-provider", "Installable provider", "install", false);
+    const custom = authOption("custom-endpoint", "Compatible endpoint", "custom", false);
+    const container = mountDetected(
+      {
+        configuredModel: "openai/gpt-5.6-luna",
+        authOptions: [...(detected.authOptions ?? []), install, custom],
+        manualProviders: setupOnly
+          ? [{ id: "special-token", brandId: "openai", label: "Special account token" }]
+          : detected.manualProviders,
+      },
+      {
+        embedded: true,
+        agentLabel: "Writer",
+        credentialChoices: ["openai-oauth", "other-device", "openai", "gemini-api-key"],
+        manualProviderId: "special-token",
+        manualApiKey: "synthetic-token",
+        onStartAuth,
+        onManualConnect,
+      },
+    );
+    expect(find(container, ".content-header")).toBeNull();
+    expect(find(container, ".model-setup__current")).toBeNull();
+    expect(text(container)).toContain("for Writer");
+    expect(text(container)).toContain("not the global defaults");
+    expect(find(container, '[data-auth-choice="openai-oauth"]')).toBeNull();
+    expect(find(container, '[data-prepare-choice="ollama"]')).not.toBeNull();
+    for (const option of [install, custom]) {
+      find<HTMLButtonElement>(container, `[data-auth-choice="${option.id}"] button`)!.click();
+      expect(onStartAuth).toHaveBeenLastCalledWith(option);
+    }
+    if (setupOnly) {
+      expect(find(container, '[data-manual-provider="special-token"]')).not.toBeNull();
+      find<HTMLButtonElement>(container, ".model-setup__manual button.primary")!.click();
+      expect(onManualConnect).toHaveBeenCalledOnce();
+    } else {
+      expect(find(container, ".model-setup__manual")).toBeNull();
+    }
+  });
 
-  it("notifies the discovery owner only when its own modal is shown", () => {
+  it("notifies discovery only for its own modal", () => {
     const onDiscoveryShown = vi.fn();
     const container = mount(props({ embedded: true, onDiscoveryShown }));
     const modal = find(container, "openclaw-modal-dialog")!;
@@ -494,74 +480,68 @@ describe("renderModelSetup", () => {
     expect(onDiscoveryShown).toHaveBeenCalledOnce();
   });
 
-  it.each(["wizard", "primary", "utility"] as const)(
-    "leaves the %s dialog in control of its action",
-    (mode) => {
-      const onWizardCancel = vi.fn();
-      const onClose = vi.fn();
-      const onOpenChat = vi.fn();
-      const onOpenSetupAssistant = vi.fn();
-      const container = mount(
-        props({
-          embedded: true,
-          onClose,
-          onWizardCancel,
-          onOpenChat,
-          onOpenSetupAssistant,
-          ...(mode === "wizard"
-            ? {
-                wizard: {
-                  phase: "step",
-                  authChoice: "local",
-                  busy: false,
-                  validationError: null,
-                  step: { id: "choice", type: "confirm", message: "Prepare local model?" },
-                },
-              }
-            : {
-                activation: {
-                  phase: "success",
-                  modelRef: mode === "utility" ? "local/setup" : "openai/gpt-5.6-luna",
-                  ...(mode === "utility" ? { modelTarget: "utility" } : {}),
-                },
-              }),
-        }),
+  it.each(["wizard", "primary", "utility"] as const)("routes %s dialog actions", (mode) => {
+    const onWizardCancel = vi.fn();
+    const onClose = vi.fn();
+    const onOpenChat = vi.fn();
+    const onOpenSetupAssistant = vi.fn();
+    const container = mount(
+      props({
+        embedded: true,
+        onClose,
+        onWizardCancel,
+        onOpenChat,
+        onOpenSetupAssistant,
+        ...(mode === "wizard"
+          ? {
+              wizard: {
+                phase: "step",
+                authChoice: "local",
+                busy: false,
+                validationError: null,
+                step: { id: "choice", type: "confirm", message: "Prepare local model?" },
+              },
+            }
+          : {
+              activation: {
+                phase: "success",
+                modelRef: mode === "utility" ? "local/setup" : "openai/gpt-5.6-luna",
+                ...(mode === "utility" ? { modelTarget: "utility" } : {}),
+              },
+            }),
+      }),
+    );
+    const dialogs = container.querySelectorAll("openclaw-modal-dialog");
+    expect(dialogs).toHaveLength(1);
+    if (mode === "wizard") {
+      expect(find(container, ".model-setup__intro")).toBeNull();
+      dialogs[0]!.dispatchEvent(
+        new CustomEvent("modal-cancel", { bubbles: true, cancelable: true }),
       );
-      const dialogs = container.querySelectorAll("openclaw-modal-dialog");
-      expect(dialogs).toHaveLength(1);
-      if (mode === "wizard") {
-        expect(find(container, ".model-setup__intro")).toBeNull();
-        dialogs[0]!.dispatchEvent(
-          new CustomEvent("modal-cancel", { bubbles: true, cancelable: true }),
-        );
-        expect(onWizardCancel).toHaveBeenCalledOnce();
-        expect(onClose).not.toHaveBeenCalled();
+      expect(onWizardCancel).toHaveBeenCalledOnce();
+      expect(onClose).not.toHaveBeenCalled();
+    } else {
+      const success = find(container, ".model-setup-success")!;
+      const done = find<HTMLButtonElement>(success, "button.primary")!;
+      if (mode === "utility") {
+        expect(text(success)).toContain("Setup & utility model ready");
+        expect(text(success)).not.toContain("Active model");
+        expect(text(success)).not.toContain("Return to Models");
+        done.click();
+        expect(onOpenSetupAssistant).toHaveBeenCalledOnce();
+        expect(onOpenChat).not.toHaveBeenCalled();
       } else {
-        const success = find(container, ".model-setup-success")!;
-        const done = find<HTMLButtonElement>(success, "button.primary")!;
-        if (mode === "utility") {
-          expect(text(success)).toContain("Setup & utility model ready");
-          expect(text(success)).not.toContain("Active model");
-          expect(text(success)).not.toContain("Return to Models");
-          done.click();
-          expect(onOpenSetupAssistant).toHaveBeenCalledOnce();
-          expect(onOpenChat).not.toHaveBeenCalled();
-        } else {
-          expect(done.textContent).toContain("Return to Models");
-          done.click();
-          expect(onOpenChat).toHaveBeenCalledOnce();
-        }
+        expect(done.textContent).toContain("Return to Models");
+        done.click();
+        expect(onOpenChat).toHaveBeenCalledOnce();
       }
-    },
-  );
+    }
+  });
 
-  it("keeps utility actions distinct from agent primary selection during rescans", () => {
+  it("keeps utility and primary actions distinct during rescans", () => {
     const utility = {
-      kind: "provider-auto:local" as const,
+      ...candidate("provider-auto:local", "local/setup"),
       label: "Local utility",
-      detail: "Available on this Gateway",
-      modelRef: "local/setup",
-      recommended: false,
       modelTarget: "utility" as const,
     };
     const onActivateCandidate = vi.fn();
@@ -590,7 +570,7 @@ describe("renderModelSetup", () => {
     expect([...buttons].every((button) => button.disabled)).toBe(true);
   });
 
-  it("keeps durable continuation without duplicating a fresh success action", () => {
+  it("retains one continuation after success", () => {
     const onOpenChat = vi.fn();
     const container = mount({ ...firstRunProps(), onOpenChat });
 
