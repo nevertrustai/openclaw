@@ -32,18 +32,25 @@ const extensionArgs = (...args: string[]) => [
   ...args,
 ];
 
-type Fixture = Awaited<ReturnType<typeof fixture>>;
-function cli(value: Fixture, config: string, args: string[], input?: Buffer) {
-  return spawnSync(process.execPath, args, {
-    input,
-    timeout: 20_000,
-    env: {
-      HOME: value.homeDir,
-      OPENCLAW_STATE_DIR: value.stateDir,
-      OPENCLAW_CONFIG_PATH: config,
-      BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
-    },
-  });
+async function cliFixture(configText = "{ invalid config") {
+  const value = await fixture();
+  const config = path.join(value.root, "invalid-config.json");
+  await writePrivate(config, configText);
+  return {
+    ...value,
+    config,
+    invoke: (args: string[], request?: unknown) =>
+      spawnSync(process.execPath, args, {
+        input: request === undefined ? undefined : nativeFrame(request),
+        timeout: 20_000,
+        env: {
+          HOME: value.homeDir,
+          OPENCLAW_STATE_DIR: value.stateDir,
+          OPENCLAW_CONFIG_PATH: config,
+          BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
+        },
+      }),
+  };
 }
 
 function nativeFrame(request: unknown): Buffer {
@@ -84,32 +91,22 @@ function nativeArgs(
 // POSIX launcher/CLI proof. The Windows PE/ACL/registry lane needs a real Windows host.
 describe.skipIf(process.platform === "win32")("native host registration", () => {
   it("does not inspect or migrate configuration before rejecting a malformed native request", async () => {
-    const value = await fixture();
-    const configPath = path.join(value.root, "malformed-config.json");
     const original = "{ deliberately invalid config";
-    await writePrivate(configPath, original);
-    const child = cli(
-      value,
-      configPath,
-      nativeArgs(
-        path.join(value.root, "not-read-before-framing.json"),
-        path.join(value.root, "not-read-before-framing-host"),
-      ),
-      nativeFrame({ v: 1, op: "bootstrap", nonce: "!" }),
-    );
+    const value = await cliFixture(original);
+    const unread = path.join(value.root, "not-read-before-framing");
+    const child = value.invoke(nativeArgs(unread, unread), { v: 1, op: "bootstrap", nonce: "!" });
     expect(nativeResponse(child)).toMatchObject({ ok: false, code: "invalid_request" });
-    expect(await fs.readFile(configPath, "utf8")).toBe(original);
+    expect(await fs.readFile(value.config, "utf8")).toBe(original);
     await expect(fs.stat(value.stateDir)).rejects.toMatchObject({ code: "ENOENT" });
   });
   it.each(["bootstrap", "ensure_relay"])(
     "rejects an unauthorized %s caller before config, keys or database creation",
     async (op) => {
-      const value = await fixture();
+      const value = await cliFixture();
       const directory = path.join(value.stateDir, "browser", "native-messaging");
       await fs.mkdir(directory, { recursive: true, mode: 0o700 });
       const launcher = path.join(directory, "host");
       const manifest = path.join(directory, "manifest.json");
-      const config = path.join(value.root, "invalid-config.json");
       await writePrivate(launcher, "fixture owned launcher", 0o700);
       await writeJson(manifest, {
         name: "ai.openclaw.browser_bootstrap",
@@ -118,21 +115,20 @@ describe.skipIf(process.platform === "win32")("native host registration", () => 
         type: "stdio",
         allowed_origins: [origin],
       });
-      await writePrivate(config, "{ invalid config");
       const before = (await fs.readdir(value.homeDir, { recursive: true })).toSorted();
-      const frame = nativeFrame({
+      const request = {
         v: 1,
         op,
         nonce,
         ...(op === "ensure_relay" ? { relayPort: 19031 } : {}),
-      });
+      };
       const args = nativeArgs(
         manifest,
         launcher,
         [origin],
         "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
       );
-      const invoke = () => cli(value, config, args, frame);
+      const invoke = () => value.invoke(args, request);
       const denied = invoke();
       const refusal = { v: 1, ok: false, code: "origin_forbidden" };
       expect(nativeResponse(denied)).toEqual(refusal);
@@ -143,7 +139,7 @@ describe.skipIf(process.platform === "win32")("native host registration", () => 
       const unsafe = invoke();
       expect(nativeResponse(unsafe)).toEqual({ v: 1, ok: false, code: "manifest_invalid" });
       expect((await fs.readdir(value.homeDir, { recursive: true })).toSorted()).toEqual(before);
-      expect(await fs.readFile(config, "utf8")).toBe("{ invalid config");
+      expect(await fs.readFile(value.config, "utf8")).toBe("{ invalid config");
     },
   );
 
@@ -152,19 +148,17 @@ describe.skipIf(process.platform === "win32")("native host registration", () => 
     ["setup", "--action", "inspect", "--json"],
     ["pair", "--json"],
   ])("preserves invalid-config diagnostics for ordinary extension command %j", async (...args) => {
-    const value = await fixture();
-    const config = path.join(value.root, "invalid-config.json");
-    await writePrivate(config, "{ invalid config");
-    const child = cli(value, config, extensionArgs(...args));
+    const value = await cliFixture();
+    const child = value.invoke(extensionArgs(...args));
     expect(child.status).toBe(1);
     const stderr = child.stderr.toString("utf8");
     expect(stderr).toContain("[openclaw] The CLI command failed.");
-    expect(stderr).toContain(`Invalid config at ${config}:`);
+    expect(stderr).toContain(`Invalid config at ${value.config}:`);
     expect(stderr).toContain(
       "- <root>: JSON5 parse failed: SyntaxError: JSON5: invalid character 'c' at 1:11",
     );
     expect(stderr).toContain("[openclaw] For help, run `openclaw doctor`.");
-    expect(await fs.readFile(config, "utf8")).toBe("{ invalid config");
+    expect(await fs.readFile(value.config, "utf8")).toBe("{ invalid config");
   });
 
   it.each(["launcher", "cli"])(

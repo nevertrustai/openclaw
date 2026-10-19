@@ -59,6 +59,13 @@ export type InstallFixture = {
 
 function selectFixture(fixture: InstallFixture = {}) {
   const restores: Array<() => void> = [];
+  const setEnv = (key: string, value: string | undefined) => {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  };
   const property = (name: "platform" | "execPath" | "argv", value: unknown) => {
     const descriptor = Object.getOwnPropertyDescriptor(process, name)!;
     // A data override must not retain an accessor's get/set fields.
@@ -93,18 +100,8 @@ function selectFixture(fixture: InstallFixture = {}) {
     ...Object.keys(env),
   ])) {
     const previous = process.env[key];
-    if (env[key] === undefined) {
-      delete process.env[key];
-    } else {
-      process.env[key] = env[key];
-    }
-    restores.push(() => {
-      if (previous === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = previous;
-      }
-    });
+    setEnv(key, env[key]);
+    restores.push(() => setEnv(key, previous));
   }
   if (fixture.now) {
     const now = vi.spyOn(Date, "now").mockImplementation(fixture.now);
