@@ -269,11 +269,11 @@ describe("cron CLI with the real Gateway pagination contract", () => {
         });
       }
     } else {
-      const output = mocks.runtime.log.mock.calls.map(([line]) => line).join("\n");
+      const rendered = mocks.runtime.log.mock.calls.map(([line]) => line).join("\n");
       for (const id of ids) {
-        expect(output).toContain(id);
+        expect(rendered).toContain(id);
       }
-      expect(output.split("\n").find((line) => line.includes("job-002"))).toContain("ops");
+      expect(rendered.split("\n").find((line) => line.includes("job-002"))).toContain("ops");
     }
   });
 
