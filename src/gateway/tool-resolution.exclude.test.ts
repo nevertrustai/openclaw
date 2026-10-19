@@ -199,7 +199,7 @@ describe("resolveGatewayScopedTools excludeToolNames", () => {
   it.each([
     ["loopback", undefined, "missing", false, false],
     ["loopback", false, "live", false, true],
-    ["loopback", false, "retired", false, false],
+    ["loopback", false, "retired", false, true],
     ["loopback", false, "live", true, false],
     ["http", false, "live", false, false],
     ["http", true, "missing", false, true],
@@ -213,7 +213,8 @@ describe("resolveGatewayScopedTools excludeToolNames", () => {
         if (authority === "retired") {
           admission.close();
         }
-        createTools.mockReturnValueOnce([makeTool("sessions")]);
+        const sessions = makeTool("sessions");
+        createTools.mockReturnValueOnce([sessions]);
         const result = await resolveTools({
           cfg: {
             gateway: { tools: { allow: ["sessions"] } },
@@ -225,6 +226,17 @@ describe("resolveGatewayScopedTools excludeToolNames", () => {
           admittedRunContext,
         });
         expect(result.tools.some((tool) => tool.name === "sessions")).toBe(available);
+        if (authority === "retired") {
+          await expect(result.tools[0]?.execute("retired-assignment", {})).resolves.toMatchObject({
+            content: [
+              {
+                type: "text",
+                text: "sessions needs the owner's authority, and this turn was not started by the owner. Do not retry sessions.",
+              },
+            ],
+          });
+          expect(sessions.execute).not.toHaveBeenCalled();
+        }
         expect(readCreateToolsArgs().senderIsOwner).toBe(senderIsOwner);
       } finally {
         admission.close();

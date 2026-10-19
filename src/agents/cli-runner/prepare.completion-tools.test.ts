@@ -10,10 +10,12 @@ import { assertNoRetainedSessionSharingReads } from "../../config/sessions/sessi
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { mintMcpLoopbackClientGrant as MintMcpLoopbackClientGrant } from "../../gateway/mcp-grant-store.js";
+import { handleMcpJsonRpc } from "../../gateway/mcp-http.handlers.js";
 import {
   resolveMcpLoopbackPolicyTools,
   resolveMcpLoopbackScopedTools,
 } from "../../gateway/mcp-http.runtime.js";
+import { buildMcpToolSchema } from "../../gateway/mcp-http.schema.js";
 import type { CliBackendPlugin } from "../../plugins/cli-backend.types.js";
 import { testing as cliBackendsTesting } from "../cli-backends.test-support.js";
 import {
@@ -513,7 +515,7 @@ describe("restricted CLI tool preparation", () => {
     expect(mintGrant).not.toHaveBeenCalled();
   });
 
-  it("mediates trusted completion tools with persisted requester policy", async () => {
+  it("keeps the CLI catalog stable while gating persisted completion authority", async () => {
     const { sessionTarget } = fixture.session;
     const childSessionKey = "agent:main:subagent:completion-review";
     const inheritedToolDeny = ["terminal", "gateway", "write", "edit", "apply_patch"];
@@ -540,38 +542,106 @@ describe("restricted CLI tool preparation", () => {
       provider: "claude-cli",
       model: "opus",
     };
-    const context = await fixture.prepare({
+    const run = {
       sessionKey: sessionTarget.sessionKey,
       sessionId: sessionTarget.sessionId,
       provider: "claude-cli",
       model: "opus",
       modelHasVision: false,
       sourceReplyDeliveryMode: "automatic",
+      toolsAllow: ["read", "exec", "write", "gateway"],
+      config: {
+        session: { store: sessionTarget.storePath },
+        tools: {
+          deny: ["apply_patch"],
+          toolsBySender: {
+            "id:owner": { allow: ["*"] },
+            "*": { deny: ["group:runtime", "group:fs"] },
+          },
+        },
+        mcp: { servers: { userProbe: { command: "node", args: ["user-probe.mjs"] } } },
+      },
+    } satisfies Partial<RunCliAgentParams>;
+    const owner = await fixture.prepare({ ...run, senderId: "owner", senderIsOwner: true });
+    const ownerGrant = mintGrant.mock.calls[0]![0].context;
+    const ownerTools = await resolveMcpLoopbackScopedTools({
+      cfg: run.config,
+      context: ownerGrant,
+      admittedRunContext: owner.params.admittedRunContext,
+    });
+    await owner.preparedBackend.cleanup?.();
+    setCliRunnerPrepareTestDeps({
+      claudeCliSessionTranscriptHasContent: async () => true,
+      claudeCliSessionTranscriptHasOrphanedToolUse: async () => false,
+    });
+    const context = await fixture.prepare({
+      ...run,
+      senderIsOwner: false,
+      cliSessionBinding: {
+        sessionId: "native-parent-session",
+        authEpoch: owner.authEpoch,
+        authEpochVersion: owner.authEpochVersion,
+        extraSystemPromptHash: owner.extraSystemPromptHash,
+        messageToolPolicyHash: owner.messageToolPolicyHash,
+        promptToolNamesHash: owner.promptToolNamesHash,
+        cwdHash: owner.cwdHash,
+        mcpConfigHash: owner.preparedBackend.mcpConfigHash,
+        mcpResumeHash: owner.preparedBackend.mcpResumeHash,
+      },
       trustedInternalHandoff,
       inputProvenance: {
         kind: "inter_session",
         sourceTool: "subagent_announce",
         sourceSessionKey: childSessionKey,
       },
-      config: {
-        session: { store: sessionTarget.storePath },
-        tools: {
-          toolsBySender: { "*": { deny: ["group:runtime", "group:fs"] } },
-        },
-        mcp: { servers: { userProbe: { command: "node", args: ["user-probe.mjs"] } } },
-      },
     });
     try {
-      const grant = mintGrant.mock.calls[0]?.[0]?.context;
+      const grant = mintGrant.mock.calls[1]![0].context;
       expect(grant).toBeDefined();
       expect(context.params.cliToolAvailability?.native).toEqual([]);
-      expect(grant?.toolsAllow).toEqual(expect.arrayContaining(["read", "exec"]));
-      expect(grant?.toolsAllow).toEqual(context.params.cliToolAvailability?.openClaw);
-      for (const denied of inheritedToolDeny) {
-        expect(grant?.toolsAllow).not.toContain(denied);
+      expect(ownerGrant.toolsAllow?.toSorted()).toEqual(["exec", "gateway", "read", "write"]);
+      expect(grant.toolsAllow).toEqual(ownerGrant.toolsAllow);
+      expect(context.promptToolNamesHash).toBe(owner.promptToolNamesHash);
+      expect(context.reusableCliSession).toEqual({
+        mode: "reuse",
+        sessionId: "native-parent-session",
+      });
+      expect(grant.toolsAllow).toEqual(context.params.cliToolAvailability?.openClaw);
+      expect(grant.trustedInternalHandoff).toEqual(trustedInternalHandoff);
+      const scoped = await resolveMcpLoopbackScopedTools({
+        cfg: run.config,
+        context: grant,
+        admittedRunContext: context.params.admittedRunContext,
+      });
+      const toolSchema = buildMcpToolSchema(scoped.tools);
+      expect(toolSchema).toEqual(buildMcpToolSchema(ownerTools.tools));
+      const deniedPath = path.join(fixture.session.dir, "completion-must-not-write.txt");
+      for (const [name, args, denial] of [
+        [
+          "write",
+          { path: deniedPath, content: "must not execute" },
+          "write is outside the authority this completion turn carries from its requester. Do not retry write.",
+        ],
+        [
+          "gateway",
+          { action: "config.get" },
+          "gateway needs the owner's authority, and this turn was not started by the owner. Do not retry gateway.",
+        ],
+      ] as const) {
+        await expect(
+          handleMcpJsonRpc({
+            message: {
+              jsonrpc: "2.0",
+              id: name,
+              method: "tools/call",
+              params: { name, arguments: args },
+            },
+            tools: scoped.tools,
+            toolSchema,
+          }),
+        ).resolves.toMatchObject({ result: { content: [{ type: "text", text: denial }] } });
       }
-      expect(grant?.trustedInternalHandoff).toEqual(trustedInternalHandoff);
-      expect(grant?.toolsAllow?.toSorted()).toEqual(["exec", "read"]);
+      expect(fs.existsSync(deniedPath)).toBe(false);
       const args = context.preparedBackend.backend.args ?? [];
       const mcpConfigPath = args[args.indexOf("--mcp-config") + 1];
       const bundle = JSON.parse(fs.readFileSync(mcpConfigPath ?? "", "utf-8")) as {
