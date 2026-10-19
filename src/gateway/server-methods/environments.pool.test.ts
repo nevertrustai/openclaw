@@ -164,12 +164,10 @@ it.each(["environments.list", "environments.status"] as const)(
     const waitForDiscovery = async () => {
       entered.resolve();
       await release.promise;
+      return undefined;
     };
     if (method === "environments.list") {
-      vi.mocked(service.listMachineOptions).mockImplementation(async () => {
-        await waitForDiscovery();
-        return undefined;
-      });
+      vi.mocked(service.listMachineOptions).mockImplementation(waitForDiscovery);
     } else {
       vi.mocked(readDevicePairingNodeSnapshot).mockImplementation(async () => {
         await waitForDiscovery();

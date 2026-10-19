@@ -14,7 +14,6 @@ import { summarizeWorkerEnvironment } from "../worker-environments/environment-s
 import {
   callEnvironmentMethod as call,
   createDevicePairingNodeSnapshot,
-  FakeWorkerServiceError,
   invokeEnvironment as invoke,
   mockContext,
   nodeCatalogState,
@@ -46,7 +45,7 @@ const workerId = { environmentId: "worker-1" };
 const createParams = { profileId: "development", idempotencyKey: "request-1" };
 function rejectService(code: string, detail: string) {
   return vi.fn(async () => {
-    throw new FakeWorkerServiceError(code, detail);
+    throw Object.assign(new Error(detail), { code });
   });
 }
 function expectFailure(response: unknown[], code: string, message: string) {
@@ -392,11 +391,8 @@ it("hides provider failure details when worker creation fails", async () => {
 });
 
 it("launches only a closed advertised desktop app and returns readiness", async () => {
-  const launchDesktopApp = vi.fn(async ({ app }: { app: "browser" | "terminal" }) => ({
-    app,
-    status: "ready" as const,
-  }));
-  const service = workerService({ launchDesktopApp });
+  const service = workerService();
+  const { launchDesktopApp } = service;
   const result = await call(
     "worker.desktop.launch",
     { environmentId: "worker-1", app: "browser" },

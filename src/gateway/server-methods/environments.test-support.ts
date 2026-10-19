@@ -221,13 +221,8 @@ export const workerService = (overrides: Partial<TestWorkerService> = {}) => ({
 
 export async function callEnvironmentMethod(
   method:
-    | "environments.list"
-    | "environments.status"
-    | "environments.create"
-    | "environments.prepare"
-    | "environments.destroy"
-    | "worker.desktop.observe"
-    | "worker.desktop.launch",
+    | `environments.${"list" | "status" | "create" | "prepare" | "destroy"}`
+    | `worker.desktop.${"observe" | "launch"}`,
   params: unknown,
   options: {
     service?: TestWorkerService;
@@ -248,13 +243,4 @@ export async function callEnvironmentMethod(
     ),
     options.scopes ? { connect: { scopes: options.scopes } } : null,
   );
-}
-
-export class FakeWorkerServiceError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-  ) {
-    super(message);
-  }
 }

@@ -43,7 +43,6 @@ vi.mock("../worker-environments/placement-capabilities.js", () => ({
 }));
 
 beforeEach(() => {
-  vi.mocked(readDevicePairingNodeSnapshot).mockResolvedValue(createDevicePairingNodeSnapshot([]));
   const plugins = createEmptyPluginRegistry();
   plugins.nodeHostCommands.push({
     pluginId: "codex",

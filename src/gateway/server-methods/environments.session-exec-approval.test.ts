@@ -85,18 +85,17 @@ it.for([
         execApprovalManager: manager,
         forwardExecApprovalRequest: route !== "ios" ? forward : undefined,
         execApprovalIosPushDelivery: {
-          ...(route !== "forward" ? { handleRequested: ios } : {}),
+          handleRequested: route !== "forward" ? ios : undefined,
           handleExpired: expired,
         },
-        ...(route === "all"
-          ? {
-              approvalWebPushDelivery: {
+        approvalWebPushDelivery:
+          route === "all"
+            ? {
                 handleRequested: webPush,
                 handleResolved: async () => {},
                 handleExpired: async () => {},
-              },
-            }
-          : {}),
+              }
+            : undefined,
       }),
     );
     if (outcome === "cron") {

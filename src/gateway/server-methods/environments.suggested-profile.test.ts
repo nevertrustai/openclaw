@@ -152,11 +152,16 @@ function adoptionHarness(getRuntimeConfig = () => storedConfig) {
   });
 }
 
-it.each([undefined, {}])(
-  "lists a suggestion without admitting a cloud destination (%j)",
-  async (profiles) => {
+it.each([
+  { profiles: undefined, suggested: true },
+  { profiles: {}, suggested: true },
+  { profiles: undefined, suggested: false },
+  { profiles: { custom: { provider: "static-ssh" } }, suggested: false },
+] as const)(
+  "lists $profiles with suggestion=$suggested without admitting a destination",
+  async ({ profiles, suggested: available }) => {
     storedConfig = { cloudWorkers: { profiles } };
-    vi.mocked(resolveSuggestedWorkerProfile).mockResolvedValue(suggested);
+    vi.mocked(resolveSuggestedWorkerProfile).mockResolvedValue(available ? suggested : undefined);
     const { options, respond } = createConfigHandlerHarness({
       method: "environments.list",
       params: { projection: "profiles" },
@@ -167,29 +172,13 @@ it.each([undefined, {}])(
       true,
       {
         environments: [],
-        suggestedProfile: { id: "cloud", providerId: "crabbox" },
+        ...(available ? { suggestedProfile: { id: "cloud", providerId: "crabbox" } } : {}),
       },
       undefined,
     );
     expectDestination(storedConfig, false);
     expect(configWriteMocks.commitGatewayConfigWrite).not.toHaveBeenCalled();
-  },
-);
-
-it.each([false, true])(
-  "omits suggestions with configured profiles or unavailable discovery (%s)",
-  async (configured) => {
-    if (configured) {
-      storedConfig = { cloudWorkers: { profiles: { custom: { provider: "static-ssh" } } } };
-    }
-    const { options, respond } = createConfigHandlerHarness({
-      method: "environments.list",
-      params: { projection: "profiles" },
-      contextOverrides: { getRuntimeConfig: () => storedConfig },
-    });
-    await environmentsHandlers["environments.list"]!(options);
-    expect(respond).toHaveBeenCalledWith(true, { environments: [] }, undefined);
-    if (configured) {
+    if (profiles && "custom" in profiles) {
       expect(resolveSuggestedWorkerProfile).not.toHaveBeenCalled();
     }
   },
@@ -204,43 +193,39 @@ it("requires admin authority to adopt a profile", () => {
   });
 });
 
-it("saves the refreshed suggestion through config.patch before allowing its dispatch", async () => {
-  storedConfig = {
-    gateway: { projects: { defaultRepository: { url: "https://github.com/acme/app" } } },
-  };
-  const unrelated = structuredClone(storedConfig.gateway);
-  vi.mocked(resolveSuggestedWorkerProfile).mockResolvedValue(suggested);
-  expectDestination(storedConfig, false);
-  const { options, respond } = adoptionHarness();
-  await adoptSuggestedWorkerProfile(options);
-  expect(storedConfig.cloudWorkers?.profiles).toEqual({ cloud: suggested.profile });
-  expect(storedConfig.gateway).toEqual(unrelated);
-  expect(resolveSuggestedWorkerProfile).toHaveBeenCalledWith({
-    config: expect.any(Object),
-    refresh: true,
-  });
-  expect(resolveWorkerPlacementDestination({ cfg: storedConfig, profileId: "cloud" })).toEqual({
-    ok: true,
-    value: { profileId: "cloud" },
-  });
-  expect(respond).toHaveBeenCalledWith(
-    true,
-    { profile: { id: "cloud", providerId: "crabbox" } },
-    undefined,
-  );
-});
-
-it("returns an existing cloud profile untouched without discovery or another write", async () => {
+it.each([false, true])("adopts only a missing cloud profile (existing=%s)", async (exists) => {
   const existing = { provider: "static-ssh", settings: { host: "example.invalid" } };
-  storedConfig = { cloudWorkers: { profiles: { cloud: existing } } };
+  const gateway = { projects: { defaultRepository: { url: "https://github.com/acme/app" } } };
+  storedConfig = {
+    gateway,
+    ...(exists ? { cloudWorkers: { profiles: { cloud: existing } } } : {}),
+  };
+  const unrelated = structuredClone(gateway);
+  vi.mocked(resolveSuggestedWorkerProfile).mockResolvedValue(suggested);
+  if (!exists) {
+    expectDestination(storedConfig, false);
+  }
   const { options, respond } = adoptionHarness();
   await adoptSuggestedWorkerProfile(options);
-  expect(resolveSuggestedWorkerProfile).not.toHaveBeenCalled();
-  expect(configWriteMocks.commitGatewayConfigWrite).not.toHaveBeenCalled();
-  expect(storedConfig.cloudWorkers?.profiles?.cloud).toBe(existing);
+  expect(storedConfig.gateway).toEqual(unrelated);
+  if (exists) {
+    expect(resolveSuggestedWorkerProfile).not.toHaveBeenCalled();
+    expect(configWriteMocks.commitGatewayConfigWrite).not.toHaveBeenCalled();
+    expect(storedConfig.cloudWorkers?.profiles?.cloud).toBe(existing);
+  } else {
+    expect(storedConfig.cloudWorkers?.profiles).toEqual({ cloud: suggested.profile });
+    expect(resolveSuggestedWorkerProfile).toHaveBeenCalledWith({
+      config: expect.any(Object),
+      refresh: true,
+    });
+    expect(resolveWorkerPlacementDestination({ cfg: storedConfig, profileId: "cloud" })).toEqual({
+      ok: true,
+      value: { profileId: "cloud" },
+    });
+  }
   expect(respond).toHaveBeenCalledWith(
     true,
-    { profile: { id: "cloud", providerId: "static-ssh" } },
+    { profile: { id: "cloud", providerId: exists ? "static-ssh" : "crabbox" } },
     undefined,
   );
 });

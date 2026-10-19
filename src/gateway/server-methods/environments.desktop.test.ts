@@ -15,6 +15,7 @@ import type { GatewayClient } from "./client-types.js";
 import { invokeEnvironment as invoke } from "./environments.test-support.js";
 
 const cleanups: Array<() => Promise<void>> = [];
+const hostRequest = { source: { kind: "host" } } as const;
 
 afterEach(async () => {
   await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
@@ -151,7 +152,7 @@ it("returns a host observer token and auth from a real loopback RFB server", asy
   const config = { enabled: true, port: address.port };
   const [ok, result] = await invoke(
     "desktop.observe",
-    { source: { kind: "host" }, control: true },
+    { ...hostRequest, control: true },
     {
       getRuntimeConfig: () => ({ desktop: { host: config } }),
       hostDesktopService: createHostDesktopService({ getConfig: () => config, registry }),
@@ -186,11 +187,7 @@ it("reports ARD credentials as required and forwards an in-memory retry", async 
     getRuntimeConfig: () => ({ desktop: { host: { enabled: true } } }),
     hostDesktopService: { observe },
   };
-  const [firstOk, , firstError] = await invoke(
-    "desktop.observe",
-    { source: { kind: "host" } },
-    context,
-  );
+  const [firstOk, , firstError] = await invoke("desktop.observe", hostRequest, context);
   expect(firstOk).toBe(false);
   expect(firstError).toMatchObject({
     code: ErrorCodes.INVALID_REQUEST,
@@ -203,7 +200,7 @@ it("reports ARD credentials as required and forwards an in-memory retry", async 
   const credentials = { username: "operator", password: "account-password" };
   const [retryOk, result] = await invoke(
     "desktop.observe",
-    { source: { kind: "host" }, credentials },
+    { ...hostRequest, credentials },
     context,
   );
   expect(retryOk).toBe(true);
