@@ -15,36 +15,51 @@ import type { ChannelKind, GatewayReloadPlan } from "./config-reload-plan.js";
 import type { GatewayCronState } from "./server-cron.js";
 import type {
   GatewayPluginReloadResult,
+  GatewayHotReloadPublication,
+  GatewayReloadHandlerParams,
+  ManagedGatewayConfigReloaderHandle,
   ManagedGatewayConfigReloaderParams,
 } from "./server-reload-contracts.js";
 import { SharedGatewaySessionGenerationState } from "./server-shared-auth-generation.js";
 
+export type ReloadTestFactories = {
+  createGatewayReloadHandlers: (
+    params: Partial<GatewayReloadHandlerParams>,
+  ) => ReturnType<typeof import("./server-reload-hot.js").createGatewayReloadHandlers>;
+  startManagedGatewayConfigReloader: (
+    params: Pick<
+      ManagedGatewayConfigReloaderParams,
+      "initialConfig" | "readSnapshot" | "subscribeToWrites"
+    > &
+      Partial<ManagedGatewayConfigReloaderParams>,
+  ) => ManagedGatewayConfigReloaderHandle;
+};
+
+export function createHotReloadPublication(
+  sourceConfig: OpenClawConfig = {},
+  isCurrent = () => true,
+): GatewayHotReloadPublication {
+  return { sourceConfig, isCurrent, publish: async (commit) => await commit() };
+}
+
 export function createMonitorPublicationFailure() {
   const database = openOpenClawStateDatabase();
+  const exec = (sql: string) =>
+    runOpenClawStateWriteTransaction(({ db }) => db.exec(sql), { database });
   return {
     install() {
       // Persistent fault injection reaches cron workers; managed admission services
       // outstanding grants instead of blocking the host needed to finish their write.
-      runOpenClawStateWriteTransaction(
-        ({ db }) =>
-          db.exec(`CREATE TRIGGER monitor_publication_failure BEFORE UPDATE ON cron_jobs
+      exec(`CREATE TRIGGER monitor_publication_failure BEFORE UPDATE ON cron_jobs
           WHEN json_extract(NEW.job_json, '$.agentId') = 'second'
             AND json_extract(NEW.job_json, '$.schedule.everyMs') = 7200000
-          BEGIN SELECT RAISE(FAIL, 'monitor write failed'); END`),
-        { database },
-      );
+          BEGIN SELECT RAISE(FAIL, 'monitor write failed'); END`);
     },
     remove() {
-      runOpenClawStateWriteTransaction(
-        ({ db }) => db.exec("DROP TRIGGER monitor_publication_failure"),
-        { database },
-      );
+      exec("DROP TRIGGER monitor_publication_failure");
     },
     dispose() {
-      runOpenClawStateWriteTransaction(
-        ({ db }) => db.exec("DROP TRIGGER IF EXISTS monitor_publication_failure"),
-        { database },
-      );
+      exec("DROP TRIGGER IF EXISTS monitor_publication_failure");
     },
   };
 }
@@ -335,45 +350,40 @@ export function createManagedRestartSequenceConfigs() {
       ...(token ? { auth: { mode: "token", token: secret(token) } } : {}),
     },
   });
-  const initialConfig = gatewayConfig(18789);
   const deferredConfig = gatewayConfig(18790, "RESTART_A_TOKEN");
-  const invalidConfig = gatewayConfig(18791, "MISSING_RESTART_TOKEN", false);
   const missingHotSecret = secret("MISSING_HOT_TOKEN");
-  const invalidHotConfig = {
-    ...deferredConfig,
-    models: {
-      providers: {
-        test: {
-          baseUrl: "https://example.com",
-          apiKey: missingHotSecret,
-          models: [],
-        },
-      },
-    },
-  } satisfies OpenClawConfig;
-  const invalidNoopConfig = {
-    ...deferredConfig,
-    plugins: {
-      entries: {
-        brave: {
-          config: { webSearch: { apiKey: missingHotSecret } },
-        },
-      },
-    },
-  } satisfies OpenClawConfig;
-  const replacementConfig = {
-    gateway: {
-      ...deferredConfig.gateway,
-      bind: "lan",
-    },
-  } satisfies OpenClawConfig;
   return {
-    initialConfig,
+    initialConfig: gatewayConfig(18789),
     deferredConfig,
-    invalidConfig,
-    invalidHotConfig,
-    invalidNoopConfig,
-    replacementConfig,
+    invalidConfig: gatewayConfig(18791, "MISSING_RESTART_TOKEN", false),
+    invalidHotConfig: {
+      ...deferredConfig,
+      models: {
+        providers: {
+          test: {
+            baseUrl: "https://example.com",
+            apiKey: missingHotSecret,
+            models: [],
+          },
+        },
+      },
+    } satisfies OpenClawConfig,
+    invalidNoopConfig: {
+      ...deferredConfig,
+      plugins: {
+        entries: {
+          brave: {
+            config: { webSearch: { apiKey: missingHotSecret } },
+          },
+        },
+      },
+    } satisfies OpenClawConfig,
+    replacementConfig: {
+      gateway: {
+        ...deferredConfig.gateway,
+        bind: "lan",
+      },
+    } satisfies OpenClawConfig,
   };
 }
 

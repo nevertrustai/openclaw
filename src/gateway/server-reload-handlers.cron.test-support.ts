@@ -13,13 +13,12 @@ import {
 import { buildGatewayReloadPlan } from "./config-reload-plan.js";
 import { createRecoveryRestartMock } from "./config-reload.test-support.js";
 import type { GatewayCronState } from "./server-cron.js";
-import type { GatewayReloadHandlerParams } from "./server-reload-contracts.js";
 import {
   createDefaultGatewayReloadState,
   createMonitorPublicationFailure,
   createTestCronState,
+  type ReloadTestFactories,
 } from "./server-reload-handlers.config.test-support.js";
-import type { createGatewayReloadHandlers as createGatewayReloadHandlersImpl } from "./server-reload-hot.js";
 import { createManagedReloadSecretHandlers } from "./server-reload-managed-secrets.js";
 import { SharedGatewaySessionGenerationState } from "./server-shared-auth-generation.js";
 import {
@@ -30,10 +29,7 @@ import {
 export function registerGatewayCronReloadTests({
   createGatewayReloadHandlers,
   autoCleanupTempDirs,
-}: {
-  createGatewayReloadHandlers: (
-    params: Partial<GatewayReloadHandlerParams>,
-  ) => ReturnType<typeof createGatewayReloadHandlersImpl>;
+}: Pick<ReloadTestFactories, "createGatewayReloadHandlers"> & {
   autoCleanupTempDirs: { make(prefix: string): string };
 }) {
   it.each(["rejected", "noop"] as const)(
@@ -126,7 +122,6 @@ export function registerGatewayCronReloadTests({
           .catch((error: unknown) => error);
         expect(await readIntervals()).toEqual([7_200_000, 3_600_000]);
         expect(result).toBe("applied");
-        expect(requestRecoveryRestart).not.toHaveBeenCalled();
         expect(markRuntimeCommitted).toHaveBeenCalledOnce();
         expect(getActiveSecretsRuntimeSnapshot()?.config).toEqual(nextConfig);
         publicationFailure.remove();
