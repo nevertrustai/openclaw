@@ -39,11 +39,7 @@ it("fences a delivery generation during native writes and restores it only on ro
   await withDatabase(async (database) => {
     const options = { agentId: "main", path: database.path };
     const sessionKey = "agent:main:native";
-    const original = {
-      sessionId: "native",
-      lifecycleRevision: "original",
-      updatedAt: 1,
-    };
+    const original = { sessionId: "native", lifecycleRevision: "original", updatedAt: 1 };
     writeSessionEntry(database, sessionKey, original);
     const originalRow = readRow(database, sessionKey);
     expect(originalRow).toBeDefined();
@@ -63,31 +59,20 @@ it("fences a delivery generation during native writes and restores it only on ro
     try {
       generation.assertCurrent();
       expect(() =>
-        commit(
-          {
-            ...original,
-            lifecycleRevision: "pending",
-            updatedAt: 2,
-          },
-          (writer) => {
-            expect(writer.db.isTransaction).toBe(true);
-            expect(readRow(writer, sessionKey)?.entry.lifecycleRevision).toBe("pending");
-            expect(generation.assertCurrent).toThrow(
-              expect.objectContaining({ code: "SESSION_DELIVERY_GENERATION_UNAVAILABLE" }),
-            );
-            throw rollback;
-          },
-        ),
+        commit({ ...original, lifecycleRevision: "pending", updatedAt: 2 }, (writer) => {
+          expect(writer.db.isTransaction).toBe(true);
+          expect(readRow(writer, sessionKey)?.entry.lifecycleRevision).toBe("pending");
+          expect(generation.assertCurrent).toThrow(
+            expect.objectContaining({ code: "SESSION_DELIVERY_GENERATION_UNAVAILABLE" }),
+          );
+          throw rollback;
+        }),
       ).toThrow(rollback);
       expect(database.db.isTransaction).toBe(false);
       expect(readRow(database, sessionKey)).toEqual(originalRow);
       generation.assertCurrent();
 
-      commit({
-        ...original,
-        lifecycleRevision: "replacement",
-        updatedAt: 3,
-      });
+      commit({ ...original, lifecycleRevision: "replacement", updatedAt: 3 });
       expect(readRow(database, sessionKey)?.entry.lifecycleRevision).toBe("replacement");
       // Restoring the old values cannot restore a generation already replaced at COMMIT.
       commit();
@@ -121,18 +106,15 @@ it("classifies prepared lifecycle publications without classifying copied raw ev
     const empty = new Map<string, typeof entry>();
     const source = readIdentity(database);
     const transitions = [
-      { previous: empty, current: previous },
-      { previous, current: new Map([[`${key}-moved`, entry]]) },
-      { previous, current: new Map([[key, { ...entry, sessionId: "replacement" }]]) },
-      { previous, current: new Map([[key, { ...entry, lifecycleRevision: "next" }]]) },
-      { previous, current: empty },
-    ];
+      [empty, previous],
+      [previous, new Map([[`${key}-moved`, entry]])],
+      [previous, new Map([[key, { ...entry, sessionId: "replacement" }]])],
+      [previous, new Map([[key, { ...entry, lifecycleRevision: "next" }]])],
+      [previous, empty],
+    ] as const;
     try {
-      for (const transition of transitions) {
-        publishIdentity("main", source.identity, transition.previous, transition.current, {
-          source,
-          entries: transition.current,
-        });
+      for (const [before, current] of transitions) {
+        publishIdentity("main", source.identity, before, current, { source, entries: current });
       }
       expect(observations.map(({ mutation }) => mutation.kind)).toEqual([
         "create",
@@ -141,17 +123,16 @@ it("classifies prepared lifecycle publications without classifying copied raw ev
         "reset",
         "delete",
       ]);
-      const prepared = observations.splice(0);
-      for (const observation of prepared) {
+      const publications = observations.splice(0);
+      for (const observation of publications) {
         expect(observation.sharingChange).toBe("changed");
         expect(observation.prepared).toBeDefined();
         emitSessionIdentityMutation({ ...observation.mutation });
       }
       expect(observations).toHaveLength(5);
-      for (const observation of observations) {
-        expect(observation.sharingChange).toBeUndefined();
-        expect(observation.prepared).toBeUndefined();
-      }
+      expect(observations.map(({ sharingChange, prepared }) => [sharingChange, prepared])).toEqual(
+        Array.from({ length: 5 }, () => [undefined, undefined]),
+      );
     } finally {
       stop();
     }
@@ -196,11 +177,18 @@ it.each(["session ID", "lifecycle revision"] as const)(
       };
       const projection = await createSessionRowProjection({ cfg: {}, modelCatalog: [] });
       const query = { agentId: scope.agentId, storePath: scope.storePath, key: laterKey };
-      const observed: Array<{
-        entry: InternalSessionEntry | undefined;
-        storedEntry: InternalSessionEntry | undefined;
-        sharingEntry: InternalSessionEntry | undefined;
-      }> = [];
+      const capture = () => {
+        const row = projection.capture(query);
+        return [row?.entry, row?.storedEntry, projection.sharingTarget(query)?.entry];
+      };
+      const expectCapture = (entries: ReturnType<typeof capture>, allowMissing = false) => {
+        entries.forEach((entry, index) => {
+          if (!allowMissing || entry !== undefined) {
+            expectEntry(entry, index === 2 ? expectedSharing : expectedEntry);
+          }
+        });
+      };
+      const observed: Array<ReturnType<typeof capture>> = [];
       const workerPublications: Array<ReturnType<typeof readPrepared>> = [];
       const callbackErrors: unknown[] = [];
       let nativeReplacementStarted = false;
@@ -236,14 +224,7 @@ it.each(["session ID", "lifecycle revision"] as const)(
             !inNativeReplacement
           ) {
             workerPublications.push(readPrepared(mutation, laterKey));
-            const row = projection.capture(query);
-            observed.push(
-              structuredClone({
-                entry: row?.entry,
-                storedEntry: row?.storedEntry,
-                sharingEntry: projection.sharingTarget(query)?.entry,
-              }),
-            );
+            observed.push(structuredClone(capture()));
           }
         });
         await replaceBatch({
@@ -271,31 +252,16 @@ it.each(["session ID", "lifecycle revision"] as const)(
               identity: readIdentity(database).identity,
               revision: expect.any(Number),
             },
-            entry: {
-              lifecycleRevision: "worker",
-              label: "worker metadata",
-            },
+            entry: { lifecycleRevision: "worker", label: "worker metadata" },
           });
         }
-        expect(nativeReplacementStarted).toBe(true);
         // Cold native writes carry no revision comparable with the worker's prepared receipt.
         expect(nativeCacheWasCold).toBe(true);
         expect(observed).toHaveLength(1);
-        for (const entry of [observed[0]!.entry, observed[0]!.storedEntry]) {
-          if (entry !== undefined) {
-            expectEntry(entry);
-          }
-        }
-        if (observed[0]!.sharingEntry !== undefined) {
-          expectEntry(observed[0]!.sharingEntry, expectedSharing);
-        }
+        expectCapture(observed[0]!, true);
         expectEntry(readRow(database, laterKey)?.entry);
         await projection.ensureMaterialized();
-        const current = projection.capture(query);
-        for (const entry of [current?.entry, current?.storedEntry]) {
-          expectEntry(entry);
-        }
-        expectEntry(projection.sharingTarget(query)?.entry, expectedSharing);
+        expectCapture(capture());
       } finally {
         stop();
         projection.dispose();

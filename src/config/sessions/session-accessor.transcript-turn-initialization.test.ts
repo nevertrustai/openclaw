@@ -15,7 +15,7 @@ import {
   loadTranscriptEvents,
   persistSessionTranscriptTurn,
   replaceSessionEntrySync,
-  type SessionTranscriptTurnPersistOptions,
+  type SessionTranscriptTurnPersistOptions as TurnOptions,
 } from "./session-accessor.js";
 import { loadTranscriptEventsSync } from "./session-accessor.sqlite-read.js";
 import { resolveSqliteScope, toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
@@ -51,11 +51,10 @@ describe("first transcript turn initialization", () => {
   };
   const userMessage = () => ({ role: "user" as const, content: operation.objective });
   const goalMutation = { kind: "goal" as const, operation, runId: operation.operationId };
-  const preparingMessage = (
-    shouldAppend: NonNullable<
-      SessionTranscriptTurnPersistOptions["messages"]
-    >[number]["shouldAppend"],
-  ) => [{ message: userMessage(), shouldAppend }];
+  type ShouldAppend = NonNullable<TurnOptions["messages"]>[number]["shouldAppend"];
+  const preparingMessage = (shouldAppend: ShouldAppend) => [
+    { message: userMessage(), shouldAppend },
+  ];
   const receiptRows = () =>
     database().db.prepare("SELECT * FROM session_goal_operations ORDER BY operation_id").all();
   const database = () => openOpenClawAgentDatabase(toDatabaseOptions(resolveSqliteScope(scope())));
@@ -69,7 +68,7 @@ describe("first transcript turn initialization", () => {
           (SELECT count(*) FROM session_goal_operations) AS receipts`,
       )
       .get();
-  const admit = (options: Partial<SessionTranscriptTurnPersistOptions> = {}) =>
+  const admit = (options: Partial<TurnOptions> = {}) =>
     persistSessionTranscriptTurn(scope(), {
       config: {},
       expectedSessionId: sessionId,

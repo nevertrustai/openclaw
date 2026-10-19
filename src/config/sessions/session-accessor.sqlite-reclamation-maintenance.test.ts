@@ -58,10 +58,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
 const dirs = useAutoCleanupTempDirTracker((cleanup) =>
   afterEach(async () => {
     vi.restoreAllMocks();
-    nativePreload.path = "";
-    nativePreload.moduleUrl = "";
-    nativePreload.worker = undefined;
-    nativePreload.gate = undefined;
+    Object.assign(nativePreload, { path: "", moduleUrl: "", worker: undefined, gate: undefined });
     await closeOpenClawAgentDatabasesAsync();
     await closeOpenClawStateDatabaseAsync();
     cleanup();
@@ -239,12 +236,10 @@ it.each([
     if (!Array.isArray(events)) {
       throw new Error("Native receipt was not an array");
     }
-    expect(events.slice(0, cleanup !== "rollback" ? 4 : 3)).toEqual([
-      { step: "vacuum", isOpen: true, isTransaction: true },
-      { step: "commit", isOpen: true, isTransaction: true },
-      { step: "rollback", isOpen: true, isTransaction: true },
-      ...(cleanup !== "rollback" ? [{ step: "close", isOpen: true, isTransaction: true }] : []),
-    ]);
+    const steps = ["vacuum", "commit", "rollback", ...(cleanup !== "rollback" ? ["close"] : [])];
+    expect(events.slice(0, steps.length)).toEqual(
+      steps.map((step) => ({ step, isOpen: true, isTransaction: true })),
+    );
     probe = new DatabaseSync(source.path);
     probe.exec("PRAGMA busy_timeout = 0");
     if (unsafe) {

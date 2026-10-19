@@ -24,7 +24,7 @@ import {
 } from "../../test-utils/openclaw-test-state.js";
 import { cleanupSessionLifecycleArtifactsCore } from "./session-accessor.sqlite-artifact-cleanup.js";
 import { writeSessionEntry as writeRow } from "./session-accessor.sqlite-entry-store.js";
-import { loadSessionEntryReadOnly } from "./session-accessor.sqlite-entry.js";
+import { loadSessionEntryReadOnly as readEntry } from "./session-accessor.sqlite-entry.js";
 import * as artifactPlanning from "./session-accessor.sqlite-lifecycle-artifacts.js";
 import { loadTranscriptEventsSync } from "./session-accessor.sqlite-read.js";
 import { runExclusiveSqliteSessionWrite } from "./session-accessor.sqlite-scope.js";
@@ -258,9 +258,7 @@ it.each(["admitted", "revoked", "referenced"] as const)(
         expect(await settled).toEqual({
           value: { removedEntries: 1, archivedTranscriptArtifacts: 0 },
         });
-        expect(
-          loadSessionEntryReadOnly({ storePath, sessionKey: "agent:main:survivor" }),
-        ).toMatchObject({
+        expect(readEntry({ storePath, sessionKey: "agent:main:survivor" })).toMatchObject({
           previousSessionId: sessionId,
         });
       } else {
@@ -275,7 +273,7 @@ it.each(["admitted", "revoked", "referenced"] as const)(
       await closing;
       await following;
       expect(nativePlanning).not.toHaveBeenCalled();
-      const retainedEntry = loadSessionEntryReadOnly({ storePath, sessionKey });
+      const retainedEntry = readEntry({ storePath, sessionKey });
       expect(retainedEntry).toEqual(
         outcome === "referenced" ? undefined : expect.objectContaining(entry),
       );

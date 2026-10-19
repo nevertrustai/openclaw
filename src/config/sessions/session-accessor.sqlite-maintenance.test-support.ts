@@ -30,11 +30,6 @@ import {
   type ResolvedSessionMaintenanceConfig,
 } from "./store-maintenance.js";
 
-type SessionMaintenancePlanningWorkerResponse = {
-  kind: "committed" | "not-committed";
-  workerThreadId: number;
-};
-
 export function observeSessionMaintenancePlanningWorker(hooks: {
   beforeExecute?: () => void;
   beforeAdmission?: (request: admission.SqliteWorkerAdmissionRequest) => void;
@@ -42,7 +37,7 @@ export function observeSessionMaintenancePlanningWorker(hooks: {
     store: Pick<SqliteWorkerStore<SqliteWorkerOperations>, "close">;
   }) => void | Promise<void>;
   afterExecute?: (
-    result: SessionMaintenancePlanningWorkerResponse,
+    result: { kind: "committed" | "not-committed"; workerThreadId: number },
     native: {
       admission?: admission.SqliteWorkerOperationAdmission;
       retained?: RetainedWorkerTransactionAdmission;

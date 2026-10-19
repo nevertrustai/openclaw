@@ -76,6 +76,8 @@ function fixture(encoding?: "UTF-8" | "UTF-16le" | "UTF-16be") {
         excludedKeys,
         readPreserveKeys: () => undefined,
       }).store,
+    putFields: (fields: string) =>
+      put("owner", "current", `{"sessionId":"current","updatedAt":1,${fields}}`),
     plan: (
       removals: Parameters<typeof projectSessionEntryLifecycleMutation>[1]["removals"],
       upserts: Parameters<typeof projectSessionEntryLifecycleMutation>[1]["upserts"] = [],
@@ -112,7 +114,7 @@ function trackMaterializedKeys(database: OpenClawAgentDatabase) {
   return materializedKeys;
 }
 
-describe("SQLite cap candidate exclusions", () => {
+describe("SQLite exclusions and candidate reference reads", () => {
   it.each(["UTF-8", "UTF-16le"] as const)(
     "preserves exact exclusions across %s text conversion",
     (encoding) => {
@@ -138,9 +140,6 @@ describe("SQLite cap candidate exclusions", () => {
     const excluded = new Set(["\uD800", "\uDC00", ...keys.slice(1)]);
     expect(Object.values(cap(excluded)).map((entry) => entry.sessionId)).toEqual(["id-0"]);
   });
-});
-
-describe("SQLite exclusion survivor semantics", () => {
   it("preserves raw UTF-8 noncharacters in metadata and prompt projections", () => {
     const { database, put, refs, cap } = fixture("UTF-8");
     const key = "agent:main:survivor";
@@ -185,19 +184,15 @@ describe("SQLite exclusion survivor semantics", () => {
     put(key, "raw", json);
     const snapshot = readSessionEntryCache(database, { cache: false });
     expect(snapshot.keys).toEqual([key]);
-    expect(snapshot.entries.size).toBe(0);
+    expect(snapshot.entries).toEqual(new Map());
     expect(readSessionEntryCount(database)).toBe(0);
     expect([...iterateSessionEntryKeys(database)]).toEqual([]);
-    expect(snapshot.entries.get(key)?.skillsSnapshot).toBeUndefined();
     put("excluded", "excluded");
     const excludedKeys = new Set(["excluded"]);
     expect([...refs(excludedKeys)]).toEqual(["raw"]);
     expect(refs(excludedKeys, ["raw"])).toEqual(new Set(["raw"]));
     expect(cap(excludedKeys)).toEqual({});
   });
-});
-
-describe("SQLite candidate reference reads", () => {
   it("bounds reference rows when planning removal among 5,000 unrelated entries", async () => {
     const { database, put, refs, plan } = fixture();
     const removedKey = "agent:main:removed";
@@ -253,8 +248,8 @@ describe("SQLite candidate reference reads", () => {
   it("protects duplicate checkpoint references using the entry parser", () => {
     const fields =
       '"compactionCheckpoints":[{"sessionId":"wrong","sessionId":"candidate","preCompaction":{},"postCompaction":{}}]';
-    const { put, refs } = fixture();
-    put("owner", "current", `{"sessionId":"current","updatedAt":1,${fields}}`);
+    const { putFields, refs } = fixture();
+    putFields(fields);
     expect(refs(undefined, ["candidate"])).toEqual(new Set(["candidate"]));
     expect(refs(new Set(["owner"]), ["candidate"])).toEqual(new Set());
   });
@@ -266,8 +261,8 @@ describe("SQLite candidate reference reads", () => {
     '"compactionCheckpoints":[{"preCompaction":{},"postCompaction":{"sessionFile":1}}]',
     '"compactionCheckpoints":[{"preCompaction":{},"postCompaction":{"entryId":1}}]',
   ])("retains parser failures for malformed references: %s", (fields) => {
-    const { put, refs } = fixture();
-    put("owner", "current", `{"sessionId":"current","updatedAt":1,${fields}}`);
+    const { putFields, refs } = fixture();
+    putFields(fields);
     expect(() => refs(undefined, ["candidate"])).toThrow(TypeError);
     expect(refs(new Set(["owner"]), ["candidate"])).toEqual(new Set());
   });

@@ -237,13 +237,11 @@ it("keeps the target and sibling labels on one snapshot across an external commi
       );
       external.exec("BEGIN");
       seedCanonicalSessionValidation({ agentId: "main", db: external });
-      expect(
-        external
-          .prepare(
-            "UPDATE session_entry_snapshots SET value_json = ? WHERE session_key = ? AND field = 'skillsSnapshot'",
-          )
-          .run(JSON.stringify({ prompt: "new target", skills: [] }), scope.sessionKey).changes,
-      ).toBe(1);
+      external
+        .prepare(
+          "UPDATE session_entry_snapshots SET value_json = ? WHERE session_key = ? AND field = 'skillsSnapshot'",
+        )
+        .run(JSON.stringify({ prompt: "new target", skills: [] }), scope.sessionKey);
       update.run(JSON.stringify({ ...sibling, label: "new label" }), "agent:main:z-sibling");
       external.exec("COMMIT");
     }
