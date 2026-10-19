@@ -30,7 +30,6 @@ function createHarness(
   options: {
     direct?: boolean;
     membersUnavailable?: boolean;
-    membersUnavailableAfterRead?: boolean;
     historyUnavailable?: boolean;
     groupPolicy?: "open" | "allowlist" | "disabled";
     roomEnabled?: boolean;
@@ -56,14 +55,10 @@ function createHarness(
     }
     return { chunk: messages };
   });
-  let membershipReads = 0;
   const pluginClient = Object.assign(emitter, {
     getUserId: async () => selfUserId,
     getJoinedRoomMembers: async () => {
-      if (
-        options.membersUnavailable ||
-        (options.membersUnavailableAfterRead && membershipReads++ > 0)
-      ) {
+      if (options.membersUnavailable) {
         throw new Error("membership unavailable");
       }
       return options.direct
@@ -71,21 +66,16 @@ function createHarness(
         : [selfUserId, remoteUserId, "@casey:example.org"];
     },
     getRoomStateEvent: async (_roomId: string, type: string) => {
-      switch (type) {
-        case "m.room.name":
-          return { name: "Planning" };
-        case "m.room.topic":
-          return { topic: "Release planning" };
-        case "m.room.member":
-          return { is_direct: options.direct === true };
-        case "m.room.canonical_alias":
-          if (options.aliasesUnavailable) {
-            throw new Error("aliases unavailable");
-          }
-          return { alias: "#planning:example.org" };
-        default:
-          return {};
+      if (type === "m.room.canonical_alias" && options.aliasesUnavailable) {
+        throw new Error("aliases unavailable");
       }
+      const state = {
+        "m.room.name": { name: "Planning" },
+        "m.room.topic": { topic: "Release planning" },
+        "m.room.member": { is_direct: options.direct === true },
+        "m.room.canonical_alias": { alias: "#planning:example.org" },
+      };
+      return state[type as keyof typeof state] ?? {};
     },
     dms: { update: async () => true, isDm: () => options.direct === true },
     hydrateEvents: async (_roomId: string, events: MatrixRawEvent[]) => events,
@@ -165,6 +155,11 @@ function createHarness(
     return event;
   };
   return {
+    joinRoom: async () => {
+      sdk.emit(ClientEvent.Sync, SyncState.Prepared, null);
+      membership("join");
+      await Promise.all(tasks);
+    },
     ...params,
     emitter,
     sdk,
@@ -179,37 +174,40 @@ function createHarness(
   };
 }
 
+function joinParams() {
+  expect(reportJoin).toHaveBeenCalledTimes(1);
+  const params = reportJoin.mock.calls[0]?.[0];
+  if (!params) {
+    throw new Error("Expected a Matrix join introduction");
+  }
+  return params;
+}
+
 beforeEach(() => {
   reportJoin.mockClear();
 });
 
 describe("Matrix join introductions through the SDK bridge", () => {
-  it.each([true])(
-    "never introduces into an already-joined room during startup, including recovery=%s",
-    async (recovering) => {
-      const h = createHarness();
-      if (recovering) {
-        h.sdk.emit(ClientEvent.Sync, SyncState.Error, null);
-        h.sdk.emit(ClientEvent.Sync, SyncState.Catchup, SyncState.Error);
-      }
-      const joins = vi.fn<(roomId: string, event: MatrixRawEvent) => void>();
-      h.emitter.on("room.join", joins);
-      h.membership("join");
-      h.sdk.emit(ClientEvent.Room, h.room);
-      h.ready();
-      h.snapshot();
-      await h.flush();
-
-      expect(joins).toHaveBeenCalledTimes(3);
-      expect(joins.mock.calls.map((call) => call[1].membershipProvenance)).toEqual([
-        "snapshot",
-        "snapshot",
-        "snapshot",
-      ]);
-      expect(reportJoin).not.toHaveBeenCalled();
-      expect(h.doRequest).not.toHaveBeenCalled();
-    },
-  );
+  it("never introduces into an already-joined room during startup recovery", async () => {
+    const h = createHarness();
+    h.sdk.emit(ClientEvent.Sync, SyncState.Error, null);
+    h.sdk.emit(ClientEvent.Sync, SyncState.Catchup, SyncState.Error);
+    const joins = vi.fn<(roomId: string, event: MatrixRawEvent) => void>();
+    h.emitter.on("room.join", joins);
+    h.membership("join");
+    h.sdk.emit(ClientEvent.Room, h.room);
+    h.ready();
+    h.snapshot();
+    await h.flush();
+    expect(joins).toHaveBeenCalledTimes(3);
+    expect(joins.mock.calls.map((call) => call[1].membershipProvenance)).toEqual([
+      "snapshot",
+      "snapshot",
+      "snapshot",
+    ]);
+    expect(reportJoin).not.toHaveBeenCalled();
+    expect(h.doRequest).not.toHaveBeenCalled();
+  });
 
   it.each([undefined, "invite"])(
     "introduces the bot on a %s-to-join transition with the account route and oldest-first history",
@@ -218,15 +216,8 @@ describe("Matrix join introductions through the SDK bridge", () => {
       if (previous) {
         h.membership(previous);
       }
-      h.ready();
-      h.membership("join");
-      await h.flush();
-
-      expect(reportJoin).toHaveBeenCalledTimes(1);
-      const params = reportJoin.mock.calls[0]?.[0];
-      if (!params) {
-        throw new Error("Expected a Matrix join introduction");
-      }
+      await h.joinRoom();
+      const params = joinParams();
       expect(params).toMatchObject({
         channel: "matrix",
         accountId: "work",
@@ -257,7 +248,6 @@ describe("Matrix join introductions through the SDK bridge", () => {
     h.sdk.emit(ClientEvent.Event, event);
     h.sdk.emit(ClientEvent.Event, event);
     await h.flush();
-
     expect(reportJoin).toHaveBeenCalledTimes(1);
   });
 
@@ -265,9 +255,7 @@ describe("Matrix join introductions through the SDK bridge", () => {
     "never introduces when direct-room exclusion cannot admit a group: %j",
     async (options) => {
       const h = createHarness(options);
-      h.ready();
-      h.membership("join");
-      await h.flush();
+      await h.joinRoom();
       expect(reportJoin).not.toHaveBeenCalled();
       expect(h.doRequest).not.toHaveBeenCalled();
     },
@@ -281,31 +269,21 @@ describe("Matrix join introductions through the SDK bridge", () => {
     { roomAliasEnabled: false, aliasesUnavailable: true },
   ])("reports a denied room without reading history: %j", async (options) => {
     const h = createHarness(options);
-    h.ready();
-    h.membership("join");
-    await h.flush();
+    await h.joinRoom();
     expect(reportJoin).toHaveBeenCalledWith(expect.objectContaining({ roomAllowed: false }));
     expect(h.doRequest).not.toHaveBeenCalled();
   });
 
   it("admits an allowlisted room by its resolved alias", async () => {
     const h = createHarness({ groupPolicy: "allowlist", roomAliasEnabled: true });
-    h.ready();
-    h.membership("join");
-    await h.flush();
+    await h.joinRoom();
     expect(reportJoin).toHaveBeenCalledWith(expect.objectContaining({ roomAllowed: true }));
   });
 
   it("retains room metadata when history cannot be read", async () => {
     const h = createHarness({ historyUnavailable: true });
-    h.ready();
-    h.membership("join");
-    await h.flush();
-    expect(reportJoin).toHaveBeenCalledTimes(1);
-    const params = reportJoin.mock.calls[0]?.[0];
-    if (!params) {
-      throw new Error("Expected a Matrix join introduction");
-    }
+    await h.joinRoom();
+    const params = joinParams();
     expect(await params.resolveRoomContext({ messageLimit: 100 })).toEqual({
       title: "Planning",
       purpose: "Release planning",

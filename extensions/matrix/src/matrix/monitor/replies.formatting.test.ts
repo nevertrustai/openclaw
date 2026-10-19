@@ -1,7 +1,4 @@
-import {
-  resolveMarkdownTableMode,
-  type MarkdownTableMode,
-} from "openclaw/plugin-sdk/markdown-table-runtime";
+import { resolveMarkdownTableMode } from "openclaw/plugin-sdk/markdown-table-runtime";
 import { mediaKindFromMime } from "openclaw/plugin-sdk/media-runtime";
 import {
   createTestRegistry,
@@ -26,6 +23,17 @@ import { deliverMatrixReplies } from "./replies.js";
 const table = "| Name | Status |\n|---|---|\n| Alpha | Ready |";
 const runtimeEnv = {} as RuntimeEnv;
 const defaultCfg = { channels: { matrix: {} } } as CoreConfig;
+type Delivery = Parameters<typeof deliverMatrixReplies>[0];
+function deliver(client: MatrixClient, options: Pick<Delivery, "replies"> & Partial<Delivery>) {
+  return deliverMatrixReplies({
+    cfg: defaultCfg,
+    roomId: "!room:example.org",
+    runtime: runtimeEnv,
+    replyToMode: "off",
+    ...options,
+    client,
+  });
+}
 
 function createClient() {
   let nextId = 0;
@@ -65,128 +73,89 @@ describe("Matrix automatic reply table presentation", () => {
     resetPluginRuntimeStateForTest();
   });
 
-  it.each([
-    { name: "disabled table parsing", mode: "off", expected: "| Name | Status |" },
-  ] satisfies Array<{ name: string; mode: MarkdownTableMode | undefined; expected: string }>)(
-    "uses the same native output for automatic and direct sends with $name",
-    async ({ mode, expected }) => {
-      const cfg = {
-        channels: { matrix: mode ? { markdown: { tables: mode } } : {} },
-      } as CoreConfig;
-      const direct = createClient();
-      await sendMessageMatrix("!room:example.org", table, { cfg, client: direct.client });
-      const directContent = direct.sendMessage.mock.calls[0]?.[1];
-      expect(directContent?.formatted_body).toContain(expected);
-
-      const automatic = createClient();
-      const result = await deliverMatrixReplies({
-        cfg,
-        replies: [{ text: table }],
-        roomId: "!room:example.org",
-        client: automatic.client,
-        runtime: runtimeEnv,
-        replyToMode: "off",
-      });
-
-      expect(result.visibleReplySent).toBe(true);
-      expect(automatic.sendMessage).toHaveBeenCalledOnce();
-      const automaticContent = automatic.sendMessage.mock.calls[0]?.[1];
-      expect(automaticContent?.formatted_body).toContain(expected);
-      expect(automaticContent).toEqual(directContent);
-    },
-  );
+  it("uses the same native output for automatic and direct sends with disabled table parsing", async () => {
+    const cfg = {
+      channels: { matrix: { markdown: { tables: "off" } } },
+    } as CoreConfig;
+    const direct = createClient();
+    await sendMessageMatrix("!room:example.org", table, { cfg, client: direct.client });
+    const directContent = direct.sendMessage.mock.calls[0]?.[1];
+    expect(directContent?.formatted_body).toContain("| Name | Status |");
+    const automatic = createClient();
+    const result = await deliver(automatic.client, {
+      cfg,
+      replies: [{ text: table }],
+    });
+    expect(result.visibleReplySent).toBe(true);
+    expect(automatic.sendMessage).toHaveBeenCalledOnce();
+    const automaticContent = automatic.sendMessage.mock.calls[0]?.[1];
+    expect(automaticContent?.formatted_body).toContain("| Name | Status |");
+    expect(automaticContent).toEqual(directContent);
+  });
 
   it("keeps a native table within a long automatic reply while preserving code examples", async () => {
     const text = `${"Paragraph content. ".repeat(250)}\n\n${table}\n\n\`\`\`md\n${table}\n\`\`\`\n\n    indented code`;
     const automatic = createClient();
-    const result = await deliverMatrixReplies({
-      cfg: defaultCfg,
+    const result = await deliver(automatic.client, {
       replies: [{ text }],
-      roomId: "!room:example.org",
-      client: automatic.client,
-      runtime: runtimeEnv,
-      replyToMode: "off",
     });
-
     const contents = automatic.sendMessage.mock.calls.map((call) => call[1]);
     expect(result.visibleReplySent).toBe(true);
     expect(contents.length).toBeGreaterThan(1);
     expect(contents.every((content) => String(content.body).length <= 4000)).toBe(true);
-    expect(contents.some((content) => String(content.formatted_body).includes("<table>"))).toBe(
-      true,
-    );
-    expect(
-      contents.some((content) =>
-        String(content.formatted_body).includes('<pre><code class="language-md">'),
-      ),
-    ).toBe(true);
-    expect(
-      contents.some((content) =>
-        String(content.formatted_body).includes("<pre><code>indented code"),
-      ),
-    ).toBe(true);
+    for (const fragment of [
+      "<table>",
+      '<pre><code class="language-md">',
+      "<pre><code>indented code",
+    ]) {
+      expect(contents.some((content) => String(content.formatted_body).includes(fragment))).toBe(
+        true,
+      );
+    }
   });
 
-  it.each([true])(
-    "keeps first-reply relations and receipts across chunks (separate dispatch: %s)",
-    async (separateDispatch) => {
-      const { client, sendMessage } = createClient();
-      const hasRepliedRef = { value: false };
-      const delivery = {
-        cfg: defaultCfg,
-        roomId: "!room:example.org",
-        client,
-        runtime: runtimeEnv,
-        replyToMode: "first" as const,
-        replyToId: "$incoming",
-        hasRepliedRef,
-      };
-      const first = await deliverMatrixReplies({
-        ...delivery,
-        replies: [
-          { text: "Visible paragraph. ".repeat(400) },
-          ...(!separateDispatch ? [{ text: "Next payload" }] : []),
-        ],
-      });
-      const firstCount = sendMessage.mock.calls.length - (separateDispatch ? 0 : 1);
-      expect(firstCount).toBeGreaterThan(1);
-      expect(first.messageIds).toEqual(
-        sendMessage.mock.calls.map((_, index) => `$sent-${index + 1}`),
-      );
-      expect(first.receipt?.primaryPlatformMessageId).toBe("$sent-1");
-      expect(first.content).toBe(
-        sendMessage.mock.calls.map(([, content]) => content.body).join("\n"),
-      );
-      expect(hasRepliedRef.value).toBe(true);
-      for (const [, content] of sendMessage.mock.calls.slice(0, firstCount)) {
-        expect(content["m.relates_to"]).toEqual({ "m.in_reply_to": { event_id: "$incoming" } });
-      }
-
-      if (separateDispatch) {
-        await deliverMatrixReplies({ ...delivery, replies: [{ text: "Next payload" }] });
-      }
-      expect(sendMessage).toHaveBeenCalledTimes(firstCount + 1);
-      expect(sendMessage.mock.calls[firstCount]?.[1].body).toBe("Next payload");
-      expect(sendMessage.mock.calls[firstCount]?.[1]["m.relates_to"]).toBeUndefined();
-    },
-  );
+  it("keeps first-reply relations and receipts across separate dispatches", async () => {
+    const { client, sendMessage } = createClient();
+    const hasRepliedRef = { value: false };
+    const delivery = {
+      replyToMode: "first" as const,
+      replyToId: "$incoming",
+      hasRepliedRef,
+    };
+    const first = await deliver(client, {
+      ...delivery,
+      replies: [{ text: "Visible paragraph. ".repeat(400) }],
+    });
+    const firstCount = sendMessage.mock.calls.length;
+    expect(firstCount).toBeGreaterThan(1);
+    expect(first.messageIds).toEqual(
+      sendMessage.mock.calls.map((_, index) => `$sent-${index + 1}`),
+    );
+    expect(first.receipt?.primaryPlatformMessageId).toBe("$sent-1");
+    expect(first.content).toBe(
+      sendMessage.mock.calls.map(([, content]) => content.body).join("\n"),
+    );
+    expect(hasRepliedRef.value).toBe(true);
+    for (const [, content] of sendMessage.mock.calls.slice(0, firstCount)) {
+      expect(content["m.relates_to"]).toEqual({ "m.in_reply_to": { event_id: "$incoming" } });
+    }
+    await deliver(client, { ...delivery, replies: [{ text: "Next payload" }] });
+    expect(sendMessage).toHaveBeenCalledTimes(firstCount + 1);
+    expect(sendMessage.mock.calls[firstCount]?.[1].body).toBe("Next payload");
+    expect(sendMessage.mock.calls[firstCount]?.[1]["m.relates_to"]).toBeUndefined();
+  });
 
   it.each([false, true])(
     "distinguishes thread fallback from selected replies on every chunk (explicit: %s)",
     async (explicit) => {
       const { client, sendMessage } = createClient();
-      const result = await deliverMatrixReplies({
-        cfg: defaultCfg,
+      const result = await deliver(client, {
         replies: [
           {
             text: "Thread paragraph. ".repeat(400),
             ...(explicit ? { replyToId: "$selected", replyToTag: true } : {}),
           },
         ],
-        roomId: "!room:example.org",
-        client,
-        runtime: runtimeEnv,
-        replyToMode: "off",
         threadId: "$thread",
         replyToId: "$incoming",
       });
@@ -222,14 +191,10 @@ describe("Matrix automatic reply table presentation", () => {
       accountId: "ops",
       client: direct.client,
     });
-    await deliverMatrixReplies({
+    await deliver(automatic.client, {
       cfg,
       accountId: "ops",
       replies: [{ text }],
-      roomId: "!room:example.org",
-      client: automatic.client,
-      runtime: runtimeEnv,
-      replyToMode: "off",
     });
     const bodies = automatic.sendMessage.mock.calls.map(([, content]) => content);
     expect(bodies).toEqual(direct.sendMessage.mock.calls.map(([, content]) => content));
@@ -254,17 +219,12 @@ describe("Matrix automatic reply table presentation", () => {
       return "$accepted";
     });
     const hasRepliedRef = { value: false };
-    const error = await deliverMatrixReplies({
-      cfg: defaultCfg,
+    const error = await deliver(client, {
       replies: [{ text: "Visible paragraph. ".repeat(400) }],
-      roomId: "!room:example.org",
-      client,
-      runtime: runtimeEnv,
       replyToMode: "first",
       replyToId: "$incoming",
       hasRepliedRef,
     }).catch((caught: unknown) => caught);
-
     expect(sendMessage).toHaveBeenCalledTimes(2);
     expect(hasRepliedRef.value).toBe(true);
     expect(error).toMatchObject({

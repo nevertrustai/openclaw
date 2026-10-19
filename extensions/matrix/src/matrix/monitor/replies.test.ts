@@ -99,6 +99,18 @@ describe("deliverMatrixReplies", () => {
     setMatrixRuntime(runtimeStub);
   });
 
+  function expectMissing(result: Awaited<ReturnType<typeof deliver>>) {
+    expect(runtimeEnv.error).toHaveBeenCalledWith("matrix reply missing text/media");
+    expect(sendMessageMatrixMock).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      visibleReplySent: false,
+      suppression: { reason: "no_visible_result" },
+    });
+  }
+  function deliverTexts(texts: string[]) {
+    return deliver({ replies: texts.map((text) => ({ text })), roomId: "room:5" });
+  }
+
   it("encodes an explicit reply tag in the actual Matrix provider relation", async () => {
     const actualSend = await vi.importActual<typeof import("../send.js")>("../send.js");
     sendMessageMatrixMock.mockImplementation(actualSend.sendMessageMatrix);
@@ -127,21 +139,16 @@ describe("deliverMatrixReplies", () => {
   it("does not consume the first reply when Matrix delivery fails", async () => {
     const hasRepliedRef = { value: false };
     const delivery = {
-      cfg,
       replies: [{ text: "retry me" }],
       roomId: "room:1",
-      client: {} as MatrixClient,
-      runtime: runtimeEnv,
       replyToMode: "first" as const,
       replyToId: "reply-1",
       hasRepliedRef,
     };
     sendMessageMatrixMock.mockRejectedValueOnce(new Error("Matrix unavailable"));
-
-    await expect(deliverMatrixReplies(delivery)).rejects.toThrow("Matrix unavailable");
+    await expect(deliver(delivery)).rejects.toThrow("Matrix unavailable");
     expect(hasRepliedRef.value).toBe(false);
-
-    await expect(deliverMatrixReplies(delivery)).resolves.toMatchObject({
+    await expect(deliver(delivery)).resolves.toMatchObject({
       visibleReplySent: true,
     });
     expect(sendOptions(0).replyToId).toBe("reply-1");
@@ -154,12 +161,7 @@ describe("deliverMatrixReplies", () => {
       replies: [{ mediaUrls: ["   "] }],
     });
 
-    expect(runtimeEnv.error).toHaveBeenCalledWith("matrix reply missing text/media");
-    expect(sendMessageMatrixMock).not.toHaveBeenCalled();
-    expect(result).toEqual({
-      visibleReplySent: false,
-      suppression: { reason: "no_visible_result" },
-    });
+    expectMissing(result);
   });
 
   it("reports blank text with blank-only media as missing", async () => {
@@ -167,27 +169,18 @@ describe("deliverMatrixReplies", () => {
       replies: [{ text: "   ", mediaUrls: ["   "] }],
     });
 
-    expect(runtimeEnv.error).toHaveBeenCalledWith("matrix reply missing text/media");
-    expect(sendMessageMatrixMock).not.toHaveBeenCalled();
-    expect(result).toEqual({
-      visibleReplySent: false,
-      suppression: { reason: "no_visible_result" },
-    });
+    expectMissing(result);
   });
 
   it("suppresses reasoning-only text before Matrix sends", async () => {
-    await deliver({
-      replies: [
-        { text: "Reasoning:\n_hidden_" },
-        { text: "<think>still hidden</think>" },
-        { text: "<mm:think>MiniMax private reasoning</mm:think>" },
-        { text: "<mm:thought>MiniMax private thought</mm:thought>" },
-        { text: "<antml:thinking>Anthropic private reasoning</antml:thinking>" },
-        { text: "Visible answer" },
-      ],
-      roomId: "room:5",
-    });
-
+    await deliverTexts([
+      "Reasoning:\n_hidden_",
+      "<think>still hidden</think>",
+      "<mm:think>MiniMax private reasoning</mm:think>",
+      "<mm:thought>MiniMax private thought</mm:thought>",
+      "<antml:thinking>Anthropic private reasoning</antml:thinking>",
+      "Visible answer",
+    ]);
     expect(sendMessageMatrixMock).toHaveBeenCalledTimes(1);
     expect(sendCall(0)[0]).toBe("room:5");
     expect(sendCall(0)[1]).toBe("Visible answer");
@@ -195,27 +188,25 @@ describe("deliverMatrixReplies", () => {
   });
 
   it("strips namespaced reasoning while delivering visible Matrix replies", async () => {
-    await deliver({
-      replies: [
-        { text: "<mm:think>MiniMax private reasoning</mm:think>Visible MiniMax answer" },
-        { text: "<antml:thinking>Anthropic private reasoning</antml:thinking>Visible answer" },
-        { text: "<br>Visible HTML answer<mm:think>MiniMax private reasoning</mm:think>" },
-        { text: "Visible safe answer<mm:think>unfinished private reasoning" },
-        { text: "Visible answer<think>old reasoning</think><think>unfinished private reasoning" },
-        { text: "<thinking>private reasoning</think>Visible alias answer" },
-        { text: "<final>Visible final answer" },
-      ],
-      roomId: "room:5",
-    });
-
+    await deliverTexts([
+      "<mm:think>MiniMax private reasoning</mm:think>Visible MiniMax answer",
+      "<antml:thinking>Anthropic private reasoning</antml:thinking>Visible answer",
+      "<br>Visible HTML answer<mm:think>MiniMax private reasoning</mm:think>",
+      "Visible safe answer<mm:think>unfinished private reasoning",
+      "Visible answer<think>old reasoning</think><think>unfinished private reasoning",
+      "<thinking>private reasoning</think>Visible alias answer",
+      "<final>Visible final answer",
+    ]);
     expect(sendMessageMatrixMock).toHaveBeenCalledTimes(7);
-    expect(sendCall(0)[1]).toBe("Visible MiniMax answer");
-    expect(sendCall(1)[1]).toBe("Visible answer");
-    expect(sendCall(2)[1]).toBe("<br>Visible HTML answer");
-    expect(sendCall(3)[1]).toBe("Visible safe answer");
-    expect(sendCall(4)[1]).toBe("Visible answer");
-    expect(sendCall(5)[1]).toBe("Visible alias answer");
-    expect(sendCall(6)[1]).toBe("Visible final answer");
+    expect(sendMessageMatrixMock.mock.calls.map((call) => call[1])).toEqual([
+      "Visible MiniMax answer",
+      "Visible answer",
+      "<br>Visible HTML answer",
+      "Visible safe answer",
+      "Visible answer",
+      "Visible alias answer",
+      "Visible final answer",
+    ]);
   });
 
   it("delivers Matrix media without a reasoning-only caption", async () => {
@@ -228,7 +219,6 @@ describe("deliverMatrixReplies", () => {
       ],
       roomId: "room:5",
     });
-
     expect(sendMessageMatrixMock).toHaveBeenCalledTimes(1);
     expect(sendCall(0)[1]).toBe("");
     expect(sendOptions(0).mediaUrl).toBe("https://example.com/a.jpg");
@@ -256,17 +246,14 @@ describe("deliverMatrixReplies", () => {
       mediaUrls: ["https://example.com/a.jpg", "https://example.com/b.jpg"],
       presentation: approvalPresentation,
     });
-
     expect(sendMessageMatrixMock).toHaveBeenCalledTimes(2);
-    const first = sendMessageMatrixMock.mock.calls[0]?.[2] as Record<string, unknown>;
-    const second = sendMessageMatrixMock.mock.calls[1]?.[2] as Record<string, unknown>;
+    const first = sendOptions(0);
+    const second = sendOptions(1);
     expect((first.extraContent as Record<string, unknown>)[PRESENTATION_KEY]).toBeDefined();
     expect(second.extraContent).toBeUndefined();
   });
 
   it("sends the authored text once when the presentation only restates it", async () => {
-    // `/status` curates table/context facts into prose with extra diagnostics.
-    // Native context support must not replace that authored fallback when tables degrade.
     const authoredText =
       "Status: ok\nUptime: 42s\nReference UTC: 12:00\n\n| agent | state |\n| --- | --- |\n| main | idle |";
     await deliverPresentation({
@@ -284,20 +271,14 @@ describe("deliverMatrixReplies", () => {
         ],
       },
     });
-
     expect(sendMessageMatrixMock).toHaveBeenCalledTimes(1);
-    const [, text, opts] = sendMessageMatrixMock.mock.calls[0] as [
-      string,
-      string,
-      Record<string, unknown>,
-    ];
+    const text = sendCall(0)[1];
+    const opts = sendOptions(0);
     expect(text).toBe(authoredText);
     expect(opts.extraContent).toBeUndefined();
   });
 
   it("keeps a context block Matrix renders natively in the event", async () => {
-    // Matrix advertises context support, so a context-only presentation is not the
-    // fully-degraded case that lets the producer's own prose stand alone.
     await deliverPresentation({
       text: "Deploy finished.",
       presentationTextMode: "fallback",
@@ -305,12 +286,8 @@ describe("deliverMatrixReplies", () => {
         blocks: [{ type: "context", text: "took 42s" }],
       },
     });
-
-    const [, text, opts] = sendMessageMatrixMock.mock.calls[0] as [
-      string,
-      string,
-      Record<string, unknown>,
-    ];
+    const text = sendCall(0)[1];
+    const opts = sendOptions(0);
     expect(text).toContain("took 42s");
     expect((opts.extraContent as Record<string, unknown>)[PRESENTATION_KEY]).toMatchObject({
       type: "message.presentation",
