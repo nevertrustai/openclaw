@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { once } from "node:events";
 import { writeFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
@@ -8,7 +9,7 @@ import net from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import { resolveSlackMonitorDispatchers } from "./client-options.js";
 
@@ -46,7 +47,6 @@ const PROXY_KEYS = [
   "OPENCLAW_PROXY_ACTIVE",
   "OPENCLAW_PROXY_CA_FILE",
 ] as const;
-const originalEnv = { ...process.env };
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const closers: Array<() => Promise<void> | void> = [];
 const execFileAsync = promisify(execFile);
@@ -62,20 +62,11 @@ function loadSocketModeUndici(): SocketModeUndici {
   return requireFromSocketMode("undici/index.js") as SocketModeUndici;
 }
 
-function clearProxyEnv() {
-  for (const key of PROXY_KEYS) {
-    delete process.env[key];
-  }
-}
-
-function restoreProxyEnv() {
-  for (const key of PROXY_KEYS) {
-    if (originalEnv[key] !== undefined) {
-      process.env[key] = originalEnv[key];
-    } else {
-      delete process.env[key];
-    }
-  }
+function closeServer(server: http.Server | https.Server) {
+  return new Promise<void>((resolve) => {
+    server.closeAllConnections();
+    server.close(() => resolve());
+  });
 }
 
 async function startConnectProxy(options: { tls?: boolean } = {}): Promise<{
@@ -109,16 +100,8 @@ async function startConnectProxy(options: { tls?: boolean } = {}): Promise<{
     upstream.on("error", () => client.destroy());
     client.on("error", () => upstream.destroy());
   });
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  closers.push(
-    () =>
-      new Promise<void>((resolve) => {
-        server.closeAllConnections();
-        server.close(() => resolve());
-      }),
-  );
+  await once(server.listen(0, "127.0.0.1"), "listening");
+  closers.push(() => closeServer(server));
   const scheme = options.tls ? "https" : "http";
   return {
     url: `${scheme}://127.0.0.1:${(server.address() as AddressInfo).port}`,
@@ -138,13 +121,9 @@ async function startEchoWebSocketServer(options: { tls?: boolean } = {}): Promis
     socket.on("message", (data, isBinary) => socket.send(data, { binary: isBinary })),
   );
   if (server) {
-    await new Promise<void>((resolve) => {
-      server.listen(0, "127.0.0.1", resolve);
-    });
+    await once(server.listen(0, "127.0.0.1"), "listening");
   } else {
-    await new Promise<void>((resolve) => {
-      wss.once("listening", resolve);
-    });
+    await once(wss, "listening");
   }
   closers.push(
     () =>
@@ -157,8 +136,7 @@ async function startEchoWebSocketServer(options: { tls?: boolean } = {}): Promis
             resolve();
             return;
           }
-          server.closeAllConnections();
-          server.close(() => resolve());
+          void closeServer(server).then(resolve);
         });
       }),
   );
@@ -246,14 +224,16 @@ function echoThroughSocketModeWebSocket(
 
 describe("slack socket mode dispatcher", () => {
   beforeEach(() => {
-    clearProxyEnv();
+    for (const key of PROXY_KEYS) {
+      vi.stubEnv(key, undefined);
+    }
   });
 
   afterEach(async () => {
     for (const close of closers.splice(0).toReversed()) {
       await close();
     }
-    restoreProxyEnv();
+    vi.unstubAllEnvs();
   });
 
   it.each([undefined, "://invalid-proxy"])(
