@@ -28,13 +28,22 @@ import { buildChannelActivity, createMessageHandlerDeps } from "./message-handle
 
 const dispatch = getRuntimeApiMockState().dispatchReplyWithBufferedBlockDispatcher;
 const tagless = { contentType: "text/html", content: "<div><at>Bot</at></div>" };
+const dmConfig: MSTeamsConfig = { dmPolicy: "open", allowFrom: ["*"] };
+const dmConversation = { id: "a:bot-framework-dm", conversationType: "personal" };
+const document = (path: string) => ({
+  path,
+  contentType: "application/pdf",
+  kind: "document" as const,
+});
+const teamData = (id: string) => ({
+  team: { id },
+  channel: { id: "19:channel@thread.tacv2" },
+});
 function setup(
   config: MSTeamsConfig = {},
   getTeamDetails: NonNullable<MSTeamsTurnContext["getTeamDetails"]> = vi.fn<
     NonNullable<MSTeamsTurnContext["getTeamDetails"]>
-  >(async () => ({
-    aadGroupId: "team-aad-group",
-  })),
+  >(async () => ({ aadGroupId: "team-aad-group" })),
 ) {
   const fixture = createMessageHandlerDeps({
     channels: {
@@ -82,9 +91,7 @@ describe("Teams inbound media recovery", () => {
     dispatch.mockClear();
   });
   it("dispatches recovered tagless files without logging instruction text", async () => {
-    graphMedia.mockResolvedValue({
-      media: [{ path: "/tmp/from-graph.pdf", contentType: "application/pdf", kind: "document" }],
-    });
+    graphMedia.mockResolvedValue({ media: [document("/tmp/from-graph.pdf")] });
     const { handle, getTeamDetails, deps } = setup();
     const privateText = "Private launch note: describe the attached image file";
     const rawText = `<at>Bot</at> ${privateText}`;
@@ -92,10 +99,7 @@ describe("Teams inbound media recovery", () => {
     try {
       await handle({
         text: rawText,
-        channelData: {
-          team: { id: "19:raw-team@thread.skype" },
-          channel: { id: "19:channel@thread.tacv2" },
-        },
+        channelData: teamData("19:raw-team@thread.skype"),
       });
     } finally {
       verbose.mockRestore();
@@ -110,13 +114,7 @@ describe("Teams inbound media recovery", () => {
     expect(context()).toMatchObject({
       BodyForAgent: privateText,
       NativeChannelId: "team-aad-group/19:channel@thread.tacv2",
-      media: [
-        expect.objectContaining({
-          path: "/tmp/from-graph.pdf",
-          contentType: "application/pdf",
-          kind: "document",
-        }),
-      ],
+      media: [expect.objectContaining(document("/tmp/from-graph.pdf"))],
     });
     expect(JSON.stringify(context())).not.toContain("19:raw-team@thread.skype/");
     const logs = JSON.stringify([
@@ -128,17 +126,14 @@ describe("Teams inbound media recovery", () => {
     expect(logs).not.toContain("Private launch note");
   });
   it("recovers explicit personal attachments without opting into Graph fallback or rewriting the Bot Framework ID", async () => {
-    botFrameworkMedia.mockResolvedValue({
-      media: [{ path: "/tmp/explicit.pdf", contentType: "application/pdf", kind: "document" }],
-    });
+    botFrameworkMedia.mockResolvedValue({ media: [document("/tmp/explicit.pdf")] });
     const { handle } = setup({
-      dmPolicy: "open",
-      allowFrom: ["*"],
+      ...dmConfig,
       graphMediaFallback: undefined,
       replyStyle: "thread",
     });
     await handle({
-      conversation: { id: "a:bot-framework-dm", conversationType: "personal" },
+      conversation: dmConversation,
       serviceUrl: "https://smba.trafficmanager.net/amer/",
       channelData: {},
       replyToId: "dm-parent",
@@ -161,18 +156,11 @@ describe("Teams inbound media recovery", () => {
       BodyForAgent: "",
       To: "user:user-aad",
       OriginatingTo: "conversation:a:bot-framework-dm",
-      media: [
-        expect.objectContaining({
-          path: "/tmp/explicit.pdf",
-          contentType: "application/pdf",
-          kind: "document",
-        }),
-      ],
+      media: [expect.objectContaining(document("/tmp/explicit.pdf"))],
     });
     expect(context().MessageThreadId).toBeUndefined();
   });
   it("does not emit a ghost event when Graph recovery is empty", async () => {
-    media.mockResolvedValue([]);
     const { handle, getTeamDetails, enqueueSystemEvent } = setup();
     await handle();
     expect(media).toHaveBeenCalledTimes(1);
@@ -189,7 +177,6 @@ describe("Teams inbound media recovery", () => {
     });
   });
   it("preserves ordinary reply text when the Teams API cannot resolve a Graph team ID", async () => {
-    media.mockResolvedValue([]);
     const getTeamDetails = vi.fn(async () => {
       throw new Error("Teams API unavailable");
     });
@@ -197,10 +184,7 @@ describe("Teams inbound media recovery", () => {
     await handle({
       text: "<at>Bot</at> keep this text",
       replyToId: "unresolved-parent",
-      channelData: {
-        team: { id: "19:team-unresolved@thread.skype" },
-        channel: { id: "19:channel@thread.tacv2" },
-      },
+      channelData: teamData("19:team-unresolved@thread.skype"),
     });
     expect(getTeamDetails).toHaveBeenCalledWith("19:team-unresolved@thread.skype");
     expect(graphMedia).not.toHaveBeenCalled();
@@ -226,9 +210,9 @@ describe("Teams inbound media recovery", () => {
     });
 
     it("delivers a pasted DM image whose Bot Framework download outlasts enrichment budgets", async () => {
-      const { handle } = setup({ dmPolicy: "open", allowFrom: ["*"] });
+      const { handle } = setup(dmConfig);
       const run = handle({
-        conversation: { id: "a:bot-framework-dm", conversationType: "personal" },
+        conversation: dmConversation,
         channelData: {},
         text: "what is this?",
         attachments: [
@@ -251,10 +235,7 @@ describe("Teams inbound media recovery", () => {
       const { handle, getTeamDetails } = setup();
       const run = handle({
         text: "<at>Bot</at> see image",
-        channelData: {
-          team: { id: "19:slow-media-team@thread.skype" },
-          channel: { id: "19:channel@thread.tacv2" },
-        },
+        channelData: teamData("19:slow-media-team@thread.skype"),
       });
       await vi.advanceTimersByTimeAsync(transferMs);
       await run;
