@@ -13,6 +13,7 @@ import {
   closeOpenClawAgentDatabasesAsync,
   openOpenClawAgentDatabase,
   runOpenClawAgentWriteTransaction,
+  type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
 import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import { SQLITE_SESSION_WRITER_QUEUES } from "../../state/openclaw-agent-write-admission-state.js";
@@ -22,7 +23,7 @@ import {
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
 import { cleanupSessionLifecycleArtifactsCore } from "./session-accessor.sqlite-artifact-cleanup.js";
-import { writeSessionEntry } from "./session-accessor.sqlite-entry-store.js";
+import { writeSessionEntry as writeRow } from "./session-accessor.sqlite-entry-store.js";
 import { loadSessionEntryReadOnly } from "./session-accessor.sqlite-entry.js";
 import * as artifactPlanning from "./session-accessor.sqlite-lifecycle-artifacts.js";
 import { loadTranscriptEventsSync } from "./session-accessor.sqlite-read.js";
@@ -32,6 +33,7 @@ import * as workerReaders from "./session-transcript-worker-readers.js";
 import type { SessionEntry } from "./types.js";
 
 let state: OpenClawTestState;
+let database: OpenClawAgentDatabase;
 let storePath: string;
 let options: { agentId: string; path: string; env: NodeJS.ProcessEnv };
 const sessionKey = "agent:main:artifact-plan-victim";
@@ -46,12 +48,12 @@ const cleanupInput = () => ({
 });
 const planInput = () => ({ ...cleanupInput(), archiveDirectory: state.sessionsDir() });
 const writeEntry = (key: string, value: SessionEntry) =>
-  runOpenClawAgentWriteTransaction((db) => writeSessionEntry(db, key, value), options);
+  runOpenClawAgentWriteTransaction((db) => writeRow(db, key, value), options);
 
 beforeEach(async () => {
   state = await createOpenClawTestState({ prefix: "artifact-planning-", layout: "state-only" });
   storePath = path.join(state.sessionsDir(), "sessions.json");
-  const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+  database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
   options = { agentId: "main", path: database.path, env: state.env };
   writeEntry(sessionKey, entry);
   await replaceTranscriptEvents({ storePath, sessionKey, sessionId }, [event]);
@@ -64,7 +66,6 @@ afterEach(async () => {
 });
 
 it("skips unused candidate reads and observes a later matching entry", () => {
-  const database = openOpenClawAgentDatabase(options);
   const input = {
     ...planInput(),
     agentId: "main",
@@ -118,7 +119,6 @@ it("skips unused candidate reads and observes a later matching entry", () => {
 });
 
 it("hydrates only old scoped candidates while protecting out-of-scope history references", () => {
-  const database = openOpenClawAgentDatabase(options);
   const nowMs = Date.now() + 600_000;
   const snapshots = {
     sessionDiffBaseline: { version: 1, sessionId, root: "/synthetic", files: [] },
@@ -150,23 +150,19 @@ it("hydrates only old scoped candidates while protecting out-of-scope history re
     delivery: { kind: "none" as const },
   };
   runOpenClawAgentWriteTransaction((transaction) => {
-    writeSessionEntry(transaction, sessionKey, expectedEntry);
-    writeSessionEntry(transaction, "agent:main:survivor", {
-      ...snapshots,
-      ...survivorReferences,
-      sessionId: "survivor",
-      updatedAt: 1,
-    });
-    writeSessionEntry(transaction, "agent:main:artifact-plan-recent", {
-      ...snapshots,
-      sessionId: "recent",
-      updatedAt: nowMs,
-    });
-    writeSessionEntry(transaction, "agent:other:artifact-plan-victim", {
-      ...snapshots,
-      sessionId: "other-agent",
-      updatedAt: 1,
-    });
+    writeRow(transaction, sessionKey, expectedEntry);
+    for (const [key, id, updatedAt, references] of [
+      ["agent:main:survivor", "survivor", 1, survivorReferences],
+      ["agent:main:artifact-plan-recent", "recent", nowMs, {}],
+      ["agent:other:artifact-plan-victim", "other-agent", 1, {}],
+    ] as const) {
+      writeRow(transaction, key, {
+        ...snapshots,
+        ...references,
+        sessionId: id,
+        updatedAt,
+      });
+    }
   }, options);
   const hydratedKeys: unknown[] = [];
   requireNativeSqliteDatabase(database.db).function("artifact_snapshot_value", (key, valueJson) => {
@@ -280,11 +276,9 @@ it.each(["admitted", "revoked", "referenced"] as const)(
       await following;
       expect(nativePlanning).not.toHaveBeenCalled();
       const retainedEntry = loadSessionEntryReadOnly({ storePath, sessionKey });
-      if (outcome === "referenced") {
-        expect(retainedEntry).toBeUndefined();
-      } else {
-        expect(retainedEntry).toMatchObject(entry);
-      }
+      expect(retainedEntry).toEqual(
+        outcome === "referenced" ? undefined : expect.objectContaining(entry),
+      );
       expect(loadTranscriptEventsSync({ storePath, sessionId })).toEqual([event]);
     } finally {
       release.resolve();
@@ -313,13 +307,12 @@ it("leaves a missing lifecycle store absent", async () => {
 });
 
 it("keeps orphan plans across page boundaries and protects retained references", () => {
-  const database = openOpenClawAgentDatabase(options);
   const ids = Array.from(
     { length: 129 },
     (_, index) => `history-${String(index).padStart(3, "0")}`,
   );
   runOpenClawAgentWriteTransaction((transaction) => {
-    writeSessionEntry(transaction, sessionKey, { ...entry, previousSessionId: ids.at(-2) });
+    writeRow(transaction, sessionKey, { ...entry, previousSessionId: ids.at(-2) });
     const window = transaction.db.prepare(
       "INSERT INTO session_windows (session_id, session_key, created_at, updated_at) VALUES (?, ?, 1, 1)",
     );

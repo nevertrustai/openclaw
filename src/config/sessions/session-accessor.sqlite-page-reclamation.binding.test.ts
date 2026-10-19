@@ -4,7 +4,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { createDeferred, withTestTimeout } from "../../../test/helpers/promise.js";
-import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
 import type { SqliteWalReclamationResult } from "../../infra/sqlite-wal-reclamation.js";
 import { hasOpenClawAgentDatabaseAsyncResources } from "../../state/openclaw-agent-db-resources.js";
 import {
@@ -23,10 +22,7 @@ import {
 } from "./session-accessor.sqlite-page-reclamation.js";
 import * as pageReclamation from "./session-accessor.sqlite-page-reclamation.js";
 import { resolveSessionReclamationDatabaseOptions } from "./session-accessor.sqlite-reclamation.js";
-import {
-  getSessionKysely,
-  runExclusiveSqliteSessionWrite,
-} from "./session-accessor.sqlite-scope.js";
+import { runExclusiveSqliteSessionWrite } from "./session-accessor.sqlite-scope.js";
 import { pruneAllSessionTranscriptArchivesToHighWater } from "./session-history-archive-pruning.js";
 
 afterEach(() => vi.restoreAllMocks());
@@ -44,23 +40,20 @@ function seedArchive(database: OpenClawAgentDatabase, archiveDirectory: string) 
   });
   const content = Buffer.from("synthetic retained history\n");
   ensureSessionTranscriptArchiveSchema(database.db);
-  executeSqliteQuerySync(
-    database.db,
-    getSessionKysely(database.db)
-      .insertInto("session_transcript_archives")
-      .values({
-        archive_blob: content,
-        archive_name: archiveName,
-        archive_sha256: createHash("sha256").update(content).digest("hex"),
-        created_at: createdAt,
-        encoding: "identity",
-        generation,
-        published_at: createdAt,
-        reason: "deleted",
-        session_id: sessionId,
-        session_key: "agent:main:binding-history",
-      }),
-  );
+  database.db
+    .prepare(`INSERT INTO session_transcript_archives
+    (archive_blob, archive_name, archive_sha256, created_at, encoding, generation,
+     published_at, reason, session_id, session_key)
+    VALUES (?, ?, ?, ?, 'identity', ?, ?, 'deleted', ?, 'agent:main:binding-history')`)
+    .run(
+      content,
+      archiveName,
+      createHash("sha256").update(content).digest("hex"),
+      createdAt,
+      generation,
+      createdAt,
+      sessionId,
+    );
   fs.mkdirSync(archiveDirectory, { recursive: true });
   const archivePath = path.join(archiveDirectory, archiveName);
   fs.writeFileSync(archivePath, content);
@@ -68,13 +61,22 @@ function seedArchive(database: OpenClawAgentDatabase, archiveDirectory: string) 
 }
 
 function readArchives(database: OpenClawAgentDatabase) {
-  return executeSqliteQuerySync(
-    database.db,
-    getSessionKysely(database.db)
-      .selectFrom("session_transcript_archives")
-      .select(["archive_name", "archive_sha256", "generation", "published_at", "session_id"]),
-  ).rows;
+  return database.db
+    .prepare(`SELECT archive_name, archive_sha256, generation, published_at, session_id
+    FROM session_transcript_archives`)
+    .all();
 }
+
+const prune = (
+  databaseOptions: ReturnType<typeof resolveSessionReclamationDatabaseOptions>,
+  archiveDirectory: string,
+) =>
+  pruneAllSessionTranscriptArchivesToHighWater({
+    databaseOptions,
+    archiveDirectory,
+    highWaterBytes: 0,
+    storePath: databaseOptions.path,
+  });
 
 it.each([
   { operation: "prune", retirement: "path" },
@@ -102,13 +104,9 @@ it.each([
           env: { ...state.env, OPENCLAW_STATE_DIR: link },
         });
         if (operation === "prune") {
-          const result = await pruneAllSessionTranscriptArchivesToHighWater({
-            archiveDirectory,
-            databaseOptions: linkOptions,
-            highWaterBytes: 0,
-            storePath: linkOptions.path,
+          await expect(prune(linkOptions, archiveDirectory)).resolves.toMatchObject({
+            removedFiles: 1,
           });
-          expect(result.removedFiles).toBe(1);
         } else {
           expect((await readSqliteSessionArchivePruning(linkOptions))?.archives).toHaveLength(1);
         }
@@ -160,28 +158,17 @@ it.runIf(process.platform !== "win32").each([false, true])(
             });
           },
         );
-        let failure: unknown;
-        let removedFiles: number | undefined;
-        try {
-          const result = await pruneAllSessionTranscriptArchivesToHighWater({
-            archiveDirectory,
-            databaseOptions: aliasOptions,
-            highWaterBytes: 0,
-            storePath: alias,
-          });
-          removedFiles = result.removedFiles;
-        } catch (error) {
-          failure = error;
+        const pending = prune(aliasOptions, archiveDirectory);
+        if (retarget) {
+          await expect(pending).rejects.toThrow("file identity changed");
+        } else {
+          await expect(pending).resolves.toMatchObject({ removedFiles: 1 });
         }
         expect(captured).toBe(true);
         if (retarget) {
           expect(readArchives(archiveDatabase)).toEqual(before);
           expect(fs.readFileSync(archive.archivePath)).toEqual(archive.content);
-          expect(failure).toBeInstanceOf(Error);
-          expect(String(failure)).toContain("file identity changed");
         } else {
-          expect(failure).toBeUndefined();
-          expect(removedFiles).toBe(1);
           expect(readArchives(archiveDatabase)).toEqual([]);
           expect(fs.existsSync(archive.archivePath)).toBe(false);
         }
@@ -240,46 +227,48 @@ it.runIf(process.platform !== "win32").each([false, true])(
             return result;
           },
         );
-        let failure: unknown;
-        let result: SqliteWalReclamationResult | undefined;
-        try {
-          result = await withSqliteSessionPageReclamation(
-            aliasOptions,
-            async (reclaimPages, _assertCurrent, preparedOptions) => {
-              preparedPath = preparedOptions.path;
-              const entered = createDeferred();
-              const release = createDeferred();
-              const blocker = runExclusiveSqliteSessionWrite(
-                preparedOptions,
-                async () => {
-                  entered.resolve();
-                  await release.promise;
-                },
-                "session.transcript.batch",
-              );
-              void blocker.catch(entered.reject);
-              let reclamation: Promise<SqliteWalReclamationResult> | undefined;
-              try {
-                await entered.promise;
-                observing = true;
-                reclamation = reclaimPages(1);
-                void reclamation.catch(() => {});
-                await withTestTimeout(requested.promise, 10_000, "Page write was not queued");
-                if (retarget) {
-                  fs.unlinkSync(alias);
-                  fs.symlinkSync(replacement.path, alias);
-                }
-                release.resolve();
-                return await reclamation;
-              } finally {
-                observing = false;
-                release.resolve();
-                await Promise.allSettled([blocker, reclamation]);
+        const pending = withSqliteSessionPageReclamation(
+          aliasOptions,
+          async (reclaimPages, _assertCurrent, preparedOptions) => {
+            preparedPath = preparedOptions.path;
+            const entered = createDeferred();
+            const release = createDeferred();
+            const blocker = runExclusiveSqliteSessionWrite(
+              preparedOptions,
+              async () => {
+                entered.resolve();
+                await release.promise;
+              },
+              "session.transcript.batch",
+            );
+            void blocker.catch(entered.reject);
+            let reclamation: Promise<SqliteWalReclamationResult> | undefined;
+            try {
+              await entered.promise;
+              observing = true;
+              reclamation = reclaimPages(1);
+              void reclamation.catch(() => {});
+              await withTestTimeout(requested.promise, 10_000, "Page write was not queued");
+              if (retarget) {
+                fs.unlinkSync(alias);
+                fs.symlinkSync(replacement.path, alias);
               }
-            },
-          );
-        } catch (error) {
-          failure = error;
+              release.resolve();
+              return await reclamation;
+            } finally {
+              observing = false;
+              release.resolve();
+              await Promise.allSettled([blocker, reclamation]);
+            }
+          },
+        );
+        if (retarget) {
+          await expect(pending).rejects.toThrow("file identity changed");
+        } else {
+          await expect(pending).resolves.toMatchObject({
+            checkpointCompleted: true,
+            vacuumPasses: 1,
+          });
         }
         expect(readArchives(original)).toEqual(originalRows);
         expect(readArchives(replacement)).toEqual(replacementRows);
@@ -287,11 +276,7 @@ it.runIf(process.platform !== "win32").each([false, true])(
         expect(fs.readFileSync(replacementArchive.archivePath)).toEqual(replacementArchive.content);
         if (retarget) {
           expect(readFreePages()).toBe(freePagesBefore);
-          expect(failure).toBeInstanceOf(Error);
-          expect(String(failure)).toContain("file identity changed");
         } else {
-          expect(failure).toBeUndefined();
-          expect(result).toMatchObject({ checkpointCompleted: true, vacuumPasses: 1 });
           expect(readFreePages()).toBeLessThan(freePagesBefore);
         }
       },

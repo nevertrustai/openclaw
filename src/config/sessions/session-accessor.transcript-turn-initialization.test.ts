@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../../test/helpers/promise.js";
+import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
 import { onSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
 import {
@@ -50,6 +50,12 @@ describe("first transcript turn initialization", () => {
     sandbox: "required",
   };
   const userMessage = () => ({ role: "user" as const, content: operation.objective });
+  const goalMutation = { kind: "goal" as const, operation, runId: operation.operationId };
+  const preparingMessage = (
+    shouldAppend: NonNullable<
+      SessionTranscriptTurnPersistOptions["messages"]
+    >[number]["shouldAppend"],
+  ) => [{ message: userMessage(), shouldAppend }];
   const receiptRows = () =>
     database().db.prepare("SELECT * FROM session_goal_operations ORDER BY operation_id").all();
   const database = () => openOpenClawAgentDatabase(toDatabaseOptions(resolveSqliteScope(scope())));
@@ -69,14 +75,9 @@ describe("first transcript turn initialization", () => {
       expectedSessionId: sessionId,
       initialSessionEntry,
       messages: [
-        {
-          message: {
-            ...userMessage(),
-            idempotencyKey: `${operation.operationId}:user`,
-          },
-        },
+        { message: { ...userMessage(), idempotencyKey: `${operation.operationId}:user` } },
       ],
-      sessionTurnMutation: { kind: "goal", operation, runId: operation.operationId },
+      sessionTurnMutation: goalMutation,
       sessionLifecyclePatch: {
         status: undefined,
         lifecycleRunId: operation.operationId,
@@ -98,12 +99,8 @@ describe("first transcript turn initialization", () => {
   it("creates the first session, Goal, input and run receipt atomically and replays after reopen", async () => {
     expect(loadSessionEntry(scope())).toBeUndefined();
     const onMessageCommitted = vi.fn(({ messageId }: { messageId: string }) => {
-      expect(loadTranscriptEventsSync(scope())).toContainEqual(
-        expect.objectContaining({
-          id: messageId,
-          message: expect.objectContaining({ role: "user" }),
-        }),
-      );
+      const event = loadTranscriptEventsSync(scope()).find((row) => row.id === messageId);
+      expect(event).toMatchObject({ id: messageId, message: { role: "user" } });
     });
     const turn = await admit({ onMessageCommitted });
     expect(turn.sessionEntry?.status).toBeUndefined();
@@ -186,12 +183,11 @@ describe("first transcript turn initialization", () => {
       );
       try {
         await racePromiseWithAbortSignal(
-          Promise.race([
+          awaitGateBeforeSettlement(
             accepted.promise,
-            outcome.then(() => {
-              throw new Error("Commit settled before both callbacks accepted work");
-            }),
-          ]),
+            outcome,
+            "Commit settled before both callbacks accepted work",
+          ),
           test.signal,
         );
         const acceptedOrder = ["accepted:1", "accepted:2"];
@@ -220,16 +216,11 @@ describe("first transcript turn initialization", () => {
     async (competingSessionId) => {
       const competing = { sessionId: competingSessionId, updatedAt: now };
       const turn = await admit({
-        messages: [
-          {
-            message: userMessage(),
-            shouldAppend: () => {
-              // Direct/cross-process writers bypass the process-local queue.
-              replaceSessionEntrySync(scope(), competing);
-              return true;
-            },
-          },
-        ],
+        messages: preparingMessage(() => {
+          // Direct/cross-process writers bypass the process-local queue.
+          replaceSessionEntrySync(scope(), competing);
+          return true;
+        }),
       });
       expect(turn).toMatchObject({ rejectedReason: "session-rebound", appendedCount: 0 });
       expect(loadSessionEntry(scope())).toMatchObject(competing);
@@ -280,24 +271,17 @@ describe("first transcript turn initialization", () => {
     await expect(
       admit({
         sessionTurnMutation: {
-          kind: "goal",
-          operation,
-          runId: operation.operationId,
+          ...goalMutation,
           assertCurrent: () => {
             if (!current) {
               throw new Error("admission closed");
             }
           },
         },
-        messages: [
-          {
-            message: userMessage(),
-            shouldAppend: async () => {
-              current = false;
-              return true;
-            },
-          },
-        ],
+        messages: preparingMessage(async () => {
+          current = false;
+          return true;
+        }),
       }),
     ).rejects.toThrow("admission closed");
     expect(counts()).toEqual({ nodes: 0, windows: 0, events: 0, receipts: 0 });
