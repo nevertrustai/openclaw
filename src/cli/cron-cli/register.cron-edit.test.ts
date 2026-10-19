@@ -27,6 +27,24 @@ async function run(args: readonly string[]) {
 }
 const edit = (args: readonly string[]) => run(["edit", "job-1", ...args]);
 const addArgs = ["add", "--name", "fixture", "--agent", "main"];
+const methods = () => callGatewayFromCli.mock.calls.map(([method]) => method);
+const rejectEdit = (args: readonly string[], message: string, reads?: string[]) =>
+  reject(["edit", "job-1", ...args], message, reads);
+async function expectJsonFailure(args: string[], message: string, root = "cron") {
+  const argv = process.argv;
+  process.argv = [...argv.slice(0, 2), root, ...args];
+  try {
+    const failure = await run(args).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ExpectedCliError);
+    expect(formatCliJsonFailure(failure)).toEqual({
+      ok: false,
+      error: { type: "cli_error", message },
+    });
+    expect(callGatewayFromCli).not.toHaveBeenCalled();
+  } finally {
+    process.argv = argv;
+  }
+}
 function existing(job: Record<string, unknown>) {
   callGatewayFromCli.mockImplementation(async (method: string) =>
     method === "cron.get" ? { id: "job-1", ...job } : { ok: true },
@@ -42,7 +60,7 @@ function expectPatch(patch: Record<string, unknown>, extra: Record<string, unkno
 async function reject(args: readonly string[], message: string, reads: string[] = []) {
   await expect(run(args)).rejects.toMatchObject({ name: "ExitError", code: 1 });
   expect(defaultRuntime.error).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(message));
-  expect(callGatewayFromCli.mock.calls.map(([method]) => method)).toEqual(reads);
+  expect(methods()).toEqual(reads);
 }
 
 beforeEach(() => {
@@ -98,24 +116,14 @@ describe("cron edit", () => {
     [["--on-exit-cwd", "/repo"], "--on-exit-cwd requires --on-exit"],
     [["--on-exit", "./watch.sh", "--every", "5m"], "Choose at most one schedule change"],
   ] as const)("rejects %j before Gateway access", async (args, message) => {
-    await reject(["edit", "job-1", ...args], message);
+    await rejectEdit(args, message);
   });
 
   it("keeps conflicting enable/disable guidance in JSON mode before RPC", async () => {
-    const argv = process.argv;
-    const commandArgs = ["edit", "job-1", "--enable", "--disable", "--json"];
-    process.argv = [...argv.slice(0, 2), "cron", ...commandArgs];
-    try {
-      const failure = await run(commandArgs).catch((error: unknown) => error);
-      expect(failure).toBeInstanceOf(ExpectedCliError);
-      expect(formatCliJsonFailure(failure)).toEqual({
-        ok: false,
-        error: { type: "cli_error", message: "Choose --enable or --disable, not both" },
-      });
-      expect(callGatewayFromCli).not.toHaveBeenCalled();
-    } finally {
-      process.argv = argv;
-    }
+    await expectJsonFailure(
+      ["edit", "job-1", "--enable", "--disable", "--json"],
+      "Choose --enable or --disable, not both",
+    );
   });
 
   it("preserves trigger.once and the exact script path when replacing the body (#119916)", async () => {
@@ -141,10 +149,7 @@ describe("cron edit", () => {
       ["missing.js", "ENOENT"],
     ] as const) {
       vi.mocked(defaultRuntime.error).mockClear();
-      await reject(
-        ["edit", "job-1", "--pacing-min", "30m", "--trigger-script", path.join(dir, file)],
-        message,
-      );
+      await rejectEdit(["--pacing-min", "30m", "--trigger-script", path.join(dir, file)], message);
     }
   });
 
@@ -155,9 +160,7 @@ describe("cron edit", () => {
       payload: { kind: "agentTurn", message: "hello" },
     });
     await edit(["--pacing-min", "30m", "--tools", "read"]);
-    expect(callGatewayFromCli.mock.calls.filter(([method]) => method === "cron.get")).toHaveLength(
-      1,
-    );
+    expect(methods().filter((method) => method === "cron.get")).toHaveLength(1);
     expectPatch(
       { pacing: { min: "30m", max: "4h" }, payload: { kind: "agentTurn", toolsAllow: ["read"] } },
       { expectedConfigRevision: "revision" },
@@ -182,20 +185,13 @@ describe("cron edit", () => {
   it("uses explicit timezone and stagger without reading the existing job", async () => {
     await edit(["--cron", "0 5 * * *", "--tz", "UTC", "--stagger", "10s"]);
     expectPatch({ schedule: { kind: "cron", expr: "0 5 * * *", tz: "UTC", staggerMs: 10000 } });
-    expect(callGatewayFromCli.mock.calls.map(([method]) => method)).toEqual([
-      "cron.update",
-      "cron.status",
-    ]);
+    expect(methods()).toEqual(["cron.update", "cron.status"]);
   });
 
   it("preserves command execution kind when disabling its timeout", async () => {
     existing({ payload: { kind: "command", argv: ["echo", "hello"] } });
     await edit(["--timeout-seconds", "0", "--clear-tools"]);
-    expect(callGatewayFromCli.mock.calls.map(([method]) => method)).toEqual([
-      "cron.get",
-      "cron.update",
-      "cron.status",
-    ]);
+    expect(methods()).toEqual(["cron.get", "cron.update", "cron.status"]);
     expectPatch({ payload: { kind: "command", timeoutSeconds: 0, toolsAllow: ["*"] } });
   });
 
@@ -248,10 +244,7 @@ describe("cron edit", () => {
 
   it("changes an explicit conversational payload without loading the old job", async () => {
     await edit(["--message", "new message", "--timeout-seconds", "12", "--tools", "read"]);
-    expect(callGatewayFromCli.mock.calls.map(([method]) => method)).toEqual([
-      "cron.update",
-      "cron.status",
-    ]);
+    expect(methods()).toEqual(["cron.update", "cron.status"]);
     expectPatch({
       payload: {
         kind: "agentTurn",
@@ -272,10 +265,7 @@ describe("cron edit", () => {
   it.each(["-1s", "not-a-duration", "999999999999999999d"])(
     "rejects failure cooldown %s",
     async (duration) => {
-      await reject(
-        ["edit", "job-1", "--failure-alert-cooldown", duration],
-        "Invalid --failure-alert-cooldown.",
-      );
+      await rejectEdit(["--failure-alert-cooldown", duration], "Invalid --failure-alert-cooldown.");
     },
   );
   it("clears the delivery destination", async () => {
@@ -364,36 +354,22 @@ describe("automation mutation options", () => {
   });
 
   it("preserves the blank cwd error through JSON output and the create alias", async () => {
-    const argv = process.argv;
-    const args = [
-      "create",
-      "--name",
-      "fixture",
-      "--on-exit",
-      "pwd",
-      "--message",
-      "run",
-      "--on-exit-cwd",
-      "",
-      "--json",
-    ];
-    process.argv = [...argv.slice(0, 2), "automations", ...args];
-    try {
-      let failure: unknown;
-      try {
-        await run(args);
-      } catch (error) {
-        failure = error;
-      }
-      expect(failure).toBeInstanceOf(ExpectedCliError);
-      expect(formatCliJsonFailure(failure)).toEqual({
-        ok: false,
-        error: { type: "cli_error", message: "--on-exit-cwd must not be blank" },
-      });
-      expect(callGatewayFromCli).not.toHaveBeenCalled();
-    } finally {
-      process.argv = argv;
-    }
+    await expectJsonFailure(
+      [
+        "create",
+        "--name",
+        "fixture",
+        "--on-exit",
+        "pwd",
+        "--message",
+        "run",
+        "--on-exit-cwd",
+        "",
+        "--json",
+      ],
+      "--on-exit-cwd must not be blank",
+      "automations",
+    );
   });
 
   it.each([undefined, ""])("preserves stream cwd edit semantics for %j", async (value) => {
@@ -416,11 +392,9 @@ describe("automation mutation options", () => {
   });
   it("rejects a blank schedule after reading pacing without mutating", async () => {
     existing({ configRevision: "revision", pacing: { min: "1m", max: "1h" } });
-    await reject(
-      ["edit", "job-1", "--pacing-min", "30m", "--every", ""],
-      "Schedule values must not be blank",
-      ["cron.get"],
-    );
+    await rejectEdit(["--pacing-min", "30m", "--every", ""], "Schedule values must not be blank", [
+      "cron.get",
+    ]);
   });
 
   it.each([

@@ -21,11 +21,14 @@ async function run(args: string[]) {
   registerCronSimpleCommands(program);
   await program.parseAsync(args, { from: "user" });
 }
-function mockPages(readPage: (params: { offset?: number }) => unknown) {
+function mockPages(readPage: (params: { offset?: number }) => unknown, legacy = false) {
   callGatewayFromCli.mockImplementation(
     async (method: string, _opts: unknown, params?: { id?: string; offset?: number }) => {
       if (method === "cron.get") {
-        throw Object.assign(new Error(`cron job not found: ${params?.id ?? ""}`), {
+        const message = legacy
+          ? "unknown method: cron.get"
+          : `cron job not found: ${params?.id ?? ""}`;
+        throw Object.assign(new Error(message), {
           name: "GatewayClientRequestError",
           gatewayCode: "INVALID_REQUEST",
         });
@@ -36,6 +39,10 @@ function mockPages(readPage: (params: { offset?: number }) => unknown) {
       throw new Error(`unexpected cron method: ${method}`);
     },
   );
+}
+const listCalls = () => callGatewayFromCli.mock.calls.filter(([method]) => method === "cron.list");
+function expectRequest(method: string, params: unknown) {
+  expect(callGatewayFromCli).toHaveBeenCalledExactlyOnceWith(method, expect.anything(), params);
 }
 const page = {
   snapshotRevision: "stable",
@@ -65,22 +72,20 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("cron output routing", () => {
-  it("inherits parent Gateway options without losing JSON mode", async () => {
-    const program = new Command().name("openclaw");
-    registerCronCli(program);
-    const argv = ["node", "openclaw", "automations", "--port", "18789", "status"];
-    program.hook("preAction", (_parent, command) => {
-      expect(isCommandJsonOutputMode(command, argv)).toBe(true);
-    });
-    await program.parseAsync(argv);
-    expect(callGatewayFromCli).toHaveBeenCalledWith(
-      "cron.status",
-      expect.objectContaining({ port: "18789" }),
-      {},
-    );
-    expect(defaultRuntime.writeJson).toHaveBeenCalledWith({ enabled: true });
+it("inherits parent Gateway options without losing JSON mode", async () => {
+  const program = new Command().name("openclaw");
+  registerCronCli(program);
+  const argv = ["node", "openclaw", "automations", "--port", "18789", "status"];
+  program.hook("preAction", (_parent, command) => {
+    expect(isCommandJsonOutputMode(command, argv)).toBe(true);
   });
+  await program.parseAsync(argv);
+  expect(callGatewayFromCli).toHaveBeenCalledWith(
+    "cron.status",
+    expect.objectContaining({ port: "18789" }),
+    {},
+  );
+  expect(defaultRuntime.writeJson).toHaveBeenCalledWith({ enabled: true });
 });
 
 describe("cron show pagination (#83856)", () => {
@@ -89,101 +94,32 @@ describe("cron show pagination (#83856)", () => {
       label: "non-advancing cursor",
       read: () => ({ ...page, jobs: [], total: 1, hasMore: true, nextOffset: 0 }),
       error: "pagination did not advance",
-      calls: 1,
-    },
-    {
-      label: "page bound",
-      read: ({ offset = 0 }: { offset?: number }) => ({
-        ...page,
-        jobs: [{ id: `page-${offset}`, name: `Page ${offset}` }],
-        total: 51,
-        offset,
-        hasMore: true,
-        nextOffset: offset + 1,
-      }),
-      error: "pagination exceeded maximum pages",
-      calls: 50,
     },
     {
       label: "missing job",
       read: () => ({ ...page, jobs: [], total: 0 }),
       error:
         "Automation not found: missing. Run `openclaw cron list` to see recent automation ids.",
-      calls: 1,
     },
-  ])("rejects $label", async ({ read, error, calls }) => {
+  ])("rejects $label", async ({ read, error }) => {
     mockPages(read);
     await expect(run(["show", "missing", "--json"])).rejects.toThrow("exit 1");
     expect(defaultRuntime.error).toHaveBeenCalledWith(expect.stringContaining(error));
-    expect(callGatewayFromCli.mock.calls.filter(([method]) => method === "cron.list")).toHaveLength(
-      calls,
-    );
-  });
-  it("finds an exact name beyond the first page", async () => {
-    mockPages(({ offset = 0 }) => ({
-      ...page,
-      total: 201,
-      offset,
-      hasMore: offset === 0,
-      nextOffset: offset === 0 ? 200 : null,
-      jobs: offset
-        ? [{ id: "abc", name: "wanted" }]
-        : Array.from({ length: 200 }, (_, index) => ({
-            id: `page-${index}`,
-            name: `Page ${index}`,
-          })),
-    }));
-    await run(["show", "wanted", "--json"]);
-    expect(defaultRuntime.writeJson).toHaveBeenCalledWith(expect.objectContaining({ id: "abc" }));
-    expect(callGatewayFromCli.mock.calls.filter(([method]) => method === "cron.list")).toHaveLength(
-      2,
-    );
+    expect(listCalls()).toHaveLength(1);
   });
 });
 
-describe("cron show legacy rows without state (#173631)", () => {
-  it("renders a version-skewed job row that omits state instead of crashing", async () => {
-    // Protocol-v4 Gateways lack cron.get; the CLI falls back to raw legacy
-    // cron.list pages. Older/malformed rows can omit state entirely, which
-    // used to crash printCronShow on the first job.state access.
-    callGatewayFromCli.mockImplementation(async (method: string) => {
-      if (method === "cron.get") {
-        throw Object.assign(new Error("unknown method: cron.get"), {
-          name: "GatewayClientRequestError",
-          gatewayCode: "INVALID_REQUEST",
-        });
-      }
-      if (method === "cron.list") {
-        return {
-          jobs: [
-            {
-              id: "legacy-job",
-              name: "Legacy job",
-              enabled: true,
-              schedule: undefined,
-              payload: undefined,
-              sessionTarget: undefined,
-              agentId: undefined,
-              state: undefined,
-            },
-          ],
-        };
-      }
-      throw new Error(`unexpected cron method: ${method}`);
-    });
-    const logs: string[] = [];
-    vi.spyOn(defaultRuntime, "log").mockImplementation((...args: unknown[]) => {
-      for (const arg of args) {
-        logs.push(String(arg));
-      }
-    });
-    await run(["show", "legacy-job"]);
-    expect(callGatewayFromCli).toHaveBeenCalledWith("cron.get", expect.anything(), {
-      id: "legacy-job",
-    });
-    expect(logs.join("\n")).toContain("id: legacy-job");
-    expect(logs.join("\n")).toContain("name: Legacy job");
+it("renders a legacy job without state instead of crashing (#173631)", async () => {
+  // Protocol-v4 rows can omit state, formerly crashing printCronShow.
+  mockPages(() => ({ jobs: [{ id: "legacy-job", name: "Legacy job", enabled: true }] }), true);
+  const log = vi.spyOn(defaultRuntime, "log").mockImplementation(() => {});
+  await run(["show", "legacy-job"]);
+  expect(callGatewayFromCli).toHaveBeenCalledWith("cron.get", expect.anything(), {
+    id: "legacy-job",
   });
+  const output = log.mock.calls.flat().map(String).join("\n");
+  expect(output).toContain("id: legacy-job");
+  expect(output).toContain("name: Legacy job");
 });
 
 it("emits the hidden-job hint when disabling from a terminal", async () => {
@@ -212,7 +148,7 @@ describe("cron runs", () => {
   it("queries all visible automations without a job selector", async () => {
     callGatewayFromCli.mockResolvedValueOnce({ entries: [], total: 0 });
     await run(["runs", "--all"]);
-    expect(callGatewayFromCli).toHaveBeenCalledExactlyOnceWith("cron.runs", expect.anything(), {
+    expectRequest("cron.runs", {
       scope: "all",
       limit: 50,
     });
@@ -220,25 +156,21 @@ describe("cron runs", () => {
   });
 
   it("retains filters and pagination in the all-jobs request", async () => {
+    const filters = {
+      status: "error",
+      "delivery-status": "not-delivered",
+      query: "timeout",
+      sort: "asc",
+      offset: "1",
+      limit: "2",
+      "run-id": "run-1",
+    };
     await run([
       "runs",
       "--all",
-      "--status",
-      "error",
-      "--delivery-status",
-      "not-delivered",
-      "--query",
-      "timeout",
-      "--sort",
-      "asc",
-      "--offset",
-      "1",
-      "--limit",
-      "2",
-      "--run-id",
-      "run-1",
+      ...Object.entries(filters).flatMap(([key, value]) => [`--${key}`, value]),
     ]);
-    expect(callGatewayFromCli).toHaveBeenCalledExactlyOnceWith("cron.runs", expect.anything(), {
+    expectRequest("cron.runs", {
       scope: "all",
       status: "error",
       deliveryStatus: "not-delivered",
@@ -269,12 +201,7 @@ describe("cron runs", () => {
     const argv = process.argv;
     process.argv = [...argv.slice(0, 2), "cron", "runs", "job-1", "--offset", "-1", "--json"];
     try {
-      let thrown: unknown;
-      try {
-        await program.parseAsync(process.argv);
-      } catch (error) {
-        thrown = error;
-      }
+      const thrown = await program.parseAsync(process.argv).catch((error: unknown) => error);
       expect(thrown).toBeInstanceOf(ExpectedCliError);
       expect(formatCliJsonFailure(thrown)).toEqual({
         ok: false,

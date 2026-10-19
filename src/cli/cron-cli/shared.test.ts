@@ -56,8 +56,43 @@ function createRuntimeLogCapture(): { logs: string[]; runtime: RuntimeEnv } {
   return { logs, runtime };
 }
 
-function expectLogsToInclude(logs: readonly string[], text: string): void {
-  expect(logs.join("\n")).toContain(text);
+function expectLogsToInclude(logs: readonly string[], ...texts: string[]): void {
+  for (const text of texts) {
+    expect(logs.join("\n")).toContain(text);
+  }
+}
+
+function renderJob(job: CronJob) {
+  return { list: renderList(job), show: renderShow(job) };
+}
+function renderList(...jobs: CronJob[]) {
+  const { logs, runtime } = createRuntimeLogCapture();
+  printCronList(jobs, runtime);
+  return logs;
+}
+function renderShow(job: CronJob) {
+  const { logs, runtime } = createRuntimeLogCapture();
+  printCronShow(job, runtime);
+  return logs;
+}
+
+function captureError(error: unknown): unknown {
+  try {
+    handleCronCliError(error);
+  } catch (caught) {
+    return caught;
+  }
+}
+
+function withJsonArgs(args: string[], check: () => void) {
+  const argv = process.argv;
+  process.argv = [...argv.slice(0, 2), ...args, "--json"];
+  try {
+    check();
+  } finally {
+    process.argv = argv;
+    vi.unstubAllEnvs();
+  }
 }
 
 afterEach(() => {
@@ -91,8 +126,7 @@ describe("printCronList", () => {
     { at: "+010000-01-15T12:34:56.789Z", expected: "+010000-01-15 12:34Z" },
     { at: "not-a-time", expected: "-" },
   ])("preserves one-shot ISO year in cron list for $at", ({ at, expected }) => {
-    const { logs, runtime } = createRuntimeLogCapture();
-    printCronList([createBaseJob({ schedule: { kind: "at", at }, state: {} })], runtime);
+    const logs = renderList(createBaseJob({ schedule: { kind: "at", at }, state: {} }));
     expectLogsToInclude(logs, `at ${expected}`);
   });
 
@@ -173,22 +207,18 @@ describe("printCronList", () => {
       },
     });
 
-    const list = createRuntimeLogCapture();
-    printCronList([job], list.runtime);
-    expect(list.logs[0]).toContain("Declaration");
-    expect(list.logs[0]).toContain("Owner");
-    expectLogsToInclude(list.logs, "daily-report");
-    expectLogsToInclude(list.logs, "Daily summary");
-    expectLogsToInclude(list.logs, "agent:ops:main");
-
-    const show = createRuntimeLogCapture();
-    printCronShow(job, show.runtime);
-    expectLogsToInclude(show.logs, "declaration: daily-report");
-    expectLogsToInclude(show.logs, "display name: Daily summary");
-    expectLogsToInclude(show.logs, "owner agent: ops");
-    expectLogsToInclude(show.logs, "last error: boom");
-    expectLogsToInclude(show.logs, "last delivery: not-delivered");
-    expectLogsToInclude(show.logs, "last delivery error: offline");
+    const { list, show } = renderJob(job);
+    expectLogsToInclude([list[0] ?? ""], "Declaration", "Owner");
+    expectLogsToInclude(list, "daily-report", "Daily summary", "agent:ops:main");
+    expectLogsToInclude(
+      show,
+      "declaration: daily-report",
+      "display name: Daily summary",
+      "owner agent: ops",
+      "last error: boom",
+      "last delivery: not-delivered",
+      "last delivery error: offline",
+    );
   });
 
   it("sanitizes every stored cron show value at the terminal boundary", () => {
@@ -224,7 +254,6 @@ describe("printCronList", () => {
   });
 
   it("tolerates malformed rows in human-readable output", () => {
-    const { logs, runtime } = createRuntimeLogCapture();
     const malformedJob = {
       id: "malformed-job",
       name: undefined,
@@ -235,8 +264,7 @@ describe("printCronList", () => {
       state: undefined,
     } as unknown as CronJob;
 
-    printCronList([malformedJob], runtime);
-    expectLogsToInclude(logs, "malformed-job");
+    expectLogsToInclude(renderList(malformedJob), "malformed-job");
   });
 
   it.each([
@@ -276,14 +304,11 @@ describe("printCronList", () => {
     triggerDetail?: string;
   }>)("formats schedules in list and show: $expected", ({ schedule, expected, ...details }) => {
     const job = createBaseJob({ schedule, state: {}, ...details });
-    const list = createRuntimeLogCapture();
-    printCronList([job], list.runtime);
-    expectLogsToInclude(list.logs, expected);
-    const show = createRuntimeLogCapture();
-    printCronShow(job, show.runtime);
-    expectLogsToInclude(show.logs, `schedule: ${expected}`);
+    const { list, show } = renderJob(job);
+    expectLogsToInclude(list, expected);
+    expectLogsToInclude(show, `schedule: ${expected}`);
     if (details.triggerDetail) {
-      expectLogsToInclude(show.logs, details.triggerDetail);
+      expectLogsToInclude(show, details.triggerDetail);
     }
   });
 
@@ -300,19 +325,16 @@ describe("printCronList", () => {
       },
     });
 
-    const list = createRuntimeLogCapture();
-    printCronList([job], list.runtime);
-    const row = list.logs.find((line) => line.includes(job.id)) ?? "";
+    const { list, show } = renderJob(job);
+    const row = list.find((line) => line.includes(job.id)) ?? "";
     expect(row).toContain(running ? "running" : "disabled");
     expect(row).not.toContain("idle");
     expect(row).not.toContain("ok (suppressed)");
 
-    const show = createRuntimeLogCapture();
-    printCronShow(job, show.runtime);
-    expect(show.logs).toContain(`status: ${running ? "running" : "disabled"}`);
-    expectLogsToInclude(show.logs, "stream status: disabled");
+    expect(show).toContain(`status: ${running ? "running" : "disabled"}`);
     expectLogsToInclude(
-      show.logs,
+      show,
+      "stream status: disabled",
       "stream error: stream sources require cron.triggers.enabled=true",
     );
     expect(enrichCronJsonWithStatus(job)).toMatchObject({ status: running ? "running" : "ok" });
@@ -330,8 +352,7 @@ describe("printCronList", () => {
       state: { lastRunStatus: "error", consecutiveErrors: 1, lastError: "boom" },
     });
 
-    const { logs, runtime } = createRuntimeLogCapture();
-    printCronList([failing, singleFailure], runtime);
+    const logs = renderList(failing, singleFailure);
 
     expectLogsToInclude(logs, "error (12x)");
     // A single failure keeps the bare status token; the count only marks repeats.
@@ -360,14 +381,13 @@ describe("printCronList", () => {
         },
       });
 
-      const list = createRuntimeLogCapture();
-      printCronList([job], list.runtime);
-      expectLogsToInclude(list.logs, expectedStatus);
-
-      const show = createRuntimeLogCapture();
-      printCronShow(job, show.runtime);
-      expectLogsToInclude(show.logs, `status: ${expectedStatus}`);
-      expectLogsToInclude(show.logs, `last delivery error: ${deliveryError}`);
+      const { list, show } = renderJob(job);
+      expectLogsToInclude(list, expectedStatus);
+      expectLogsToInclude(
+        show,
+        `status: ${expectedStatus}`,
+        `last delivery error: ${deliveryError}`,
+      );
 
       expect(enrichCronJsonWithStatus(job)).toMatchObject({
         status: "ok",
@@ -379,74 +399,55 @@ describe("printCronList", () => {
     },
   );
 
-  it.each(["silent"] as const)(
-    "shows recorded %s suppression without changing JSON delivery status",
-    (deliverySuppressionReason) => {
-      const job = createBaseJob({
-        state: {
-          lastRunStatus: "ok",
-          lastDeliveryStatus: "not-delivered",
-          lastDelivered: false,
-          deliverySuppressionReason,
-        },
-      });
-      const list = createRuntimeLogCapture();
-      printCronList([job], list.runtime);
-      expectLogsToInclude(list.logs, "ok (suppressed)");
-      expect(list.logs.join("\n")).not.toContain("ok (not delivered)");
-
-      const show = createRuntimeLogCapture();
-      printCronShow(job, show.runtime);
-      expectLogsToInclude(show.logs, "status: ok (suppressed)");
-      expectLogsToInclude(show.logs, "last delivery: not-delivered");
-      expectLogsToInclude(show.logs, `last delivery suppression: ${deliverySuppressionReason}`);
-      expect(enrichCronJsonWithStatus(job)).toMatchObject({
-        status: "ok",
-        state: {
-          lastDeliveryStatus: "not-delivered",
-          lastDelivered: false,
-          deliverySuppressionReason,
-        },
-      });
-    },
-  );
+  it("shows recorded silent suppression without changing JSON delivery status", () => {
+    const deliverySuppressionReason = "silent";
+    const job = createBaseJob({
+      state: {
+        lastRunStatus: "ok",
+        lastDeliveryStatus: "not-delivered",
+        lastDelivered: false,
+        deliverySuppressionReason,
+      },
+    });
+    const { list, show } = renderJob(job);
+    expectLogsToInclude(list, "ok (suppressed)");
+    expect(list.join("\n")).not.toContain("ok (not delivered)");
+    expectLogsToInclude(
+      show,
+      "status: ok (suppressed)",
+      "last delivery: not-delivered",
+      `last delivery suppression: ${deliverySuppressionReason}`,
+    );
+    expect(enrichCronJsonWithStatus(job)).toMatchObject({
+      status: "ok",
+      state: {
+        lastDeliveryStatus: "not-delivered",
+        lastDelivered: false,
+        deliverySuppressionReason,
+      },
+    });
+  });
 
   it("shows why the scheduler auto-disabled a job without changing JSON status", () => {
-    const runFailures = createBaseJob({
-      id: "auto-disabled-runs",
-      name: "Auto-disabled runs",
-      enabled: false,
-      state: {
-        consecutiveErrors: 10,
-        autoDisabled: {
-          reason: "consecutive-failures",
-          atMs: Date.now(),
-          consecutiveErrors: 10,
+    const disabledJob = (reason: "consecutive-failures" | "schedule-errors", count: number) =>
+      createBaseJob({
+        enabled: false,
+        state: {
+          ...(reason === "schedule-errors"
+            ? { scheduleErrorCount: count }
+            : { consecutiveErrors: count }),
+          autoDisabled: { reason, atMs: Date.now(), consecutiveErrors: count },
         },
-      },
-    });
-    const scheduleErrors = createBaseJob({
-      id: "auto-disabled-schedule",
-      name: "Auto-disabled schedule",
-      enabled: false,
-      state: {
-        scheduleErrorCount: 3,
-        autoDisabled: {
-          reason: "schedule-errors",
-          atMs: Date.now(),
-          consecutiveErrors: 3,
-        },
-      },
-    });
+      });
+    const runFailures = disabledJob("consecutive-failures", 10);
+    const scheduleErrors = disabledJob("schedule-errors", 3);
 
-    const list = createRuntimeLogCapture();
-    printCronList([runFailures, scheduleErrors], list.runtime);
-    expectLogsToInclude(list.logs, "disabled (10x)");
-    expectLogsToInclude(list.logs, "disabled (schedule)");
-
-    const show = createRuntimeLogCapture();
-    printCronShow(runFailures, show.runtime);
-    expectLogsToInclude(show.logs, "status: disabled (10x)");
+    expectLogsToInclude(
+      renderList(runFailures, scheduleErrors),
+      "disabled (10x)",
+      "disabled (schedule)",
+    );
+    expectLogsToInclude(renderShow(runFailures), "status: disabled (10x)");
 
     expect(enrichCronJsonWithStatus(runFailures)).toMatchObject({
       status: "disabled",
@@ -457,22 +458,17 @@ describe("printCronList", () => {
   });
 
   it("caps the failure count so the status column never overflows", () => {
-    const { logs, runtime } = createRuntimeLogCapture();
-    printCronList(
-      [
-        createBaseJob({
-          id: "minute-cron-job",
-          state: { lastRunStatus: "error", consecutiveErrors: 1440, lastError: "boom" },
-        }),
-      ],
-      runtime,
+    const logs = renderList(
+      createBaseJob({
+        id: "minute-cron-job",
+        state: { lastRunStatus: "error", consecutiveErrors: 1440, lastError: "boom" },
+      }),
     );
     expectLogsToInclude(logs, "error (99+x)");
     expect(logs.join("\n")).not.toContain("1440");
   });
 
   it("shows dash for unset agentId instead of default", () => {
-    const { logs, runtime } = createRuntimeLogCapture();
     const job = createBaseJob({
       id: "no-agent-job",
       name: "No Agent",
@@ -481,10 +477,8 @@ describe("printCronList", () => {
       payload: { kind: "agentTurn", message: "hello", model: "sonnet" },
     });
 
-    printCronList([job], runtime);
-    // Header should say "Agent ID" not "Agent"
+    const logs = renderList(job);
     expect(logs[0]).toContain("Agent ID");
-    // Data row should show "-" for missing agentId, not "default"
     const dataLine = logs[1] ?? "";
     expect(dataLine).not.toContain("default");
   });
@@ -595,48 +589,32 @@ describe("handleCronCliError", () => {
     exit.mockRestore();
   });
 
-  it.each([
-    {
-      label: "typed lookup miss",
-      error: new GatewayClientRequestError({
-        code: "INVALID_REQUEST",
-        message: "transport-neutral lookup miss",
-        details: { code: "CRON_JOB_NOT_FOUND", jobId: "missing-job" },
-      }),
-      message:
-        "Automation not found: missing-job. Run `openclaw cron list` to see recent automation ids.",
-    },
-  ])(
-    "hands a $label to the root renderer as an expected machine-output failure",
-    ({ error, message }) => {
-      const argv = process.argv;
-      process.argv = [...argv.slice(0, 2), "cron", "show", "missing-job", "--json"];
-      try {
-        let thrown: unknown;
-        try {
-          handleCronCliError(error);
-        } catch (caught) {
-          thrown = caught;
-        }
-        expect(thrown).toBeInstanceOf(ExpectedCliError);
-        expect(formatCliJsonFailure(thrown)).toEqual({
-          ok: false,
-          error: { type: "cli_error", message },
-        });
-        const stderr = formatCliFailureLines({
-          title: "Could not start the CLI.",
-          error: thrown,
-          argv: process.argv,
-        }).join("\n");
-        expect(stderr).toContain(message);
-        expect(stderr).not.toContain("Could not start the CLI.");
-        expect(stderr).not.toContain("openclaw doctor");
-        expect(stderr).not.toContain("OPENCLAW_DEBUG");
-      } finally {
-        process.argv = argv;
-      }
-    },
-  );
+  it("hands a typed lookup miss to the root renderer as an expected machine-output failure", () => {
+    const error = new GatewayClientRequestError({
+      code: "INVALID_REQUEST",
+      message: "transport-neutral lookup miss",
+      details: { code: "CRON_JOB_NOT_FOUND", jobId: "missing-job" },
+    });
+    const message =
+      "Automation not found: missing-job. Run `openclaw cron list` to see recent automation ids.";
+    withJsonArgs(["cron", "show", "missing-job"], () => {
+      const thrown = captureError(error);
+      expect(thrown).toBeInstanceOf(ExpectedCliError);
+      expect(formatCliJsonFailure(thrown)).toEqual({
+        ok: false,
+        error: { type: "cli_error", message },
+      });
+      const stderr = formatCliFailureLines({
+        title: "Could not start the CLI.",
+        error: thrown,
+        argv: process.argv,
+      }).join("\n");
+      expect(stderr).toContain(message);
+      expect(stderr).not.toContain("Could not start the CLI.");
+      expect(stderr).not.toContain("openclaw doctor");
+      expect(stderr).not.toContain("OPENCLAW_DEBUG");
+    });
+  });
 
   // A legacy gateway without cron.get makes `cron edit <id> --exact` wrap the
   // lookup miss; the renderer only reveals such causes on explicit debug intent.
@@ -652,24 +630,9 @@ describe("handleCronCliError", () => {
     const wrapped = new CronCliError("unknown automation id: missing-job", {
       cause: new Error("unknown method: cron.get"),
     });
-    const argv = process.argv;
-    process.argv = [
-      ...argv.slice(0, 2),
-      "cron",
-      "edit",
-      "missing-job",
-      "--exact",
-      "--json",
-      ...flags,
-    ];
-    vi.stubEnv("OPENCLAW_DEBUG", debug);
-    try {
-      let thrown: unknown;
-      try {
-        handleCronCliError(wrapped);
-      } catch (caught) {
-        thrown = caught;
-      }
+    withJsonArgs(["cron", "edit", "missing-job", "--exact", ...flags], () => {
+      vi.stubEnv("OPENCLAW_DEBUG", debug);
+      const thrown = captureError(wrapped);
       expect(thrown).toBeInstanceOf(ExpectedCliError);
       const machineMessage = formatCliJsonFailure(thrown).error.message;
       expect(machineMessage).toContain("unknown automation id: missing-job");
@@ -680,26 +643,16 @@ describe("handleCronCliError", () => {
       }).join("\n");
       expect(stderr).toContain("unknown automation id: missing-job");
       expect(stderr.includes("unknown method: cron.get")).toBe(causeShown);
-    } finally {
-      vi.unstubAllEnvs();
-      process.argv = argv;
-    }
+    });
   });
 
   it.each([false, true])("preserves unexpected machine-mode errors with debug=%s", (debug) => {
     const error = new Error("Automation runtime failed", {
       cause: new Error("Runtime load failed"),
     });
-    const argv = process.argv;
-    process.argv = [...argv.slice(0, 2), "automations", "status", "--json"];
-    vi.stubEnv("OPENCLAW_DEBUG", debug ? "1" : "");
-    try {
-      let thrown: unknown;
-      try {
-        handleCronCliError(error);
-      } catch (caught) {
-        thrown = caught;
-      }
+    withJsonArgs(["automations", "status"], () => {
+      vi.stubEnv("OPENCLAW_DEBUG", debug ? "1" : "");
+      const thrown = captureError(error);
       expect(thrown).toBe(error);
       const stderr = formatCliFailureLines({
         title: "The CLI command failed.",
@@ -711,9 +664,6 @@ describe("handleCronCliError", () => {
       expect(formatCliJsonFailure(thrown).error.message.includes("Runtime load failed")).toBe(
         debug,
       );
-    } finally {
-      vi.unstubAllEnvs();
-      process.argv = argv;
-    }
+    });
   });
 });
