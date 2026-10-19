@@ -148,15 +148,34 @@ export class GatewaySessionRowEvents {
       const ancestorSessions = Array.isArray(ancestors)
         ? ancestors.map((row) => decodeRow(row, transaction))
         : ancestors;
+      let envelope = payload;
+      if (Object.hasOwn(payload, "sessionFieldRefs")) {
+        const row = asNullableRecord(session);
+        const refs = payload.sessionFieldRefs;
+        if (!row || !Array.isArray(refs)) {
+          throw new Error("invalid session field references");
+        }
+        const fields = Object.keys(row).toSorted();
+        const restored = refs.map((index: unknown) => {
+          const field =
+            typeof index === "number" && Number.isInteger(index) ? fields[index] : undefined;
+          if (field === undefined || Object.hasOwn(payload, field)) {
+            throw new Error("invalid session field reference");
+          }
+          return [field, row[field]];
+        });
+        envelope = { ...payload, ...Object.fromEntries(restored) };
+        delete envelope.sessionFieldRefs;
+      }
       transaction.commit();
       return {
         event:
-          session === payload.session && ancestorSessions === ancestors
+          session === payload.session && ancestorSessions === ancestors && envelope === payload
             ? event
             : {
                 ...event,
                 payload: {
-                  ...payload,
+                  ...envelope,
                   ...(Object.hasOwn(payload, "session") ? { session } : {}),
                   ...(Object.hasOwn(payload, "ancestorSessions") ? { ancestorSessions } : {}),
                 },
