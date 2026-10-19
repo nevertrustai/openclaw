@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { defaultRuntime } from "../../runtime.js";
 import { ExpectedCliError, formatCliJsonFailure } from "../failure-output.js";
 import { isCommandJsonOutputMode } from "../program/json-mode.js";
@@ -88,25 +88,22 @@ it("inherits parent Gateway options without losing JSON mode", async () => {
   expect(defaultRuntime.writeJson).toHaveBeenCalledWith({ enabled: true });
 });
 
-describe("cron show pagination (#83856)", () => {
-  it.each([
-    {
-      label: "non-advancing cursor",
-      read: () => ({ ...page, jobs: [], total: 1, hasMore: true, nextOffset: 0 }),
-      error: "pagination did not advance",
-    },
-    {
-      label: "missing job",
-      read: () => ({ ...page, jobs: [], total: 0 }),
-      error:
-        "Automation not found: missing. Run `openclaw cron list` to see recent automation ids.",
-    },
-  ])("rejects $label", async ({ read, error }) => {
-    mockPages(read);
-    await expect(run(["show", "missing", "--json"])).rejects.toThrow("exit 1");
-    expect(defaultRuntime.error).toHaveBeenCalledWith(expect.stringContaining(error));
-    expect(listCalls()).toHaveLength(1);
-  });
+it.each([
+  {
+    label: "non-advancing cursor",
+    read: () => ({ ...page, jobs: [], total: 1, hasMore: true, nextOffset: 0 }),
+    error: "pagination did not advance",
+  },
+  {
+    label: "missing job",
+    read: () => ({ ...page, jobs: [], total: 0 }),
+    error: "Automation not found: missing. Run `openclaw cron list` to see recent automation ids.",
+  },
+])("cron show rejects $label (#83856)", async ({ read, error }) => {
+  mockPages(read);
+  await expect(run(["show", "missing", "--json"])).rejects.toThrow("exit 1");
+  expect(defaultRuntime.error).toHaveBeenCalledWith(expect.stringContaining(error));
+  expect(listCalls()).toHaveLength(1);
 });
 
 it("renders a legacy job without state instead of crashing (#173631)", async () => {
@@ -144,72 +141,56 @@ it("warns for a known disabled scheduler", async () => {
   }
 });
 
-describe("cron runs", () => {
-  it("queries all visible automations without a job selector", async () => {
-    callGatewayFromCli.mockResolvedValueOnce({ entries: [], total: 0 });
-    await run(["runs", "--all"]);
-    expectRequest("cron.runs", {
-      scope: "all",
-      limit: 50,
-    });
-    expect(defaultRuntime.writeJson).toHaveBeenCalledWith({ entries: [], total: 0 });
-  });
+it.each([
+  { args: ["--all"], selector: { scope: "all" } },
+  { args: ["--id", "job-1"], selector: { id: "job-1" } },
+])("cron runs preserves default paging for $args", async ({ args, selector }) => {
+  const response = { entries: [], total: 0 };
+  callGatewayFromCli.mockResolvedValueOnce(response);
+  await run(["runs", ...args]);
+  expectRequest("cron.runs", { ...selector, limit: 50 });
+  expect(defaultRuntime.writeJson).toHaveBeenCalledWith(response);
+});
 
-  it("retains filters and pagination in the all-jobs request", async () => {
-    const filters = {
-      status: "error",
-      "delivery-status": "not-delivered",
-      query: "timeout",
-      sort: "asc",
-      offset: "1",
-      limit: "2",
-      "run-id": "run-1",
-    };
-    await run([
-      "runs",
-      "--all",
-      ...Object.entries(filters).flatMap(([key, value]) => [`--${key}`, value]),
-    ]);
-    expectRequest("cron.runs", {
-      scope: "all",
-      status: "error",
-      deliveryStatus: "not-delivered",
-      query: "timeout",
-      sortDir: "asc",
-      offset: 1,
-      limit: 2,
-      runId: "run-1",
-    });
+it("retains filters and pagination in the all-jobs request", async () => {
+  await run(
+    (
+      "runs --all --status error --delivery-status not-delivered --query timeout " +
+      "--sort asc --offset 1 --limit 2 --run-id run-1"
+    ).split(" "),
+  );
+  expectRequest("cron.runs", {
+    scope: "all",
+    status: "error",
+    deliveryStatus: "not-delivered",
+    query: "timeout",
+    sortDir: "asc",
+    offset: 1,
+    limit: 2,
+    runId: "run-1",
   });
+});
 
-  it("rejects --all combined with a supplied selector before RPC", async () => {
-    await expect(run(["runs", "--all", "job-1"])).rejects.toThrow("exit 1");
-    expect(defaultRuntime.error).toHaveBeenCalledWith("--all cannot be combined with a job id");
+it("rejects --all combined with a supplied selector before RPC", async () => {
+  await expect(run(["runs", "--all", "job-1"])).rejects.toThrow("exit 1");
+  expect(defaultRuntime.error).toHaveBeenCalledWith("--all cannot be combined with a job id");
+  expect(callGatewayFromCli).not.toHaveBeenCalled();
+});
+
+it("reports an invalid offset as an expected JSON failure before RPC", async () => {
+  const program = new Command().name("openclaw").exitOverride();
+  registerCronCli(program);
+  const argv = process.argv;
+  process.argv = [...argv.slice(0, 2), "cron", "runs", "job-1", "--offset", "-1", "--json"];
+  try {
+    const thrown = await program.parseAsync(process.argv).catch((error: unknown) => error);
+    expect(thrown).toBeInstanceOf(ExpectedCliError);
+    expect(formatCliJsonFailure(thrown)).toEqual({
+      ok: false,
+      error: { type: "cli_error", message: "Invalid --offset (must be a non-negative integer)." },
+    });
     expect(callGatewayFromCli).not.toHaveBeenCalled();
-  });
-
-  it("preserves default paging and the --id alias", async () => {
-    await run(["runs", "--id", "job-1"]);
-    expect(callGatewayFromCli).toHaveBeenCalledWith("cron.runs", expect.anything(), {
-      id: "job-1",
-      limit: 50,
-    });
-  });
-  it("reports an invalid offset as an expected JSON failure before RPC", async () => {
-    const program = new Command().name("openclaw").exitOverride();
-    registerCronCli(program);
-    const argv = process.argv;
-    process.argv = [...argv.slice(0, 2), "cron", "runs", "job-1", "--offset", "-1", "--json"];
-    try {
-      const thrown = await program.parseAsync(process.argv).catch((error: unknown) => error);
-      expect(thrown).toBeInstanceOf(ExpectedCliError);
-      expect(formatCliJsonFailure(thrown)).toEqual({
-        ok: false,
-        error: { type: "cli_error", message: "Invalid --offset (must be a non-negative integer)." },
-      });
-      expect(callGatewayFromCli).not.toHaveBeenCalled();
-    } finally {
-      process.argv = argv;
-    }
-  });
+  } finally {
+    process.argv = argv;
+  }
 });

@@ -21,6 +21,20 @@ const { registerCronAddCommand } = await import("./register.cron-add.js");
 const { registerCronEditCommand } = await import("./register.cron-edit.js");
 const { readCronPayloadScript, readCronTriggerScript, readCronScratchContent } =
   await import("./trigger-options.js");
+let fixtureRoot = "";
+
+async function fixture(name: string, content: string | Buffer) {
+  if (name !== name.trim()) {
+    await fs.writeFile(path.join(fixtureRoot, name.trim()), "wrong file", "utf8");
+  }
+  const file = path.join(fixtureRoot, name);
+  await fs.writeFile(file, content);
+  return file;
+}
+
+function expectRequest(method: string, options: unknown, payload: unknown) {
+  expect(callGatewayFromCli).toHaveBeenCalledWith(method, options, payload);
+}
 
 async function run(operation: "add" | "edit", options: Record<string, string | true>) {
   const program = new Command().exitOverride();
@@ -54,9 +68,8 @@ describe("cron trigger CLI options", () => {
     ["Script payload", readCronPayloadScript],
     ["Cron scratch", readCronScratchContent],
   ] as const)("rejects malformed UTF-8 for %s from files and stdin", async (label, read) => {
-    const file = path.join(fixtureRoot, "invalid.txt");
     const bytes = Buffer.from([0x78, 0xff, 0x79]);
-    await fs.writeFile(file, bytes);
+    const file = await fixture("invalid.txt", bytes);
     await expect(read(file)).rejects.toThrow(`${label} must be valid UTF-8`);
     const stdin = vi
       .spyOn(process.stdin, Symbol.asyncIterator)
@@ -69,20 +82,16 @@ describe("cron trigger CLI options", () => {
   });
 
   it("preserves exact scratch BOM, Unicode and CRLF while scripts retain trimming", async () => {
-    const file = path.join(fixtureRoot, "valid.txt");
     const text = "\uFEFF 中文 😀 \uFFFD\r\n";
-    await fs.writeFile(file, text, "utf8");
+    const file = await fixture("valid.txt", text);
     await expect(readCronScratchContent(file)).resolves.toBe(text);
     await expect(readCronTriggerScript(file)).resolves.toBe("中文 😀 \uFFFD");
     await expect(readCronPayloadScript(file)).resolves.toBe("中文 😀 \uFFFD");
   });
 
-  let fixtureRoot = "";
-
   beforeEach(async () => {
     fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cron-trigger-cli-"));
-    callGatewayFromCli.mockReset();
-    callGatewayFromCli.mockResolvedValue({ ok: true });
+    callGatewayFromCli.mockReset().mockResolvedValue({ ok: true });
   });
 
   afterEach(async () => {
@@ -90,9 +99,7 @@ describe("cron trigger CLI options", () => {
   });
 
   it("reads the exact trigger path on add", async () => {
-    const scriptPath = path.join(fixtureRoot, "watch.js ");
-    await fs.writeFile(path.join(fixtureRoot, "watch.js"), "json({ fire: false })", "utf8");
-    await fs.writeFile(scriptPath, "  json({ fire: true })  \n", "utf8");
+    const scriptPath = await fixture("watch.js ", "  json({ fire: true })  \n");
     await run("add", {
       "trigger-script": scriptPath,
       "trigger-once": true,
@@ -100,12 +107,10 @@ describe("cron trigger CLI options", () => {
       session: "main",
     });
 
-    expect(callGatewayFromCli).toHaveBeenCalledWith(
+    expectRequest(
       "cron.add",
       expect.objectContaining({ triggerScript: scriptPath, triggerOnce: true }),
-      expect.objectContaining({
-        trigger: { script: "json({ fire: true })", once: true },
-      }),
+      expect.objectContaining({ trigger: { script: "json({ fire: true })", once: true } }),
     );
   });
 
@@ -117,9 +122,7 @@ describe("cron trigger CLI options", () => {
   });
 
   it("reads the exact payload path and budgets on add", async () => {
-    const scriptPath = path.join(fixtureRoot, "job.js ");
-    await fs.writeFile(path.join(fixtureRoot, "job.js"), "return { notify: 'wrong file' }", "utf8");
-    await fs.writeFile(scriptPath, "  return { notify: 'done' }  \n", "utf8");
+    const scriptPath = await fixture("job.js ", "  return { notify: 'done' }  \n");
     await run("add", {
       name: "script job",
       script: scriptPath,
@@ -128,7 +131,7 @@ describe("cron trigger CLI options", () => {
       session: "isolated",
     });
 
-    expect(callGatewayFromCli).toHaveBeenCalledWith(
+    expectRequest(
       "cron.add",
       expect.objectContaining({
         script: scriptPath,
@@ -148,8 +151,7 @@ describe("cron trigger CLI options", () => {
   });
 
   it("rejects script creation with a generic timeout", async () => {
-    const scriptPath = path.join(fixtureRoot, "job.js");
-    await fs.writeFile(scriptPath, "return { notify: 'done' }", "utf8");
+    const scriptPath = await fixture("job.js", "return { notify: 'done' }");
     await rejectAdd(
       { name: "script job", script: scriptPath, "timeout-seconds": "30" },
       "Use --script-timeout-seconds for script jobs, not --timeout-seconds.",
@@ -157,34 +159,24 @@ describe("cron trigger CLI options", () => {
   });
 
   it("reads the exact payload path on edit", async () => {
-    const scriptPath = path.join(fixtureRoot, "edit-job.js ");
-    await fs.writeFile(
-      path.join(fixtureRoot, "edit-job.js"),
-      "return { state: { ok: false } }",
-      "utf8",
-    );
-    await fs.writeFile(scriptPath, "return { state: { ok: true } }\n", "utf8");
+    const scriptPath = await fixture("edit-job.js ", "return { state: { ok: true } }\n");
     await run("edit", {
       script: scriptPath,
       "script-timeout-seconds": "600",
       "script-tool-budget": "100",
     });
 
-    expect(callGatewayFromCli).toHaveBeenCalledWith(
-      "cron.update",
-      expect.objectContaining({ script: scriptPath }),
-      {
-        id: "job-1",
-        patch: {
-          payload: {
-            kind: "script",
-            script: "return { state: { ok: true } }",
-            timeoutSeconds: 600,
-            toolBudget: 100,
-          },
+    expectRequest("cron.update", expect.objectContaining({ script: scriptPath }), {
+      id: "job-1",
+      patch: {
+        payload: {
+          kind: "script",
+          script: "return { state: { ok: true } }",
+          timeoutSeconds: 600,
+          toolBudget: 100,
         },
       },
-    );
+    });
   });
 
   it("sends pacing bounds on add", async () => {
@@ -197,30 +189,21 @@ describe("cron trigger CLI options", () => {
       session: "main",
     });
 
-    expect(callGatewayFromCli).toHaveBeenCalledWith(
+    expectRequest(
       "cron.add",
       expect.anything(),
       expect.objectContaining({ pacing: { min: "15m", max: "4h" } }),
     );
   });
 
-  it("maps --clear-trigger to a nullable edit patch", async () => {
-    await run("edit", { "clear-trigger": true });
-
-    expect(callGatewayFromCli).toHaveBeenCalledWith(
-      "cron.update",
-      expect.objectContaining({ clearTrigger: true }),
-      { id: "job-1", patch: { trigger: null } },
-    );
-  });
-
-  it("maps --clear-pacing to a nullable edit patch", async () => {
-    await run("edit", { "clear-pacing": true });
-
-    expect(callGatewayFromCli).toHaveBeenCalledWith(
-      "cron.update",
-      expect.objectContaining({ clearPacing: true }),
-      { id: "job-1", patch: { pacing: null } },
-    );
+  it.each([
+    ["trigger", "clearTrigger"],
+    ["pacing", "clearPacing"],
+  ])("maps --clear-%s to a nullable edit patch", async (field, option) => {
+    await run("edit", { [`clear-${field}`]: true });
+    expectRequest("cron.update", expect.objectContaining({ [option]: true }), {
+      id: "job-1",
+      patch: { [field]: null },
+    });
   });
 });
