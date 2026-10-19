@@ -16,7 +16,9 @@ import type { WorkerEnvironmentRecord } from "../worker-environments/store.js";
 import type { GatewayClient } from "./client-types.js";
 import { environmentsHandlers } from "./environments.js";
 
-export type TestWorkerRecord = WorkerEnvironmentRecord & WorkerEnvironmentServiceRecord;
+export type TestWorkerRecord = WorkerEnvironmentServiceRecord & {
+  sshEndpoint: WorkerEnvironmentRecord["sshEndpoint"];
+};
 
 export function createDevicePairingNodeSnapshot(
   paired: readonly PairedDevice[],
@@ -115,9 +117,7 @@ export function mockContext(
   ],
 ) {
   return {
-    logGateway: {
-      warn: vi.fn(),
-    },
+    logGateway: { warn: vi.fn() },
     nodeRegistry: Object.assign(new NodeRegistry(), {
       listConnectedForPairingStates: () => connectedNodes,
     }),
@@ -147,11 +147,9 @@ export function workerRecord(overrides: Partial<TestWorkerRecord> = {}): TestWor
     environmentId: "worker-1",
     providerId: "static-ssh",
     profileId: "development",
-    profileSnapshot: { settings: {} },
-    provisionOperationId: "provision:worker-1",
+    ownerEpoch: 1,
     leaseId: "lease-1",
     sharedHost: false,
-    desktop: null,
     sshEndpoint: {
       host: "worker.example.test",
       port: 22,
@@ -162,17 +160,14 @@ export function workerRecord(overrides: Partial<TestWorkerRecord> = {}): TestWor
     state: "ready",
     attachedSessionIds: [],
     createdAtMs: 1_000,
-    updatedAtMs: 1_000,
-    stateChangedAtMs: 1_000,
     idleSinceAtMs: null,
     destroyRequestedAtMs: null,
     preparation: null,
-    lastError: null,
     tunnelStatus: "stopped",
     desktopAvailable: false,
     desktopApps: [],
     ...overrides,
-  } as TestWorkerRecord;
+  };
 }
 
 export const workerService = (overrides: Partial<TestWorkerService> = {}) => ({
@@ -236,11 +231,8 @@ export async function callEnvironmentMethod(
   params: unknown,
   options: {
     service?: TestWorkerService;
-    reconcileActive?: (environmentId?: string) => Promise<void>;
-    forceDestroyEnvironment?: (
-      environmentId: string,
-      onCleanupError?: (error: unknown) => void,
-    ) => Promise<TestWorkerRecord>;
+    reconcileActive?: Parameters<typeof mockContext>[1];
+    forceDestroyEnvironment?: Parameters<typeof mockContext>[2];
     connectedNodes?: unknown[];
     scopes?: string[];
   } = {},
