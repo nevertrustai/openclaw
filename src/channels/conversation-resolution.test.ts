@@ -10,7 +10,12 @@ import type { ChannelPlugin } from "./plugins/types.plugin.js";
 
 const testConfig: OpenClawConfig = {};
 
-function registerChannelPlugin(plugin: ChannelPlugin): void {
+type TestPlugin = Omit<Partial<ChannelPlugin>, "id" | "config"> & {
+  id: string;
+  config?: Partial<ChannelPlugin["config"]>;
+};
+function registerChannelPlugin({ id, config, ...overrides }: TestPlugin): void {
+  const plugin = { ...createChannelTestPluginBase({ id, config }), ...overrides };
   setActivePluginRegistry(createTestRegistry([{ pluginId: plugin.id, source: "test", plugin }]));
 }
 
@@ -40,11 +45,8 @@ describe("conversation resolution", () => {
 
   it("uses the runtime command resolver and plugin default account", () => {
     registerChannelPlugin({
-      ...createChannelTestPluginBase({
-        id: "discord",
-        label: "Discord",
-        config: { defaultAccountId: () => "work" },
-      }),
+      id: "discord",
+      config: { defaultAccountId: () => "work" },
       bindings: {
         ...bindingDefaults,
         resolveCommandConversation: ({ originatingTo }) => {
@@ -69,7 +71,7 @@ describe("conversation resolution", () => {
 
   it("applies provider-owned self-parent defaults in one core path", () => {
     registerChannelPlugin({
-      ...createChannelTestPluginBase({ id: "line", label: "LINE" }),
+      id: "line",
       bindings: {
         ...bindingDefaults,
         selfParentConversationByDefault: true,
@@ -93,7 +95,7 @@ describe("conversation resolution", () => {
       parentConversationId: "  room:R1234567890abcdef1234567890abcd  ",
     };
     registerChannelPlugin({
-      ...createChannelTestPluginBase({ id: "line", label: "LINE" }),
+      id: "line",
       threading: {
         resolveFocusedBinding: () => ({
           ...conversation,
@@ -113,7 +115,7 @@ describe("conversation resolution", () => {
 
   it("normalizes alias-prefixed topic routes before fallback resolution", () => {
     registerChannelPlugin({
-      ...createChannelTestPluginBase({ id: "telegram", label: "Telegram" }),
+      id: "telegram",
       messaging: {
         targetPrefixes: ["tg"],
         normalizeTarget: () => "telegram:group:-1001234567890:topic:77",
@@ -130,7 +132,7 @@ describe("conversation resolution", () => {
   it("uses undeclared raw shorthand metadata in fallback resolution", () => {
     const channel = "plainchat";
     registerChannelPlugin({
-      ...createChannelTestPluginBase({ id: channel, label: channel }),
+      id: channel,
       messaging: {
         normalizeTarget: () => `${channel}:-1001234567890:77`,
       },
@@ -143,10 +145,13 @@ describe("conversation resolution", () => {
     });
   });
 
-  it("normalizes numeric command thread ids through the shared route contract", () => {
-    registerChannelPlugin(createChannelTestPluginBase({ id: "test-chat", label: "Test chat" }));
-
-    expect(command("test-chat", "test-chat:channel:parent-room", "default", 42.9)).toEqual({
+  it.each(["command", "inbound"])("normalizes numeric %s thread ids", (entrypoint) => {
+    registerChannelPlugin({ id: "test-chat" });
+    const result =
+      entrypoint === "command"
+        ? command("test-chat", "test-chat:channel:parent-room", "default", 42.9)
+        : inbound("test-chat", "test-chat:channel:parent-room", 42.9);
+    expect(result).toEqual({
       channel: "test-chat",
       accountId: "default",
       conversationId: "42",
@@ -157,7 +162,7 @@ describe("conversation resolution", () => {
 
   it("keeps Matrix room casing when the channel resolver returns a child thread", () => {
     registerChannelPlugin({
-      ...createChannelTestPluginBase({ id: "matrix", label: "Matrix" }),
+      id: "matrix",
       messaging: {
         resolveInboundConversation: ({ threadId, to }) => {
           const parent = to?.trim().replace(/^(?:matrix:)?(?:channel:|room:)/iu, "");
@@ -174,18 +179,6 @@ describe("conversation resolution", () => {
       conversationId: "$thread-root",
       parentConversationId: "!Room:Example.org",
       threadId: "$thread-root",
-    });
-  });
-
-  it("normalizes numeric inbound thread ids through the shared route contract", () => {
-    registerChannelPlugin(createChannelTestPluginBase({ id: "test-chat", label: "Test chat" }));
-
-    expect(inbound("test-chat", "test-chat:channel:parent-room", 42.9)).toEqual({
-      channel: "test-chat",
-      accountId: "default",
-      conversationId: "42",
-      parentConversationId: "parent-room",
-      threadId: "42",
     });
   });
 });

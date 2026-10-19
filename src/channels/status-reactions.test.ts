@@ -43,19 +43,9 @@ const collectEmojisForMethod = (calls: ReactionCall[], method: string) =>
 const countCallsForEmoji = (calls: ReactionCall[], emoji: string) =>
   calls.filter((entry) => entry.emoji === emoji).length;
 describe("resolveToolEmoji", () => {
-  it.each([
-    {
-      name: "returns tool emoji for unknown tool",
-      tool: "unknown_tool",
-      expected: DEFAULT_EMOJIS.tool,
-    },
-    { name: "returns tool emoji for undefined", tool: undefined, expected: DEFAULT_EMOJIS.tool },
-  ] satisfies Array<{ name: string; tool: string | undefined; expected: string }>)(
-    "should $name",
-    ({ tool, expected }) => {
-      expect(resolveToolEmoji(tool, DEFAULT_EMOJIS)).toBe(expected);
-    },
-  );
+  it.each(["unknown_tool", undefined])("uses the fallback emoji for %s", (tool) => {
+    expect(resolveToolEmoji(tool, DEFAULT_EMOJIS)).toBe(DEFAULT_EMOJIS.tool);
+  });
 
   it("preserves explicit status emoji overrides before exact tool display emojis", () => {
     const overrides = {
@@ -83,64 +73,45 @@ describe("createStatusReactionController", () => {
     vi.useRealTimers();
   });
 
-  const immediateTerminalCases = [
-    {
-      name: "setDone",
-      run: (controller: ReturnType<typeof createStatusReactionController>) => controller.setDone(),
-      expected: DEFAULT_EMOJIS.done,
-      holdMs: DEFAULT_TIMING.doneHoldMs,
-    },
-    {
-      name: "setError",
-      run: (controller: ReturnType<typeof createStatusReactionController>) => controller.setError(),
-      expected: DEFAULT_EMOJIS.error,
-      holdMs: DEFAULT_TIMING.errorHoldMs,
-    },
-  ] as const;
+  it.each([
+    ["setDone", DEFAULT_EMOJIS.done, DEFAULT_TIMING.doneHoldMs],
+    ["setError", DEFAULT_EMOJIS.error, DEFAULT_TIMING.errorHoldMs],
+  ] as const)("holds %s before an immediately queued restore", async (method, expected, holdMs) => {
+    const { calls, controller } = createEnabledController();
 
-  it.each(immediateTerminalCases)(
-    "should hold $name before an immediately queued restore",
-    async ({ run, expected, holdMs }) => {
-      const { calls, controller } = createEnabledController();
+    void controller.setQueued();
+    await vi.advanceTimersByTimeAsync(0);
 
-      void controller.setQueued();
-      await vi.advanceTimersByTimeAsync(0);
+    const settled = { terminal: false, restore: false };
+    const terminalPromise = controller[method]().then(() => {
+      settled.terminal = true;
+    });
+    const restorePromise = controller.restoreInitial().then(() => {
+      settled.restore = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
 
-      let terminalResolved = false;
-      let restoreResolved = false;
-      const terminalPromise = run(controller).then(() => {
-        terminalResolved = true;
-      });
-      const restorePromise = controller.restoreInitial().then(() => {
-        restoreResolved = true;
-      });
-      await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toEqual([call("set", "👀"), call("set", expected), call("remove", "👀")]);
+    expect(settled).toEqual({ terminal: false, restore: false });
 
-      expect(calls).toEqual([call("set", "👀"), call("set", expected), call("remove", "👀")]);
-      expect(terminalResolved).toBe(false);
-      expect(restoreResolved).toBe(false);
+    await vi.advanceTimersByTimeAsync(holdMs - 1);
 
-      await vi.advanceTimersByTimeAsync(holdMs - 1);
+    expect(collectEmojisForMethod(calls, "set")).toEqual(["👀", expected]);
+    expect(settled).toEqual({ terminal: false, restore: false });
 
-      expect(collectEmojisForMethod(calls, "set")).toEqual(["👀", expected]);
-      expect(terminalResolved).toBe(false);
-      expect(restoreResolved).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.all([terminalPromise, restorePromise]);
 
-      await vi.advanceTimersByTimeAsync(1);
-      await Promise.all([terminalPromise, restorePromise]);
-
-      expect(calls).toEqual([
-        call("set", "👀"),
-        call("set", expected),
-        call("remove", "👀"),
-        call("set", "👀"),
-        call("remove", expected),
-      ]);
-      expect(terminalResolved).toBe(true);
-      expect(restoreResolved).toBe(true);
-      expect(countCallsForEmoji(calls, expected)).toBe(2);
-    },
-  );
+    expect(calls).toEqual([
+      call("set", "👀"),
+      call("set", expected),
+      call("remove", "👀"),
+      call("set", "👀"),
+      call("remove", expected),
+    ]);
+    expect(settled).toEqual({ terminal: true, restore: true });
+    expect(countCallsForEmoji(calls, expected)).toBe(2);
+  });
 
   it("should only fire last state when rapidly changing (debounce)", async () => {
     const { calls, controller } = createEnabledController();
@@ -223,39 +194,25 @@ describe("createStatusReactionController", () => {
     expect(collectEmojisForMethod(calls, "remove")).toEqual(["👀", DEFAULT_EMOJIS.error]);
   });
 
-  const createControllerAfterThinking = async () => {
-    const state = createEnabledController();
-    void state.controller.setThinking();
-    await vi.advanceTimersByTimeAsync(DEFAULT_TIMING.debounceMs);
-    return state;
-  };
+  it.each(["phase change", "repeated same-phase updates"])(
+    "resets stall timers on %s",
+    async (update) => {
+      const { calls, controller } = createEnabledController();
+      void controller.setThinking();
+      await vi.advanceTimersByTimeAsync(DEFAULT_TIMING.debounceMs);
 
-  const stallResetCases = [
-    {
-      name: "phase change",
-      runUpdate: (controller: ReturnType<typeof createStatusReactionController>) => {
+      await vi.advanceTimersByTimeAsync(DEFAULT_TIMING.stallSoftMs / 2);
+      if (update === "phase change") {
         void controller.setTool("exec");
-        return vi.advanceTimersByTimeAsync(DEFAULT_TIMING.debounceMs);
-      },
+        await vi.advanceTimersByTimeAsync(DEFAULT_TIMING.debounceMs);
+      } else {
+        await controller.setThinking();
+      }
+      await vi.advanceTimersByTimeAsync(DEFAULT_TIMING.stallSoftMs / 2);
+
+      expect(countCallsForEmoji(calls, DEFAULT_EMOJIS.stallSoft)).toBe(0);
     },
-    {
-      name: "repeated same-phase updates",
-      runUpdate: (controller: ReturnType<typeof createStatusReactionController>) => {
-        void controller.setThinking();
-        return Promise.resolve();
-      },
-    },
-  ] as const;
-
-  it.each(stallResetCases)("should reset stall timers on $name", async ({ runUpdate }) => {
-    const { calls, controller } = await createControllerAfterThinking();
-
-    await vi.advanceTimersByTimeAsync(DEFAULT_TIMING.stallSoftMs / 2);
-    await runUpdate(controller);
-    await vi.advanceTimersByTimeAsync(DEFAULT_TIMING.stallSoftMs / 2);
-
-    expect(countCallsForEmoji(calls, DEFAULT_EMOJIS.stallSoft)).toBe(0);
-  });
+  );
 
   it("should call onError callback when adapter throws", async () => {
     const onError = vi.fn();

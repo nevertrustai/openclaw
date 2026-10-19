@@ -21,17 +21,23 @@ function draft(messageId = "preview-old") {
     warnPrefix: "cleanup failed",
   };
   const state = { stopped: false, final: false };
-  const lifecycle = (
-    overrides: Pick<LifecycleOptions, "deleteMessage"> & Partial<LifecycleOptions>,
-  ) =>
+  const pending = createDeferred();
+  const deleteMessage = vi.fn(() => pending.promise);
+  const warn = vi.fn();
+  const onFailure = vi.fn();
+  const clear = () =>
+    clearFinalizableDraftMessage({ ...options, deleteMessage, warn, onDeleteFailure: onFailure });
+  const lifecycle = (overrides: Partial<LifecycleOptions> = {}) =>
     createFinalizableDraftLifecycle({
       ...options,
       state,
       throttleMs: 250,
       sendOrEditStreamMessage: async () => true,
+      deleteMessage,
+      warn,
       ...overrides,
     });
-  return { message, options, state, lifecycle };
+  return { message, state, lifecycle, pending, deleteMessage, warn, onFailure, clear };
 }
 
 describe("draft-stream-controls", () => {
@@ -53,105 +59,67 @@ describe("draft-stream-controls", () => {
       },
     });
 
-    expect(result).toBe("m-1");
-    expect(messageId).toBeUndefined();
-    expect(events).toEqual(["stop", "read", "clear"]);
+    expect({ result, messageId, events }).toEqual({
+      result: "m-1",
+      messageId: undefined,
+      events: ["stop", "read", "clear"],
+    });
   });
 
   it("clearFinalizableDraftMessage claims a failed delete and reports its retry target", async () => {
-    const warn = vi.fn();
-    const { message, options } = draft("m-3");
-    const onDeleteFailure = vi.fn();
-    const deleteMessage = vi.fn(async () => {
-      throw new Error("boom");
-    });
-
-    await clearFinalizableDraftMessage({
-      ...options,
-      deleteMessage,
-      onDeleteFailure,
-      warn,
-    });
+    const { message, pending, onFailure, warn, clear } = draft("m-3");
+    const clearing = clear();
+    pending.reject(new Error("boom"));
+    await clearing;
 
     expect(message.id).toBeUndefined();
-    expect(onDeleteFailure).toHaveBeenCalledWith("m-3");
+    expect(onFailure).toHaveBeenCalledWith("m-3");
     expect(warn).toHaveBeenCalledWith("cleanup failed: boom");
   });
 
   it("clearFinalizableDraftMessage claims an id before concurrent clears", async () => {
-    const { options } = draft("m-3");
-    const pendingDelete = createDeferred();
-    const deleteMessage = vi.fn(() => pendingDelete.promise);
-    const clear = () =>
-      clearFinalizableDraftMessage({
-        ...options,
-        deleteMessage,
-      });
+    const { pending, deleteMessage, clear } = draft("m-3");
 
     const firstClear = clear();
     await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith("m-3"));
     await clear();
-    pendingDelete.resolve();
+    pending.resolve();
     await firstClear;
 
     expect(deleteMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("clearFinalizableDraftMessage preserves a replacement id while delete is in flight", async () => {
-    const { message, options } = draft();
-    const pendingDelete = createDeferred();
-    const deleteMessage = vi.fn(() => pendingDelete.promise);
+  it.each([false, true])(
+    "preserves a replacement id after deletion (failed: %s)",
+    async (failed) => {
+      const { message, pending, deleteMessage, onFailure, clear } = draft();
+      const clearPromise = clear();
+      await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith("preview-old"));
 
-    const clearPromise = clearFinalizableDraftMessage({
-      ...options,
-      deleteMessage,
-    });
-    await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith("preview-old"));
-
-    message.id = "preview-new";
-    pendingDelete.resolve();
-    await clearPromise;
-
-    expect(message.id).toBe("preview-new");
-  });
-
-  it("clearFinalizableDraftMessage reports the failed target after its id is replaced", async () => {
-    const { message, options } = draft();
-    const pendingDelete = createDeferred();
-    const onDeleteFailure = vi.fn();
-    const deleteMessage = vi.fn(() => pendingDelete.promise);
-    const clearPromise = clearFinalizableDraftMessage({
-      ...options,
-      deleteMessage,
-      onDeleteFailure,
-    });
-    await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith("preview-old"));
-
-    message.id = "preview-new";
-    pendingDelete.reject(new Error("boom"));
-    await clearPromise;
-
-    expect(onDeleteFailure).toHaveBeenCalledWith("preview-old");
-    expect(message.id).toBe("preview-new");
-  });
+      message.id = "preview-new";
+      if (failed) {
+        pending.reject(new Error("boom"));
+      } else {
+        pending.resolve();
+      }
+      await clearPromise;
+      expect(onFailure.mock.calls).toEqual(failed ? [["preview-old"]] : []);
+      expect(message.id).toBe("preview-new");
+    },
+  );
 
   it("lifecycle retries a failed old deletion after the current id is replaced", async () => {
-    const { message, lifecycle: createLifecycle } = draft();
-    const pendingDelete = createDeferred();
-    const warn = vi.fn();
+    const { message, pending, warn, lifecycle: createLifecycle } = draft();
     const deleteMessage = vi
       .fn<(messageId: string) => Promise<void>>()
-      .mockImplementationOnce(() => pendingDelete.promise)
+      .mockImplementationOnce(() => pending.promise)
       .mockResolvedValue(undefined);
-    const lifecycle = createLifecycle({
-      deleteMessage,
-      warn,
-    });
+    const lifecycle = createLifecycle({ deleteMessage });
 
     const firstClear = lifecycle.clear();
     await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith("preview-old"));
     message.id = "preview-new";
-    pendingDelete.reject(new Error("boom"));
+    pending.reject(new Error("boom"));
     await firstClear;
 
     expect(message.id).toBe("preview-new");
@@ -168,15 +136,13 @@ describe("draft-stream-controls", () => {
   });
 
   it("lifecycle does not retry a successful delete when its success callback fails", async () => {
-    const { message, lifecycle: createLifecycle } = draft();
+    const { message, warn, lifecycle: createLifecycle } = draft();
     const deleteMessage = vi.fn(async () => {});
-    const warn = vi.fn();
     const lifecycle = createLifecycle({
       deleteMessage,
       onDeleteSuccess: () => {
         throw new Error("callback boom");
       },
-      warn,
     });
 
     await lifecycle.clear();
@@ -241,14 +207,9 @@ describe("draft-stream-controls", () => {
   });
 
   it("lifecycle seal ignores late updates without clearing the preview id", async () => {
-    const { message, state, lifecycle: createLifecycle } = draft("m-5");
+    const { message, state, deleteMessage, lifecycle: createLifecycle } = draft("m-5");
     const sendOrEditStreamMessage = vi.fn(async () => true);
-    const deleteMessage = vi.fn(async () => {});
-
-    const lifecycle = createLifecycle({
-      sendOrEditStreamMessage,
-      deleteMessage,
-    });
+    const lifecycle = createLifecycle({ sendOrEditStreamMessage });
 
     lifecycle.update("stale");
     await lifecycle.seal();
@@ -257,8 +218,7 @@ describe("draft-stream-controls", () => {
 
     expect(state.final).toBe(true);
     expect(message.id).toBe("m-5");
-    expect(sendOrEditStreamMessage).toHaveBeenCalledTimes(1);
-    expect(sendOrEditStreamMessage).toHaveBeenCalledWith("stale");
+    expect(sendOrEditStreamMessage).toHaveBeenCalledExactlyOnceWith("stale");
     expect(deleteMessage).not.toHaveBeenCalled();
   });
 });
