@@ -240,25 +240,37 @@ describe("Telegram rejected topic delivery over real Bot API transport", () => {
             await drain("Telegram rejected topic recovery");
             const firstRequests = acceptedPrefix ? 2 : 1;
             expect(requests).toHaveLength(firstRequests);
+            const ambiguous = acceptedPrefix || reset;
+            const terminal = description === "chat not found";
             expect(readQueueRow(stateDir, id)).toMatchObject({
-              status: "pending",
-              retryCount: retryCount + 1,
+              status: terminal ? "failed" : "pending",
+              retryCount: ambiguous || terminal ? retryCount : retryCount + 1,
             });
-            if (acceptedPrefix || reset) {
+            if (ambiguous) {
               expect(readQueueRow(stateDir, id)?.recoveryState).toBe("unknown_after_send");
             } else {
               expect(readQueueRow(stateDir, id)?.recoveryState).not.toBe("unknown_after_send");
             }
 
+            // Reopening the DB preserves active producer leases. Ambiguous sends
+            // stay protected while a rejected topic can retry its original route.
             closeDatabases();
-            await drain("Telegram rejected topic post-restart recovery");
-            expect(requests).toHaveLength(acceptedPrefix || reset ? firstRequests : 2);
-            if (!acceptedPrefix && !reset) {
+            await drain("Telegram rejected topic database-reopen recovery");
+            expect(requests).toHaveLength(ambiguous || terminal ? firstRequests : 2);
+            if (!ambiguous && !terminal) {
               expect(readQueueRow(stateDir, id)).toMatchObject({
                 status: "pending",
                 retryCount: retryCount + 2,
               });
               expect(readQueueRow(stateDir, id)?.recoveryState).not.toBe("unknown_after_send");
+            } else {
+              expect(readQueueRow(stateDir, id)).toMatchObject({
+                status: terminal ? "failed" : "pending",
+                retryCount,
+              });
+              if (ambiguous) {
+                expect(readQueueRow(stateDir, id)?.recoveryState).toBe("unknown_after_send");
+              }
             }
             for (const request of requests) {
               expect(request).toMatchObject({ chat_id: "123", message_thread_id: 42 });
