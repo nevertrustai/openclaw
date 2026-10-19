@@ -1,4 +1,3 @@
-// Slack tests cover streaming plugin behavior.
 import { WebClient } from "@slack/web-api";
 import { ChatStreamer } from "@slack/web-api/dist/chat-stream.js";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
@@ -15,6 +14,9 @@ import {
 } from "./streaming.js";
 
 type StopImpl = (args?: unknown) => Promise<unknown>;
+const target = { channel: "C123", threadTs: "1700000000.000100" };
+const streamTs = "1700000000.500300";
+const stoppedPayload = { token: undefined, channel: "C123", ts: streamTs, chunks: [] };
 
 function makeSession(stopImpl: StopImpl = async () => {}): SlackStreamSession {
   return {
@@ -22,8 +24,7 @@ function makeSession(stopImpl: StopImpl = async () => {}): SlackStreamSession {
       append: vi.fn(async () => null),
       stop: vi.fn(stopImpl),
     } as unknown as ChatStreamer,
-    channel: "C123",
-    threadTs: "1700000000.000100",
+    ...target,
     stopped: false,
     delivered: false,
     pendingText: "",
@@ -31,9 +32,7 @@ function makeSession(stopImpl: StopImpl = async () => {}): SlackStreamSession {
 }
 
 function slackApiError(code: string): Error {
-  const err = new Error(`An API error occurred: ${code}`);
-  (err as unknown as { data: { error: string } }).data = { error: code };
-  return err;
+  return Object.assign(new Error(`An API error occurred: ${code}`), { data: { error: code } });
 }
 
 function createNativeStreamClient() {
@@ -42,28 +41,21 @@ function createNativeStreamClient() {
   if (!writeClient) {
     throw new Error("missing synthetic stream writer");
   }
-  const start = vi.spyOn(writeClient.chat, "startStream").mockResolvedValue({
-    ok: true,
-    ts: "1700000000.500300",
-  });
+  const start = vi
+    .spyOn(writeClient.chat, "startStream")
+    .mockResolvedValue({ ok: true, ts: streamTs });
   const append = vi.spyOn(writeClient.chat, "appendStream").mockResolvedValue({ ok: true });
   const stop = vi.spyOn(writeClient.chat, "stopStream").mockResolvedValue({ ok: true });
   return { client, start, append, stop };
 }
 
 function startTextStream(client: WebClient, text: string) {
-  return startSlackStream({
-    client,
-    channel: "C123",
-    threadTs: "1700000000.000100",
-    text,
-    chunks: [],
-  });
+  return startSlackStream({ client, ...target, text, chunks: [] });
 }
 
 function createBufferedSession(bufferSize: number) {
-  const startStream = vi.fn(async () => ({ ok: true, ts: "1700000000.500300" }));
-  const stopStream = vi.fn(async () => ({ ok: true, ts: "1700000000.500300" }));
+  const startStream = vi.fn(async () => ({ ok: true, ts: streamTs }));
+  const stopStream = vi.fn(async () => ({ ok: true, ts: streamTs }));
   const client = {
     chat: { startStream, appendStream: vi.fn(async () => ({ ok: true })), stopStream },
   };
@@ -155,8 +147,7 @@ describe("stopSlackStream finalize error handling", () => {
 
     const session = await startSlackStream({
       client,
-      channel: "C123",
-      threadTs: "1700000000.000100",
+      ...target,
       chunks,
       taskDisplayMode: "plan",
       identity: { username: "Research Agent", iconEmoji: ":mag:" },
@@ -171,8 +162,7 @@ describe("stopSlackStream finalize error handling", () => {
       token: undefined,
       chunks,
     });
-    expect(session.delivered).toBe(true);
-    expect(session.pendingText).toBe("");
+    expect(session).toMatchObject({ delivered: true, pendingText: "" });
   });
 
   it("throws SlackStreamNotDeliveredError for unexpected finalize codes while text is buffered", async () => {
@@ -241,18 +231,17 @@ describe("stopSlackStream finalize error handling", () => {
     expect(session).toMatchObject({ stopped: true, delivered: true, pendingText: "" });
   });
 
-  it("falls back to message.ts when chat.stopStream omits the top-level ts", async () => {
-    const session = makeSession(async () => ({ ok: true, message: { ts: "1700000000.500200" } }));
+  it.each([
+    {
+      name: "message.ts",
+      response: { ok: true, message: { ts: "1700000000.500200" } },
+      expected: { messageId: "1700000000.500200" },
+    },
+    { name: "no timestamp", response: { ok: true }, expected: {} },
+  ])("finalizes a response with $name", async ({ response, expected }) => {
+    const session = makeSession(async () => response);
     await appendSlackStream({ session, text: "short" });
-    await expect(stopSlackStream({ session })).resolves.toEqual({
-      messageId: "1700000000.500200",
-    });
-  });
-
-  it("returns an empty result when chat.stopStream reports no ts", async () => {
-    const session = makeSession(async () => ({ ok: true }));
-    await appendSlackStream({ session, text: "short" });
-    await expect(stopSlackStream({ session })).resolves.toEqual({});
+    await expect(stopSlackStream({ session })).resolves.toEqual(expected);
   });
 
   it("preserves pending text when start rejects with missing_scope", async () => {
@@ -267,19 +256,17 @@ describe("stopSlackStream finalize error handling", () => {
     expect(thrown).toHaveProperty("pendingText", "initial chunk that flushes immediately");
   });
 
-  it("retires fallback-delivered sessions so buffered text cannot be resent", () => {
-    const neverDelivered = makeSession();
-    markSlackStreamFallbackDelivered(neverDelivered);
-    expect(neverDelivered).toMatchObject({ delivered: false, pendingText: "", stopped: true });
-
-    const alreadyDelivered = makeSession();
-    alreadyDelivered.delivered = true;
-    markSlackStreamFallbackDelivered(alreadyDelivered);
-    expect(alreadyDelivered).toMatchObject({ delivered: true, pendingText: "", stopped: false });
-  });
+  it.each([false, true])(
+    "retires fallback sessions according to prior delivery: %s",
+    (delivered) => {
+      const session = makeSession();
+      session.delivered = delivered;
+      markSlackStreamFallbackDelivered(session);
+      expect(session).toMatchObject({ delivered, pendingText: "", stopped: !delivered });
+    },
+  );
 
   it("does not resend committed text when finalization rejects after delivery", async () => {
-    const streamTs = "1700000000.500300";
     const { session, startStream, stopStream } = createBufferedSession(256);
     stopStream.mockRejectedValue(slackApiError("user_not_found"));
     const metadata = { event_type: "openclaw.reply", event_payload: { turn: "qa" } };
@@ -293,13 +280,7 @@ describe("stopSlackStream finalize error handling", () => {
         chunks: [{ type: "markdown_text", text: "short committed reply" }],
       }),
     );
-    expect(stopStream).toHaveBeenCalledExactlyOnceWith({
-      token: undefined,
-      channel: "C123",
-      ts: streamTs,
-      chunks: [],
-      metadata,
-    });
+    expect(stopStream).toHaveBeenCalledExactlyOnceWith({ ...stoppedPayload, metadata });
     expect(session).toMatchObject({ stopped: true, delivered: true, pendingText: "" });
   });
 
@@ -308,18 +289,12 @@ describe("stopSlackStream finalize error handling", () => {
 
     await appendSlackStream({ session, text: "already visible" });
     await appendSlackStream({ session, text: "tail" });
-    expect(session.delivered).toBe(true);
-    expect(session.pendingText).toBe("tail");
+    expect(session).toMatchObject({ delivered: true, pendingText: "tail" });
 
     markSlackStreamFallbackDelivered(session);
     await stopSlackStream({ session });
 
     expect(startStream).toHaveBeenCalledOnce();
-    expect(stopStream).toHaveBeenCalledWith({
-      token: undefined,
-      channel: "C123",
-      ts: "1700000000.500300",
-      chunks: [],
-    });
+    expect(stopStream).toHaveBeenCalledWith(stoppedPayload);
   });
 });

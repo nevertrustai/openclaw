@@ -1,4 +1,3 @@
-// Slack tests cover sent thread cache plugin behavior.
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
@@ -21,14 +20,20 @@ import {
 } from "./sent-thread-cache.js";
 
 const thread = { accountId: "A1", channelId: "C123", threadTs: "1700000000.000001" };
-const failureNotice = { ...thread, failureText: "Model login expired" };
+const failureNotice = { ...thread, failureText: "Login expired" };
 const storeOptions = { namespace: "slack.thread-participation", maxEntries: 1000 };
 const lookupThread = (threadTs: string, teamId?: string) =>
-  hasSlackThreadParticipationWithPersistence({
-    ...thread,
-    threadTs,
-    ...(teamId ? { teamId } : {}),
-  });
+  hasSlackThreadParticipationWithPersistence({ ...thread, threadTs, teamId });
+
+function installStore(
+  openKeyedStoreV2: (options: OpenKeyedStoreOptions) => unknown,
+  warn = vi.fn(),
+) {
+  setSlackRuntime({
+    state: { openKeyedStoreV2 },
+    logging: { getChildLogger: () => ({ warn }) },
+  } as never);
+}
 
 describe("slack sent-thread-cache", () => {
   afterEach(() => {
@@ -51,12 +56,10 @@ describe("slack sent-thread-cache", () => {
 
     expect(recordSlackThreadFailureNotice(notice)).toBe(true);
     expect(recordSlackThreadFailureNotice(notice)).toBe(false);
-    expect(
-      recordSlackThreadFailureNotice({ ...notice, failureText: "Model   login\nexpired" }),
-    ).toBe(false);
-    expect(
-      recordSlackThreadFailureNotice({ ...notice, failureText: "App server unavailable" }),
-    ).toBe(true);
+    expect(recordSlackThreadFailureNotice({ ...notice, failureText: "Login   \nexpired" })).toBe(
+      false,
+    );
+    expect(recordSlackThreadFailureNotice({ ...notice, failureText: "Unavailable" })).toBe(true);
     expect(recordSlackThreadFailureNotice(notice)).toBe(true);
   });
 
@@ -67,12 +70,8 @@ describe("slack sent-thread-cache", () => {
     expect(hasSlackThreadFailureNotice(notice)).toBe(false);
     expect(recordSlackThreadFailureNotice(notice)).toBe(true);
     expect(hasSlackThreadFailureNotice(notice)).toBe(true);
-    expect(hasSlackThreadFailureNotice({ ...notice, failureText: "Model  login\nexpired" })).toBe(
-      true,
-    );
-    expect(hasSlackThreadFailureNotice({ ...notice, failureText: "App server unavailable" })).toBe(
-      false,
-    );
+    expect(hasSlackThreadFailureNotice({ ...notice, failureText: "Login  \nexpired" })).toBe(true);
+    expect(hasSlackThreadFailureNotice({ ...notice, failureText: "Unavailable" })).toBe(false);
   });
 
   it("deduplicates top-level failures per channel without mixing them with threads", () => {
@@ -186,25 +185,13 @@ describe("slack sent-thread-cache", () => {
       persistedRecords.set(key, value);
     });
     const lookup = vi.fn(async (key: string) => persistedRecords.get(key));
-    const openKeyedStoreV2 = vi.fn(() => ({
-      register,
-      lookup,
-      consume: vi.fn(),
-      delete: vi.fn(),
-      entries: vi.fn(),
-      clear: vi.fn(),
-    }));
-    setSlackRuntime({
-      state: { openKeyedStoreV2 },
-      logging: { getChildLogger: () => ({ warn: vi.fn() }) },
-    } as never);
+    const openKeyedStoreV2 = vi.fn(() => ({ register, lookup, entries: vi.fn() }));
+    installStore(openKeyedStoreV2);
 
     recordSlackThreadParticipation("A1", "C123", "1700000000.000002");
 
     await vi.waitFor(() => expect(register).toHaveBeenCalledTimes(1));
-    expect(register).toHaveBeenCalledWith("A1:C123:1700000000.000002", {
-      repliedAt,
-    });
+    expect(register).toHaveBeenCalledWith("A1:C123:1700000000.000002", { repliedAt });
     expect(openKeyedStoreV2).toHaveBeenCalledWith(storeOptions);
 
     now.mockReturnValue(repliedAt + 25 * 60 * 60 * 1000);
@@ -251,10 +238,7 @@ describe("slack sent-thread-cache", () => {
             { assertCurrent() {} },
           ),
         );
-        setSlackRuntime({
-          state: { openKeyedStoreV2 },
-          logging: { getChildLogger: () => ({ warn: vi.fn() }) },
-        } as never);
+        installStore(openKeyedStoreV2);
 
         // Worker timestamps use its real clock, independently of the host Date mock.
         const persistedAt = legacyEntry.createdAt;
@@ -310,14 +294,12 @@ describe("slack sent-thread-cache", () => {
 
   it("falls back to in-memory thread participation when persistent state cannot open", async () => {
     const warn = vi.fn();
-    setSlackRuntime({
-      state: {
-        openKeyedStoreV2: vi.fn(() => {
-          throw new Error("sqlite unavailable");
-        }),
-      },
-      logging: { getChildLogger: () => ({ warn }) },
-    } as never);
+    installStore(
+      vi.fn(() => {
+        throw new Error("sqlite unavailable");
+      }),
+      warn,
+    );
 
     recordSlackThreadParticipation("A1", "C123", "1700000000.000003");
     expect(hasSlackThreadParticipation("A1", "C123", "1700000000.000003")).toBe(true);

@@ -69,25 +69,15 @@ function closeServer(server: http.Server | https.Server) {
   });
 }
 
-async function startConnectProxy(options: { tls?: boolean } = {}): Promise<{
-  url: string;
-  targets: string[];
-  secureConnections: () => number;
-}> {
+async function startConnectProxy(options: { tls?: boolean } = {}) {
   const targets: string[] = [];
   let secureConnections = 0;
-  const reject = (_req: http.IncomingMessage, res: http.ServerResponse) => {
-    res.writeHead(405);
-    res.end();
-  };
   const server = options.tls
-    ? https.createServer({ key: PROXY_FIXTURE_KEY, cert: PROXY_FIXTURE_CERTIFICATE }, reject)
-    : http.createServer(reject);
-  if (options.tls) {
-    server.on("secureConnection", () => {
-      secureConnections += 1;
-    });
-  }
+    ? https.createServer({ key: PROXY_FIXTURE_KEY, cert: PROXY_FIXTURE_CERTIFICATE })
+    : http.createServer();
+  server.on("secureConnection", () => {
+    secureConnections += 1;
+  });
   server.on("connect", (req, client, head) => {
     targets.push(String(req.url));
     const [host, port] = String(req.url).split(":");
@@ -125,21 +115,17 @@ async function startEchoWebSocketServer(options: { tls?: boolean } = {}): Promis
   } else {
     await once(wss, "listening");
   }
-  closers.push(
-    () =>
-      new Promise<void>((resolve) => {
-        for (const client of wss.clients) {
-          client.terminate();
-        }
-        wss.close(() => {
-          if (!server) {
-            resolve();
-            return;
-          }
-          void closeServer(server).then(resolve);
-        });
-      }),
-  );
+  closers.push(async () => {
+    for (const client of wss.clients) {
+      client.terminate();
+    }
+    const closed = once(wss, "close");
+    wss.close();
+    await closed;
+    if (server) {
+      await closeServer(server);
+    }
+  });
   const address = (server ?? wss).address() as AddressInfo;
   return `${options.tls ? "wss" : "ws"}://127.0.0.1:${address.port}`;
 }
@@ -222,6 +208,24 @@ function echoThroughSocketModeWebSocket(
   });
 }
 
+function expectEcho(target: string, dispatcher: unknown) {
+  return expect(echoThroughSocketModeWebSocket(target, dispatcher)).resolves.toEqual({
+    ok: true,
+    echoed: "hello",
+  });
+}
+
+async function withDispatchers(
+  run: (dispatchers: ReturnType<typeof resolveSlackMonitorDispatchers>) => Promise<void>,
+) {
+  const dispatchers = resolveSlackMonitorDispatchers("socket");
+  try {
+    await run(dispatchers);
+  } finally {
+    await dispatchers.close();
+  }
+}
+
 describe("slack socket mode dispatcher", () => {
   beforeEach(() => {
     for (const key of PROXY_KEYS) {
@@ -239,12 +243,8 @@ describe("slack socket mode dispatcher", () => {
   it.each([undefined, "://invalid-proxy"])(
     "preserves direct connections for proxy %s",
     async (proxy) => {
-      if (proxy !== undefined) {
-        process.env.HTTPS_PROXY = proxy;
-      }
-      const dispatchers = resolveSlackMonitorDispatchers("socket");
-      expect(dispatchers.socketMode).toBeUndefined();
-      await dispatchers.close();
+      vi.stubEnv("HTTPS_PROXY", proxy);
+      await withDispatchers(async ({ socketMode }) => expect(socketMode).toBeUndefined());
     },
   );
 
@@ -275,30 +275,20 @@ describe("slack socket mode dispatcher", () => {
     writeFileSync(proxyCaFile, PROXY_FIXTURE_CERTIFICATE);
     process.env.HTTP_PROXY = proxy.url;
 
-    const untrustedDispatchers = resolveSlackMonitorDispatchers("socket");
-    try {
-      await expect(
-        echoThroughSocketModeWebSocket(target, untrustedDispatchers.socketMode),
-      ).resolves.toMatchObject({
+    await withDispatchers(async ({ socketMode }) => {
+      await expect(echoThroughSocketModeWebSocket(target, socketMode)).resolves.toMatchObject({
         ok: false,
       });
       expect(proxy.secureConnections()).toBe(0);
-    } finally {
-      await untrustedDispatchers.close();
-    }
+    });
 
     process.env.OPENCLAW_PROXY_ACTIVE = "1";
     process.env.OPENCLAW_PROXY_CA_FILE = proxyCaFile;
-    const trustedDispatchers = resolveSlackMonitorDispatchers("socket");
-    try {
-      await expect(
-        echoThroughSocketModeWebSocket(target, trustedDispatchers.socketMode),
-      ).resolves.toEqual({ ok: true, echoed: "hello" });
+    await withDispatchers(async ({ socketMode }) => {
+      await expectEcho(target, socketMode);
       expect(proxy.secureConnections()).toBe(1);
       expect(proxy.targets).toContain(target.replace("ws://", ""));
-    } finally {
-      await trustedDispatchers.close();
-    }
+    });
   });
 
   it("opens Socket Mode's WebSocket through an HTTP CONNECT proxy", async () => {
@@ -307,23 +297,15 @@ describe("slack socket mode dispatcher", () => {
     process.env.HTTPS_PROXY = proxy.url;
     process.env.HTTP_PROXY = proxy.url;
 
-    const dispatchers = resolveSlackMonitorDispatchers("socket");
-    try {
+    await withDispatchers(async (dispatchers) => {
       expect(dispatchers.socketMode).toBeInstanceOf(loadSocketModeUndici().EnvHttpProxyAgent);
       if (dispatchers.webApi instanceof loadSocketModeUndici().EnvHttpProxyAgent) {
         expect(dispatchers.socketMode).toBe(dispatchers.webApi);
       } else {
         expect(dispatchers.socketMode).not.toBe(dispatchers.webApi);
       }
-      await expect(echoThroughSocketModeWebSocket(target, dispatchers.socketMode)).resolves.toEqual(
-        {
-          ok: true,
-          echoed: "hello",
-        },
-      );
+      await expectEcho(target, dispatchers.socketMode);
       expect(proxy.targets).toContain(target.replace("ws://", ""));
-    } finally {
-      await dispatchers.close();
-    }
+    });
   });
 });
