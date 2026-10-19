@@ -103,6 +103,7 @@ export function prepareSessionToolSurface(params: {
           routeKey: params.routeKey,
           historyId,
           toolPolicy: params.toolPolicy,
+          // SAFETY: only this module writes `tools`, as ToolDefinition entries matched to this route and policy.
           tools: data.tools as ToolDefinition[],
         }
       : undefined;

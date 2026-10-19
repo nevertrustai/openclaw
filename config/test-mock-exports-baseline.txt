@@ -2182,7 +2182,6 @@
 ["src/agents/embedded-agent-runner/run/attempt-session-cleanup.test.ts","./attempt-trajectory-flush.js","786988b9862ec1e20d95cafac6979f752ccbcc3397be171ca9714e1dd647c8a8",1]
 ["src/agents/embedded-agent-runner/run/attempt-session-runtime-prepare.test.ts","../../anthropic-payload-log.js","08df499ebd965c5a269fb19cc43b68837f4de1efdbeb48eb5491338de2ac1ff9",1]
 ["src/agents/embedded-agent-runner/run/attempt-session-runtime-prepare.test.ts","../../cache-trace.js","6408d5acb705a16cbcdf3ac10e7d0c0d69ca40c77a28c738f260545f62d8ee5b",1]
-["src/agents/embedded-agent-runner/run/attempt-session-runtime-prepare.test.ts","../session-prompt-state.js","9057030117d48b8ce634bd6f49f30f4cb69f024ec3db7c1788311027f7025dbd",1]
 ["src/agents/embedded-agent-runner/run/attempt-session-runtime-prepare.test.ts","../tool-result-truncation.js","b7a0b482297707e9e9056fa14e8d7c4abe02801c766686f59f5b65b5f5c6834a",1]
 ["src/agents/embedded-agent-runner/run/attempt-session-runtime-prepare.test.ts","./attempt-session-prepare.js","9b13e25136ce683a80bb76236badb104e682fd9484cbddc9eec79ef1718abd40",1]
 ["src/agents/embedded-agent-runner/run/attempt-session-runtime-prepare.test.ts","./attempt-session-settle.js","40fe86e2b2dc9b5459660fea0a5da285e69befd32ca353e36ad0f7a393d7738b",1]
