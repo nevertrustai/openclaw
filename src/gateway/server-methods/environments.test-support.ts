@@ -6,12 +6,14 @@ import type {
   DevicePairingNodeSnapshot,
 } from "../../infra/device-pairing-read.types.js";
 import type { PairedDevice, PairedDeviceNodeSurface } from "../../infra/device-pairing.types.js";
+import type { collectNodeCatalogRuntimeState } from "../node-registry-private.js";
 import { NodeRegistry } from "../node-registry.js";
 import type {
   WorkerEnvironmentServiceContract,
   WorkerEnvironmentServiceRecord,
 } from "../worker-environments/service-contract.js";
 import type { WorkerEnvironmentRecord } from "../worker-environments/store.js";
+import type { GatewayClient } from "./client-types.js";
 import { environmentsHandlers } from "./environments.js";
 
 export type TestWorkerRecord = WorkerEnvironmentRecord & WorkerEnvironmentServiceRecord;
@@ -52,6 +54,45 @@ export type TestWorkerService = Omit<
   WorkerEnvironmentServiceContract,
   "startTunnel" | "stopTunnel"
 >;
+
+export function nodeCatalogState(): ReturnType<typeof collectNodeCatalogRuntimeState> {
+  return {
+    sessionHostNodeIds: new Set<string>(),
+    deviceFolderNodeIds: new Set<string>(),
+    issuesByNodeId: new Map(),
+    workerSlotsByNodeId: new Map(),
+    workerBundleByNodeId: new Map(),
+  };
+}
+
+export function pairedInventory() {
+  return createDevicePairingNodeSnapshot([
+    pairedNodeDevice("node-live", { commands: ["system.run"] }),
+    pairedNodeDevice("node-offline", {
+      displayName: "Offline Node",
+      caps: ["screen"],
+      commands: ["camera.snap"],
+    }),
+  ]);
+}
+
+export async function invokeEnvironment(
+  method: keyof typeof environmentsHandlers,
+  params: unknown,
+  context: object,
+  client: GatewayClient | { connect: { scopes: string[] } } | null = null,
+  hasCurrentClientAuthority?: () => boolean,
+) {
+  const respond = vi.fn();
+  await environmentsHandlers[method]?.({
+    params,
+    respond,
+    context,
+    client,
+    hasCurrentClientAuthority,
+  } as never);
+  return expectDefined(respond.mock.calls.at(0), "expected environments handler to respond");
+}
 
 export function mockContext(
   workerEnvironmentService?: TestWorkerService,
@@ -204,19 +245,17 @@ export async function callEnvironmentMethod(
     scopes?: string[];
   } = {},
 ) {
-  const respond = vi.fn();
-  await environmentsHandlers[method]?.({
-    params: params as Record<string, unknown>,
-    respond,
-    ...(options.scopes ? { client: { connect: { scopes: options.scopes } } } : {}),
-    context: mockContext(
+  return invokeEnvironment(
+    method,
+    params,
+    mockContext(
       options.service,
       options.reconcileActive,
       options.forceDestroyEnvironment,
       options.connectedNodes,
     ),
-  } as never);
-  return expectDefined(respond.mock.calls.at(0), "expected environments handler to respond");
+    options.scopes ? { connect: { scopes: options.scopes } } : null,
+  );
 }
 
 export class FakeWorkerServiceError extends Error {

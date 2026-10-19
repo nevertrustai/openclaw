@@ -4,8 +4,11 @@ import { readDevicePairingNodeSnapshot } from "../../infra/device-pairing-store-
 import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
 import { NodeRegistry } from "../node-registry.js";
-import { environmentsHandlers } from "./environments.js";
-import { createDevicePairingNodeSnapshot, pairedNodeDevice } from "./environments.test-support.js";
+import {
+  createDevicePairingNodeSnapshot,
+  invokeEnvironment as invoke,
+  pairedNodeDevice,
+} from "./environments.test-support.js";
 
 const registries: NodeRegistry[] = [];
 
@@ -129,14 +132,11 @@ describe("node environment command authority", () => {
         nodeRegistry: registry,
       };
 
-      const listRespond = vi.fn();
-      await environmentsHandlers["environments.list"]?.({
-        params: { runtimeId: "codex" },
-        respond: listRespond,
-        client: { connect: { scopes: ["operator.write"] } },
-        context,
-      } as never);
-      const payload: EnvironmentsListResult = listRespond.mock.calls[0]![1];
+      const [ok, result] = await invoke("environments.list", { runtimeId: "codex" }, context, {
+        connect: { scopes: ["operator.write"] },
+      });
+      expect(ok).toBe(true);
+      const payload: EnvironmentsListResult = result;
       const listed = payload.environments.find(
         (environment) => environment.id === "node:node-exec",
       );
@@ -173,15 +173,12 @@ describe("node environment command authority", () => {
         expect(listed?.capabilities).toContain(effectiveCommand);
       }
 
-      const statusRespond = vi.fn();
-      await environmentsHandlers["environments.status"]?.({
-        params: { environmentId: "node:node-exec" },
-        respond: statusRespond,
+      const status = await invoke(
+        "environments.status",
+        { environmentId: "node:node-exec" },
         context,
-      } as never);
-      const statusPayload = statusRespond.mock.calls.at(0)?.[1] as
-        | { invocableCommands?: string[] }
-        | undefined;
+      );
+      const statusPayload = status[1] as { invocableCommands?: string[] } | undefined;
       expect(statusPayload?.invocableCommands ?? []).toEqual(expected);
     },
   );
@@ -193,26 +190,15 @@ describe("node environment command authority", () => {
       getRuntimeConfig: () => ({}),
       nodeRegistry: new NodeRegistry(),
     };
-    const readOnlyRespond = vi.fn();
-    await environmentsHandlers["environments.list"]?.({
-      params: { ...params, runtimeId: "codex" },
-      respond: readOnlyRespond,
-      client: { connect: { scopes: ["operator.read"] } },
-      context,
-    } as never);
-    expect(readOnlyRespond).toHaveBeenCalledWith(
+    const readOnly = { connect: { scopes: ["operator.read"] } };
+    expect(
+      await invoke("environments.list", { ...params, runtimeId: "codex" }, context, readOnly),
+    ).toEqual([
       false,
       undefined,
       expect.objectContaining({ code: "FORBIDDEN", message: "missing scope: operator.write" }),
-    );
+    ]);
 
-    const inventoryRespond = vi.fn();
-    await environmentsHandlers["environments.list"]?.({
-      params,
-      respond: inventoryRespond,
-      client: { connect: { scopes: ["operator.read"] } },
-      context,
-    } as never);
-    expect(inventoryRespond.mock.calls.at(0)?.[0]).toBe(true);
+    expect((await invoke("environments.list", params, context, readOnly))[0]).toBe(true);
   });
 });

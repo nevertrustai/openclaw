@@ -74,6 +74,9 @@ vi.mock("../../infra/restart.js", async (importOriginal) => ({
 
 let storedConfig: OpenClawConfig;
 let storedHash: string;
+function expectDestination(config: OpenClawConfig, ok: boolean) {
+  expect(resolveWorkerPlacementDestination({ cfg: config, profileId: "cloud" }).ok).toBe(ok);
+}
 beforeEach(() => {
   storedConfig = {};
   storedHash = "base-hash";
@@ -173,9 +176,7 @@ describe("suggested cloud profile adoption", () => {
         },
         undefined,
       );
-      expect(resolveWorkerPlacementDestination({ cfg: storedConfig, profileId: "cloud" }).ok).toBe(
-        false,
-      );
+      expectDestination(storedConfig, false);
       expect(configWriteMocks.commitGatewayConfigWrite).not.toHaveBeenCalled();
     },
   );
@@ -214,9 +215,7 @@ describe("suggested cloud profile adoption", () => {
     };
     const unrelated = structuredClone(storedConfig.gateway);
     vi.mocked(resolveSuggestedWorkerProfile).mockResolvedValue(suggested);
-    expect(resolveWorkerPlacementDestination({ cfg: storedConfig, profileId: "cloud" }).ok).toBe(
-      false,
-    );
+    expectDestination(storedConfig, false);
     const { options, respond } = adoptionHarness();
     await adoptSuggestedWorkerProfile(options);
     expect(storedConfig.cloudWorkers?.profiles).toEqual({ cloud: suggested.profile });
@@ -257,18 +256,14 @@ describe("suggested cloud profile adoption", () => {
     vi.mocked(resolveSuggestedWorkerProfile).mockResolvedValue(suggested);
     const { options, respond } = adoptionHarness(() => runtimeConfig);
 
-    expect(resolveWorkerPlacementDestination({ cfg: runtimeConfig, profileId: "cloud" }).ok).toBe(
-      false,
-    );
+    expectDestination(runtimeConfig, false);
     await adoptSuggestedWorkerProfile(options);
     expect(storedConfig.cloudWorkers?.profiles?.cloud).toEqual(suggested.profile);
     expect(scheduleGatewayRestart).toHaveBeenCalledOnce();
     expect(writeRestartSentinel).toHaveBeenCalledWith(
       expect.objectContaining({ stats: expect.objectContaining({ requiresRestart: true }) }),
     );
-    expect(resolveWorkerPlacementDestination({ cfg: runtimeConfig, profileId: "cloud" }).ok).toBe(
-      false,
-    );
+    expectDestination(runtimeConfig, false);
     const unavailable = [
       false,
       undefined,
@@ -287,9 +282,7 @@ describe("suggested cloud profile adoption", () => {
     expect(respond.mock.calls).toEqual([
       [true, { profile: { id: "cloud", providerId: "crabbox" } }, undefined],
     ]);
-    expect(resolveWorkerPlacementDestination({ cfg: runtimeConfig, profileId: "cloud" }).ok).toBe(
-      true,
-    );
+    expectDestination(runtimeConfig, true);
     expect(configWriteMocks.commitGatewayConfigWrite).toHaveBeenCalledOnce();
     expect(scheduleGatewayRestart).toHaveBeenCalledOnce();
   });

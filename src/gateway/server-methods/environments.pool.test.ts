@@ -14,7 +14,8 @@ import {
   callEnvironmentMethod,
   createDevicePairingNodeSnapshot,
   mockContext,
-  pairedNodeDevice,
+  nodeCatalogState,
+  pairedInventory,
   workerRecord,
   workerService,
 } from "./environments.test-support.js";
@@ -31,23 +32,8 @@ vi.mock("../node-registry-private.js", async (importOriginal) => ({
 
 beforeEach(() => {
   vi.spyOn(Date, "now").mockReturnValue(10_000);
-  vi.mocked(collectNodeCatalogRuntimeState).mockReturnValue({
-    sessionHostNodeIds: new Set(),
-    deviceFolderNodeIds: new Set(),
-    issuesByNodeId: new Map(),
-    workerSlotsByNodeId: new Map(),
-    workerBundleByNodeId: new Map(),
-  });
-  vi.mocked(readDevicePairingNodeSnapshot).mockResolvedValue(
-    createDevicePairingNodeSnapshot([
-      pairedNodeDevice("node-live", { commands: ["system.run"] }),
-      pairedNodeDevice("node-offline", {
-        displayName: "Offline Node",
-        caps: ["screen"],
-        commands: ["camera.snap"],
-      }),
-    ]),
-  );
+  vi.mocked(collectNodeCatalogRuntimeState).mockReturnValue(nodeCatalogState());
+  vi.mocked(readDevicePairingNodeSnapshot).mockResolvedValue(pairedInventory());
 });
 
 afterEach(() => vi.restoreAllMocks());

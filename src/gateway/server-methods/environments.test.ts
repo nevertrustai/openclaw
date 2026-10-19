@@ -11,12 +11,14 @@ import * as rfbProbe from "../desktop/rfb-probe.js";
 import { collectNodeCatalogRuntimeState } from "../node-registry-private.js";
 import { NodeRegistry } from "../node-registry.js";
 import { summarizeWorkerEnvironment } from "../worker-environments/environment-summary.js";
-import { environmentsHandlers } from "./environments.js";
 import {
   callEnvironmentMethod as call,
   createDevicePairingNodeSnapshot,
   FakeWorkerServiceError,
+  invokeEnvironment as invoke,
   mockContext,
+  nodeCatalogState,
+  pairedInventory,
   pairedNodeDevice,
   workerRecord,
   workerService,
@@ -35,13 +37,7 @@ vi.mock("../../plugins/worker-profile-suggestions.js", async (importOriginal) =>
 
 vi.mock("../node-registry-private.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../node-registry-private.js")>()),
-  collectNodeCatalogRuntimeState: vi.fn(() => ({
-    sessionHostNodeIds: new Set(),
-    deviceFolderNodeIds: new Set(),
-    issuesByNodeId: new Map(),
-    workerSlotsByNodeId: new Map(),
-    workerBundleByNodeId: new Map(),
-  })),
+  collectNodeCatalogRuntimeState: vi.fn(),
 }));
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -53,28 +49,17 @@ function rejectService(code: string, detail: string) {
     throw new FakeWorkerServiceError(code, detail);
   });
 }
+function expectFailure(response: unknown[], code: string, message: string) {
+  expect(response[0]).toBe(false);
+  expect(response[2]).toEqual({ code, message });
+}
 let runtimeState: ReturnType<typeof collectNodeCatalogRuntimeState>;
 
 beforeEach(() => {
   vi.spyOn(Date, "now").mockReturnValue(NOW);
-  runtimeState = {
-    sessionHostNodeIds: new Set(),
-    deviceFolderNodeIds: new Set(),
-    issuesByNodeId: new Map(),
-    workerSlotsByNodeId: new Map(),
-    workerBundleByNodeId: new Map(),
-  };
+  runtimeState = nodeCatalogState();
   vi.mocked(collectNodeCatalogRuntimeState).mockReturnValue(runtimeState);
-  vi.mocked(readDevicePairingNodeSnapshot).mockResolvedValue(
-    createDevicePairingNodeSnapshot([
-      pairedNodeDevice("node-live", { commands: ["system.run"] }),
-      pairedNodeDevice("node-offline", {
-        displayName: "Offline Node",
-        caps: ["screen"],
-        commands: ["camera.snap"],
-      }),
-    ]),
-  );
+  vi.mocked(readDevicePairingNodeSnapshot).mockResolvedValue(pairedInventory());
 });
 
 afterEach(() => vi.restoreAllMocks());
@@ -109,13 +94,12 @@ describe("environment gateway methods", () => {
     expect(setupPayload).not.toHaveProperty("environments.1.desktopSetup");
 
     const observe = vi.fn();
-    const respond = vi.fn();
-    await environmentsHandlers["desktop.observe"]?.({
-      params: { source: { kind: "host" } },
-      respond,
-      context: { ...mockContext(), hostDesktopService: { observe } },
-    } as never);
-    expect(respond.mock.calls[0]?.[0]).toBe(false);
+    const result = await invoke(
+      "desktop.observe",
+      { source: { kind: "host" } },
+      { ...mockContext(), hostDesktopService: { observe } },
+    );
+    expect(result[0]).toBe(false);
     expect(observe).not.toHaveBeenCalled();
   });
 
@@ -189,15 +173,9 @@ describe("environment gateway methods", () => {
         ],
       }),
     };
-    const respond = vi.fn();
-    await environmentsHandlers["environments.list"]?.({
-      params: { includeDesktopSetup: true },
-      respond,
-      context,
-    } as never);
-    expect(respond.mock.calls[0]?.[0]).toBe(true);
-    const payload: EnvironmentsListResult = respond.mock.calls[0]![1];
-    const { environments } = payload;
+    const [ok, payload] = await invoke("environments.list", { includeDesktopSetup: true }, context);
+    expect(ok).toBe(true);
+    const { environments }: EnvironmentsListResult = payload;
     const find = (id: string) => environments.find((entry) => entry.id === id);
     expect(find("gateway")).toMatchObject({ type: "local", desktop: true, sessionHost: true });
     expect(probe).not.toHaveBeenCalled();
@@ -241,13 +219,11 @@ describe("environment gateway methods", () => {
     expect(find("node:node-other")).not.toHaveProperty("desktop");
     expect(find("node:node-lost")).not.toHaveProperty("desktop");
     for (const environmentId of ["node:node-live", "node:node-lost"]) {
-      respond.mockClear();
-      await environmentsHandlers["environments.status"]?.({
-        params: { environmentId },
-        respond,
-        context,
-      } as never);
-      expect(respond).toHaveBeenCalledWith(true, find(environmentId), undefined);
+      expect(await invoke("environments.status", { environmentId }, context)).toEqual([
+        true,
+        find(environmentId),
+        undefined,
+      ]);
     }
   });
 
@@ -377,25 +353,19 @@ describe("environment gateway methods", () => {
   });
 
   it("rejects unknown environment ids", async () => {
-    const [ok, , error] = await call("environments.status", {
-      environmentId: "missing",
-    });
-
-    expect(ok).toBe(false);
-    expect(error).toEqual({
-      code: ErrorCodes.INVALID_REQUEST,
-      message: "unknown environmentId",
-    });
+    expectFailure(
+      await call("environments.status", { environmentId: "missing" }),
+      ErrorCodes.INVALID_REQUEST,
+      "unknown environmentId",
+    );
   });
 
   it("keeps worker creation unavailable until a provider profile is configured", async () => {
-    const [ok, , error] = await call("environments.create", createParams);
-
-    expect(ok).toBe(false);
-    expect(error).toEqual({
-      code: ErrorCodes.INVALID_REQUEST,
-      message: "cloud worker environments are not configured",
-    });
+    expectFailure(
+      await call("environments.create", createParams),
+      ErrorCodes.INVALID_REQUEST,
+      "cloud worker environments are not configured",
+    );
   });
 
   it("creates a worker from a configured profile", async () => {
@@ -424,13 +394,11 @@ describe("environment gateway methods", () => {
     const service = workerService({
       create: rejectService("provider_failure", "private endpoint details"),
     });
-    const [ok, , error] = await call("environments.create", createParams, { service });
-
-    expect(ok).toBe(false);
-    expect(error).toEqual({
-      code: ErrorCodes.UNAVAILABLE,
-      message: "worker environment creation failed",
-    });
+    expectFailure(
+      await call("environments.create", createParams, { service }),
+      ErrorCodes.UNAVAILABLE,
+      "worker environment creation failed",
+    );
   });
 
   it("maps desktop lifecycle errors to invalid request and hides runtime failures", async () => {
@@ -514,13 +482,11 @@ describe("environment gateway methods", () => {
       ),
     });
 
-    const [ok, , error] = await call("environments.destroy", workerId, { service });
-
-    expect(ok).toBe(false);
-    expect(error).toEqual({
-      code: ErrorCodes.INVALID_REQUEST,
-      message: "Attached cloud workers must be stopped through sessions.reclaim",
-    });
+    expectFailure(
+      await call("environments.destroy", workerId, { service }),
+      ErrorCodes.INVALID_REQUEST,
+      "Attached cloud workers must be stopped through sessions.reclaim",
+    );
   });
 
   it("logs best-effort forced teardown errors without failing the call", async () => {
@@ -536,19 +502,11 @@ describe("environment gateway methods", () => {
       vi.fn(async () => {}),
       forceDestroyEnvironment,
     );
-    const respond = vi.fn();
-
-    await environmentsHandlers["environments.destroy"]?.({
-      params: { environmentId: "worker-1", force: true },
-      respond,
-      context,
-    } as never);
-
-    expect(respond).toHaveBeenCalledWith(
+    expect(await invoke("environments.destroy", { ...workerId, force: true }, context)).toEqual([
       true,
       expect.objectContaining({ worker: expect.objectContaining({ state: "destroying" }) }),
       undefined,
-    );
+    ]);
     expect(context.logGateway.warn).toHaveBeenCalledWith(
       "worker environment forced teardown cleanup failed: Error: provider stop remains pending",
     );
