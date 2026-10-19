@@ -5,16 +5,16 @@ import {
   type JsonRpcId,
 } from "@agentclientprotocol/sdk";
 import { createInMemorySessionStore } from "@openclaw/acp-core/session";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, expect, it } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { AcpSessionNewOrdering } from "./session-new-ordering.js";
 
-const cleanups: Array<() => Promise<void>> = [];
+let cleanup: (() => Promise<void>) | undefined;
 const FAST_POLL = { interval: 1 } as const;
 afterEach(async () => {
-  for (const cleanup of cleanups.splice(0)) {
-    await cleanup();
-  }
+  const dispose = cleanup;
+  cleanup = undefined;
+  await dispose?.();
 });
 
 function createWireHarness(maxSessions = 10) {
@@ -141,7 +141,7 @@ function createWireHarness(maxSessions = 10) {
     expect(updateIndex(sessionId)).toBeGreaterThanOrEqual(0);
     expect(updateIndex(sessionId)).toBeLessThan(responseIndex(id));
   };
-  cleanups.push(async () => {
+  cleanup = async () => {
     slow.resolve();
     if (!inputCancelled) {
       input.close();
@@ -150,7 +150,7 @@ function createWireHarness(maxSessions = 10) {
     outputAbort.abort();
     await outputDone.catch(() => {});
     store.dispose();
-  });
+  };
   return {
     frames,
     entered,
@@ -180,108 +180,94 @@ function create(id: JsonRpcId, sessionId: string) {
 }
 const initialize = (id: number) =>
   request(id, "initialize", { protocolVersion: 1, clientCapabilities: {} });
+const restore = (id: JsonRpcId, method: string, sessionId: string) =>
+  request(id, method, { sessionId, cwd: "/tmp", mcpServers: [] });
 
-describe("ACP SDK NDJSON ordering", () => {
-  it("streams create/prompt/load/resume with empty and null IDs while a creation is pending", async () => {
-    const wire = createWireHarness();
-    await wire.beginSlow(90);
-    await wire.exchange(create(1, "chatty"));
-    await wire.exchange(request(2, "session/prompt", { sessionId: "chatty", prompt: [] }));
-    await wire.exchange(
-      request("", "session/load", { sessionId: "loaded", cwd: "/tmp", mcpServers: [] }),
-    );
-    await wire.exchange(
-      request(null, "session/resume", { sessionId: "resumed", cwd: "/tmp", mcpServers: [] }),
-    );
-    expect(wire.responseIndex(90)).toBe(-1);
-    expect(wire.updateIndex("chatty")).toBeGreaterThan(wire.responseIndex(1));
-    const text = wire.frames.findIndex(
-      (frame) => "method" in frame && JSON.stringify(frame).includes('"answer"'),
-    );
-    expect(text).toBeGreaterThan(wire.responseIndex(1));
-    expect(text).toBeLessThan(wire.responseIndex(2));
-    wire.expectUpdateBefore("loaded", "");
-    wire.expectUpdateBefore("resumed", null);
-    wire.slow.resolve();
-    await wire.waitResponse(90);
-    await expect
-      .poll(() => wire.updateIndex("slow"), FAST_POLL)
-      .toBeGreaterThan(wire.responseIndex(90));
-  });
+it("streams create/prompt/load/resume with empty and null IDs while a creation is pending", async () => {
+  const wire = createWireHarness();
+  await wire.beginSlow(90);
+  await wire.exchange(create(1, "chatty"));
+  await wire.exchange(request(2, "session/prompt", { sessionId: "chatty", prompt: [] }));
+  await wire.exchange(restore("", "session/load", "loaded"));
+  await wire.exchange(restore(null, "session/resume", "resumed"));
+  expect(wire.responseIndex(90)).toBe(-1);
+  expect(wire.updateIndex("chatty")).toBeGreaterThan(wire.responseIndex(1));
+  const text = wire.frames.findIndex(
+    (frame) => "method" in frame && JSON.stringify(frame).includes('"answer"'),
+  );
+  expect(text).toBeGreaterThan(wire.responseIndex(1));
+  expect(text).toBeLessThan(wire.responseIndex(2));
+  wire.expectUpdateBefore("loaded", "");
+  wire.expectUpdateBefore("resumed", null);
+  wire.slow.resolve();
+  await wire.waitResponse(90);
+  await expect
+    .poll(() => wire.updateIndex("slow"), FAST_POLL)
+    .toBeGreaterThan(wire.responseIndex(90));
+});
 
-  it.each([
-    {
-      failure: "missing protocol version",
-      message: { ...create(41, "invalid"), jsonrpc: undefined },
-    },
-    {
-      failure: "invalid parameters",
-      message: request(null, "session/new", { cwd: 1, mcpServers: [] }),
-    },
-    ...["session/load", "session/resume"].map((method) => ({
-      failure: `malformed ${method}`,
-      message: {
-        ...request(41, method, { sessionId: "slow", cwd: "/tmp", mcpServers: [] }),
-        jsonrpc: "1.0",
-      },
-    })),
-  ])("retires rejected session correlations after $failure", async ({ message }) => {
-    const wire = createWireHarness();
-    wire.send(message);
-    await wire.waitResponse(null);
-    expect(wire.entered).toEqual([]);
-    await wire.connection.sessionUpdate(wire.sessionInfo("unowned", "after rejection"));
-    await wire.exchange(initialize(42));
-    wire.expectUpdateBefore("unowned", 42);
-    await wire.beginSlow("");
-    wire.slow.resolve();
-    const response = await wire.waitResponse("");
-    await expect.poll(() => wire.updateIndex("slow"), FAST_POLL).toBeGreaterThan(response);
-    expect(wire.entered).toEqual(["slow"]);
-    expect(wire.updateIndex("unowned")).toBeGreaterThanOrEqual(0);
-  });
+it.each([
+  { ...create(41, "invalid"), jsonrpc: undefined },
+  request(null, "session/new", { cwd: 1, mcpServers: [] }),
+  ...["session/load", "session/resume"].map((method) =>
+    Object.assign(restore(41, method, "slow"), { jsonrpc: "1.0" }),
+  ),
+])("retires rejected session correlations for %j", async (message) => {
+  const wire = createWireHarness();
+  wire.send(message);
+  await wire.waitResponse(null);
+  expect(wire.entered).toEqual([]);
+  await wire.connection.sessionUpdate(wire.sessionInfo("unowned", "after rejection"));
+  await wire.exchange(initialize(42));
+  wire.expectUpdateBefore("unowned", 42);
+  await wire.beginSlow("");
+  wire.slow.resolve();
+  const response = await wire.waitResponse("");
+  await expect.poll(() => wire.updateIndex("slow"), FAST_POLL).toBeGreaterThan(response);
+  expect(wire.entered).toEqual(["slow"]);
+  expect(wire.updateIndex("unowned")).toBeGreaterThanOrEqual(0);
+});
 
-  it("does not settle a null-ID creation on an uncorrelated protocol error", async () => {
-    const wire = createWireHarness();
-    await wire.beginSlow(null);
-    wire.send({ ...create(41, "invalid"), jsonrpc: "1.0" });
-    await wire.waitResponse(null);
-    await wire.exchange(initialize(42));
-    expect(wire.updateIndex("slow")).toBe(-1);
-    wire.slow.resolve();
-    await expect
-      .poll(() => wire.frames.some((frame) => "result" in frame && frame.id === null), FAST_POLL)
-      .toBe(true);
-    await expect.poll(() => wire.updateIndex("slow"), FAST_POLL).toBeGreaterThan(2);
-  });
+it("does not settle a null-ID creation on an uncorrelated protocol error", async () => {
+  const wire = createWireHarness();
+  await wire.beginSlow(null);
+  wire.send({ ...create(41, "invalid"), jsonrpc: "1.0" });
+  await wire.waitResponse(null);
+  await wire.exchange(initialize(42));
+  expect(wire.updateIndex("slow")).toBe(-1);
+  wire.slow.resolve();
+  await expect
+    .poll(() => wire.frames.some((frame) => "result" in frame && frame.id === null), FAST_POLL)
+    .toBe(true);
+  await expect.poll(() => wire.updateIndex("slow"), FAST_POLL).toBeGreaterThan(2);
+});
 
-  it("forgets recognition when the actual session store evicts an idle session", async () => {
-    const wire = createWireHarness(1);
-    await wire.exchange(create(1, "evicted"));
-    await wire.beginSlow(2);
-    expect(wire.store.hasSession("evicted")).toBe(false);
-    const before = wire.frames.length;
-    await wire.connection.sessionUpdate(wire.sessionInfo("evicted", "late"));
-    await wire.exchange(initialize(3));
-    expect(wire.frames.slice(before)).toHaveLength(1);
-    wire.slow.resolve();
-    await wire.waitResponse(2);
-    await expect.poll(() => wire.frames.length, FAST_POLL).toBe(before + 4);
-  });
+it("forgets recognition when the actual session store evicts an idle session", async () => {
+  const wire = createWireHarness(1);
+  await wire.exchange(create(1, "evicted"));
+  await wire.beginSlow(2);
+  expect(wire.store.hasSession("evicted")).toBe(false);
+  const before = wire.frames.length;
+  await wire.connection.sessionUpdate(wire.sessionInfo("evicted", "late"));
+  await wire.exchange(initialize(3));
+  expect(wire.frames.slice(before)).toHaveLength(1);
+  wire.slow.resolve();
+  await wire.waitResponse(2);
+  await expect.poll(() => wire.frames.length, FAST_POLL).toBe(before + 4);
+});
 
-  it("reports NDJSON output failure to the server shutdown owner", async () => {
-    const wire = createWireHarness();
-    wire.failOutput();
-    wire.send(create(1, "broken-output"));
-    await expect(wire.outputDone).rejects.toThrow("stdout closed");
-    expect(wire.frames).toEqual([]);
-  });
+it("reports NDJSON output failure to the server shutdown owner", async () => {
+  const wire = createWireHarness();
+  wire.failOutput();
+  wire.send(create(1, "broken-output"));
+  await expect(wire.outputDone).rejects.toThrow("stdout closed");
+  expect(wire.frames).toEqual([]);
+});
 
-  it("preserves the stable SDK's rejection of NDJSON batch frames", async () => {
-    const wire = createWireHarness();
-    wire.send([create(1, "batched")]);
-    await wire.connection.closed.catch(() => {});
-    expect(wire.entered).toEqual([]);
-    expect(wire.frames).toEqual([]);
-  });
+it("preserves the stable SDK's rejection of NDJSON batch frames", async () => {
+  const wire = createWireHarness();
+  wire.send([create(1, "batched")]);
+  await wire.connection.closed.catch(() => {});
+  expect(wire.entered).toEqual([]);
+  expect(wire.frames).toEqual([]);
 });

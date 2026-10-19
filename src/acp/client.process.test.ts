@@ -8,7 +8,6 @@ import { createBoundedChildOutput } from "../../test/helpers/bounded-child-outpu
 import { createFixtureLifetime } from "../../test/helpers/fixture-lifetime.js";
 import { DEFAULT_VITEST_TEST_TIMEOUT_MS } from "../../test/vitest/vitest.timeouts.js";
 import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
-import { runAcpClientInteractive } from "./client.js";
 
 const fixture = createFixtureLifetime();
 const node = resolveTestNodeExecPath();
@@ -21,16 +20,18 @@ type ServerMode = "handshake-failure" | "SIGTERM" | "exit-0" | "quit-7" | "eof-p
 
 afterEach(() => fixture.cleanup());
 
-async function createServerFixture(mode: ServerMode) {
-  const dir = fixture.createTempDir("openclaw-acp-client-process-test-");
-  const pidFile = path.join(dir, "server.pid");
-  const termFile = path.join(dir, "server.term");
-  const promptFile = path.join(dir, "server.prompt");
-  await writeFile(path.join(dir, "package.json"), '{"type":"commonjs"}\n');
-  // The client prepends "acp" to server args, so this becomes `node acp`.
-  await writeFile(
-    path.join(dir, "acp"),
-    `
+function runCase(mode: ServerMode, code = 0, diagnostic?: string) {
+  return fixture.run(async () => {
+    const handshake = mode === "handshake-failure";
+    const dir = fixture.createTempDir("openclaw-acp-client-process-test-");
+    const pidFile = path.join(dir, "server.pid");
+    const termFile = path.join(dir, "server.term");
+    const promptFile = path.join(dir, "server.prompt");
+    await writeFile(path.join(dir, "package.json"), '{"type":"commonjs"}\n');
+    // The client prepends "acp" to server args, so this becomes `node acp`.
+    await writeFile(
+      path.join(dir, "acp"),
+      `
 const fs = require("node:fs");
 const readline = require("node:readline");
 const mode = ${JSON.stringify(mode)};
@@ -73,49 +74,7 @@ lines.on("line", (line) => {
 });
 setInterval(() => {}, 60_000);
 `,
-  );
-  return { dir, pidFile, termFile, promptFile };
-}
-
-it(
-  "force-kills the spawned ACP server when the handshake fails",
-  async () =>
-    fixture.run(async () => {
-      const { dir, pidFile, termFile } = await createServerFixture("handshake-failure");
-      let serverPid: number | undefined;
-      try {
-        const error = await runAcpClientInteractive({
-          serverCommand: process.execPath,
-          cwd: dir,
-        }).catch((caught: unknown) => caught);
-        serverPid = Number(await readFile(pidFile, "utf8"));
-
-        expect(error).toMatchObject({ name: "RequestError", ...handshakeError });
-        if (process.platform !== "win32") {
-          expect(await readFile(termFile, "utf8")).toBe("SIGTERM");
-        }
-        expect(() => process.kill(serverPid as number, 0)).toThrow();
-      } finally {
-        try {
-          if (serverPid !== undefined) {
-            process.kill(serverPid, "SIGKILL");
-          }
-        } catch {
-          // Already reaped.
-        }
-      }
-    }),
-  20_000,
-);
-
-it.skipIf(process.platform === "win32").each([
-  { mode: "SIGTERM", code: 1, diagnostic: "signal SIGTERM" },
-  { mode: "exit-0", code: 0, diagnostic: "code 0" },
-  { mode: "quit-7", code: 7, diagnostic: "code 7" },
-  { mode: "eof-pending", code: 0, diagnostic: "signal SIGKILL" },
-] as const)("preserves the client outcome for $mode", async ({ mode, code, diagnostic }) =>
-  fixture.run(async () => {
-    const { dir, pidFile, termFile, promptFile } = await createServerFixture(mode);
+    );
     const stdout = createBoundedChildOutput();
     const stderr = createBoundedChildOutput();
     const cancellation = new AbortController();
@@ -132,9 +91,19 @@ it.skipIf(process.platform === "win32").each([
         "--input-type=module",
         "--eval",
         `import { runAcpClientInteractive } from ${JSON.stringify(new URL("./client.ts", import.meta.url).href)};
-         process.exitCode = await runAcpClientInteractive({ serverCommand: process.execPath, cwd: process.argv[1] });
+         import { readFileSync } from "node:fs";
+         process.exitCode = await runAcpClientInteractive({ serverCommand: process.execPath, cwd: process.argv[1] }).catch(error => {
+           if (${JSON.stringify(mode)} !== "handshake-failure") throw error;
+           const serverPid = Number(readFileSync(process.argv[2], "utf8"));
+           let serverAlive = true;
+           try { process.kill(serverPid, 0); } catch { serverAlive = false; }
+           const { name, code, message, data } = error;
+           console.log("ACP_CLIENT_ERROR:" + JSON.stringify({ name, code, message, data, serverAlive }));
+           return 0;
+         });
          console.log("ACP_CLIENT_RETURNED");`,
         dir,
+        pidFile,
       ],
       env: {
         PATH: process.env.PATH,
@@ -146,7 +115,7 @@ it.skipIf(process.platform === "win32").each([
       stdio: ["pipe", "pipe", "pipe"],
       requireProcessTreeExit: true,
       // Leave the shared test deadline enough time to join cancellation and output.
-      timeoutMs: DEFAULT_VITEST_TEST_TIMEOUT_MS - 20_000,
+      timeoutMs: handshake ? 18_000 : DEFAULT_VITEST_TEST_TIMEOUT_MS - 20_000,
       signal: cancellation.signal,
       onReady(child) {
         child.once("exit", (childCode, signal) => {
@@ -181,14 +150,21 @@ it.skipIf(process.platform === "win32").each([
         { cause: error },
       );
     });
-    expect(prompted, stderr.text()).toBe(true);
     expect(result, `${stderr.text()}\n${stdout.text()}`).toBe(code);
     expect(native).toEqual({ code, signal: null });
     expect(stdout.text()).toContain("ACP_CLIENT_RETURNED");
-    expect(await readFile(promptFile, "utf8")).toBe("status marker");
-    expect(stdout.text()).toContain(`Agent exited with ${diagnostic}`);
-    if (clientQuits) {
-      expect(quitSent).toBe(true);
+    if (handshake) {
+      const error = JSON.parse(stdout.text().match(/ACP_CLIENT_ERROR:(.*)/)?.[1] ?? "null");
+      expect(error).toMatchObject({ name: "RequestError", ...handshakeError, serverAlive: false });
+    } else {
+      expect(prompted, stderr.text()).toBe(true);
+      expect(await readFile(promptFile, "utf8")).toBe("status marker");
+      expect(stdout.text()).toContain(`Agent exited with ${diagnostic}`);
+    }
+    if (clientQuits || (handshake && process.platform !== "win32")) {
+      if (clientQuits) {
+        expect(quitSent).toBe(true);
+      }
       expect(await readFile(termFile, "utf8")).toBe("SIGTERM");
     }
     if (eof) {
@@ -197,5 +173,20 @@ it.skipIf(process.platform === "win32").each([
     }
     const serverPid = Number(await readFile(pidFile, "utf8"));
     expect(() => process.kill(serverPid, 0)).toThrow();
-  }),
+  });
+}
+
+it(
+  "force-kills the spawned ACP server when the handshake fails",
+  () => runCase("handshake-failure"),
+  20_000,
+);
+
+it.skipIf(process.platform === "win32").each([
+  { mode: "SIGTERM", code: 1, diagnostic: "signal SIGTERM" },
+  { mode: "exit-0", code: 0, diagnostic: "code 0" },
+  { mode: "quit-7", code: 7, diagnostic: "code 7" },
+  { mode: "eof-pending", code: 0, diagnostic: "signal SIGKILL" },
+] as const)("preserves the client outcome for $mode", ({ mode, code, diagnostic }) =>
+  runCase(mode, code, diagnostic),
 );
