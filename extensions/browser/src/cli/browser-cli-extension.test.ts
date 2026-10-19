@@ -7,18 +7,13 @@ import type { installChromeExtensionBootstrap } from "../browser/extension-insta
 import { relayKeyIdFromHex } from "../browser/extension-relay/auth-v2-crypto.js";
 
 // Metadata output must remain usable without loading browser or agent execution runtimes.
-vi.mock("../control-service.js", () => {
-  throw new Error("Browser extension CLI must not load browser control services");
+const rejectRuntimeImport = vi.hoisted(() => () => {
+  throw new Error("Browser extension metadata must not load execution runtimes");
 });
-vi.mock("openclaw/plugin-sdk/agent-harness-runtime", () => {
-  throw new Error("Browser extension CLI must not load agent runtime");
-});
-vi.mock("openclaw/plugin-sdk/media-runtime", () => {
-  throw new Error("Browser extension CLI must not load media runtime");
-});
-vi.mock("openclaw/plugin-sdk/media-understanding-runtime", () => {
-  throw new Error("Browser extension CLI must not load media understanding runtime");
-});
+vi.mock("../control-service.js", rejectRuntimeImport);
+vi.mock("openclaw/plugin-sdk/agent-harness-runtime", rejectRuntimeImport);
+vi.mock("openclaw/plugin-sdk/media-runtime", rejectRuntimeImport);
+vi.mock("openclaw/plugin-sdk/media-understanding-runtime", rejectRuntimeImport);
 
 const relayMocks = vi.hoisted(() => {
   let relayKey = "";
@@ -48,11 +43,7 @@ vi.mock("../browser/extension-relay/relay-auth.js", async (importOriginal) => ({
 
 vi.mock("../browser/extension-install.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../browser/extension-install.js")>()),
-  browserExtensionStatus: installMocks.browserExtensionStatus,
-  installChromeExtensionBootstrap: installMocks.installChromeExtensionBootstrap,
-  removeChromeStoreInstallRequests: installMocks.removeChromeStoreInstallRequests,
-  repairChromeExtensionNativeHosts: installMocks.repairChromeExtensionNativeHosts,
-  uninstallChromeExtensionNativeHosts: installMocks.uninstallChromeExtensionNativeHosts,
+  ...installMocks,
 }));
 
 const { defaultRuntime: runtime, resetRuntimeCapture } = createCliRuntimeCapture();
@@ -104,11 +95,9 @@ describe("browser extension pairing Gateway URL", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
-    installMocks.browserExtensionStatus.mockReset();
-    installMocks.installChromeExtensionBootstrap.mockReset();
-    installMocks.removeChromeStoreInstallRequests.mockReset();
-    installMocks.repairChromeExtensionNativeHosts.mockReset();
-    installMocks.uninstallChromeExtensionNativeHosts.mockReset();
+    for (const mock of Object.values(installMocks)) {
+      mock.mockReset();
+    }
     resetRuntimeCapture();
   });
 
@@ -292,18 +281,11 @@ describe("browser extension pairing Gateway URL", () => {
     expect(output.log).not.toHaveBeenCalled();
   });
 
-  it.each([
-    {
-      label: "configured",
-      config: {
-        browser: {
-          profiles: { custom: { driver: "extension" as const, cdpPort: 21117, color: "#00AA00" } },
-        },
-      },
-      port: 21117,
-    },
-  ])("prints safe $label v2 metadata through the lazy root CLI", async ({ config, port }) => {
-    configMocks.read.mockReturnValue(config);
+  it("prints safe configured v2 metadata through the lazy root CLI", async () => {
+    const port = 21117;
+    configMocks.read.mockReturnValue({
+      browser: { profiles: { custom: { driver: "extension", cdpPort: port, color: "#00AA00" } } },
+    });
     const { registerBrowserCli } = await import("./browser-cli.js");
     const program = new Command();
     registerBrowserCli(program, ["node", "openclaw", "browser", "extension", "cdp", "--json"]);

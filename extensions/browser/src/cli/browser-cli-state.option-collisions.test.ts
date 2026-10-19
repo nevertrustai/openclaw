@@ -27,14 +27,6 @@ describe("browser state option collisions", () => {
     return program;
   };
 
-  const getLastRequest = () => {
-    const call = gatewayMock.mock.calls.at(-1);
-    if (!call) {
-      throw new Error("expected browser request call");
-    }
-    return call[2];
-  };
-
   const runBrowserCommand = async (argv: string[]) => {
     const program = createStateProgram();
     await program.parseAsync(["browser", ...argv], { from: "user" });
@@ -42,7 +34,11 @@ describe("browser state option collisions", () => {
 
   const runBrowserCommandAndGetRequest = async (argv: string[]) => {
     await runBrowserCommand(argv);
-    return getLastRequest();
+    const call = gatewayMock.mock.calls.at(-1);
+    if (!call) {
+      throw new Error("expected browser request call");
+    }
+    return call[2];
   };
 
   const expectErrorMessage = (expected: string) => {
@@ -50,6 +46,13 @@ describe("browser state option collisions", () => {
     const lastCall = calls.at(-1);
     expect(lastCall).toHaveLength(1);
     expect(stripAnsi(String(lastCall?.[0]))).toBe(expected);
+  };
+
+  const expectInvalid = async (args: string[], message: string) => {
+    await runBrowserCommand(args);
+    expect(gatewayMock).not.toHaveBeenCalled();
+    expectErrorMessage(message);
+    expect(getBrowserCliRuntime().exit).toHaveBeenCalledWith(1);
   };
 
   beforeEach(() => {
@@ -161,27 +164,18 @@ describe("browser state option collisions", () => {
   });
 
   it("rejects non-decimal viewport dimensions before resize dispatch", async () => {
-    await runBrowserCommand(["set", "viewport", "1e3", "768"]);
-
-    expect(gatewayMock).not.toHaveBeenCalled();
-    expectErrorMessage("Invalid width: must be a positive integer");
-    expect(getBrowserCliRuntime().exit).toHaveBeenCalledWith(1);
+    await expectInvalid(
+      ["set", "viewport", "1e3", "768"],
+      "Invalid width: must be a positive integer",
+    );
   });
 
   it("rejects excessive viewport dimensions before resize dispatch", async () => {
-    await runBrowserCommand(["set", "viewport", "8193", "768"]);
-
-    expect(gatewayMock).not.toHaveBeenCalled();
-    expectErrorMessage("Invalid width: maximum is 8192");
-    expect(getBrowserCliRuntime().exit).toHaveBeenCalledWith(1);
+    await expectInvalid(["set", "viewport", "8193", "768"], "Invalid width: maximum is 8192");
   });
 
   it("errors when set media receives an invalid value", async () => {
-    await runBrowserCommand(["set", "media", "sepia"]);
-
-    expect(gatewayMock).not.toHaveBeenCalled();
-    expectErrorMessage("Expected dark|light|no-preference|none");
-    expect(getBrowserCliRuntime().exit).toHaveBeenCalledWith(1);
+    await expectInvalid(["set", "media", "sepia"], "Expected dark|light|no-preference|none");
   });
 
   it("passes no-preference through to /set/media", async () => {
@@ -191,28 +185,23 @@ describe("browser state option collisions", () => {
   });
 
   it("rejects invalid geolocation numbers before dispatch", async () => {
-    await runBrowserCommand(["set", "geo", "48.208", "16.373", "--accuracy", "fast"]);
-
-    expect(gatewayMock).not.toHaveBeenCalled();
-    expectErrorMessage("Invalid --accuracy: must be a finite number");
-    expect(getBrowserCliRuntime().exit).toHaveBeenCalledWith(1);
+    await expectInvalid(
+      ["set", "geo", "48.208", "16.373", "--accuracy", "fast"],
+      "Invalid --accuracy: must be a finite number",
+    );
   });
 
   it("errors when headers JSON is missing", async () => {
-    await runBrowserCommand(["set", "headers"]);
-
-    expect(gatewayMock).not.toHaveBeenCalled();
-    expectErrorMessage(
+    await expectInvalid(
+      ["set", "headers"],
       "Error: Missing headers JSON (pass --headers-json or positional JSON argument)",
     );
-    expect(getBrowserCliRuntime().exit).toHaveBeenCalledWith(1);
   });
 
   it("errors when headers JSON is not an object", async () => {
-    await runBrowserCommand(["set", "headers", "--json", "[]"]);
-
-    expect(gatewayMock).not.toHaveBeenCalled();
-    expectErrorMessage("Error: Headers JSON must be a JSON object");
-    expect(getBrowserCliRuntime().exit).toHaveBeenCalledWith(1);
+    await expectInvalid(
+      ["set", "headers", "--json", "[]"],
+      "Error: Headers JSON must be a JSON object",
+    );
   });
 });
