@@ -27,6 +27,18 @@ const entry = {
   sessionKey: "owner",
   workspaceDir: "/owned/projection",
 };
+const success = (stdout = "") => ({ code: 0, stdout, stderr: "" });
+const commands = (action: string) =>
+  mocks.command.mock.calls.filter(([, args]) => args[0] === action).map(([, args]) => args[1]);
+function quiesce(overrides: Partial<Parameters<typeof quiesceLocalWorkspace>[0]> = {}) {
+  return quiesceLocalWorkspace({
+    workspaceDir: entry.workspaceDir,
+    retained: [],
+    persist: () => {},
+    assertCurrent: () => {},
+    ...overrides,
+  });
+}
 beforeEach(() => {
   mocks.command.mockReset();
   mocks.current.mockReset();
@@ -38,19 +50,14 @@ beforeEach(() => {
 it.each(["true", "false"])(
   "recovers its recorded paused generation (Running=%s) but never adopts a foreign pause",
   async (running) => {
-    mocks.command.mockImplementation(async (_engine, args: string[]) => ({
-      code: 0,
-      stdout: args.includes("{{.State.Paused}}") ? "true" : id + ` ${running} true`,
-      stderr: "",
-    }));
-    const input = { workspaceDir: "/owned/projection", persist: vi.fn(), assertCurrent: () => {} };
-    await expect(quiesceLocalWorkspace({ ...input, retained: [] })).rejects.toThrow(
-      "another owner",
+    mocks.command.mockImplementation(async (_engine, args: string[]) =>
+      success(args.includes("{{.State.Paused}}") ? "true" : id + ` ${running} true`),
     );
-    const { resume } = await quiesceLocalWorkspace({ ...input, retained: [{ name: "owned", id }] });
+    await expect(quiesce()).rejects.toThrow("another owner");
+    const { resume } = await quiesce({ retained: [{ name: "owned", id }] });
     await resume();
-    expect(mocks.command.mock.calls.some((call) => call[1][0] === "pause")).toBe(false);
-    expect(mocks.command.mock.calls.some((call) => call[1][0] === "unpause")).toBe(true);
+    expect(commands("pause")).toHaveLength(0);
+    expect(commands("unpause").length).toBeGreaterThan(0);
   },
 );
 
@@ -65,16 +72,9 @@ it.each([
     mocks.current.mockImplementation(() => {
       throw new Error("retired");
     });
-    return { code: 0, stdout: id + " true false", stderr: "" };
+    return success(id + " true false");
   });
-  await expect(
-    quiesceLocalWorkspace({
-      workspaceDir: "/owned/projection",
-      retained: [],
-      persist: () => {},
-      assertCurrent: () => {},
-    }),
-  ).rejects.toThrow(error);
+  await expect(quiesce()).rejects.toThrow(error);
   expect(mocks.command).toHaveBeenCalledOnce();
 });
 
@@ -95,28 +95,19 @@ it("persists exact container and browser custody before pausing and resumes only
     if (args[0] === "pause") {
       expect(persist).toHaveBeenLastCalledWith(args[1] === id ? retained.slice(0, 1) : retained);
     }
-    return {
-      code: 0,
-      stderr: "",
-      stdout: args.includes("{{.State.Paused}}")
+    return success(
+      args.includes("{{.State.Paused}}")
         ? "true"
         : args[0] === "inspect"
           ? `${args.at(-1) === "browser-owned" ? browserId : id} true false`
           : "",
-    };
+    );
   });
-  const { resume } = await quiesceLocalWorkspace({
-    workspaceDir: entry.workspaceDir,
-    retained: [],
-    persist,
-    assertCurrent: () => {},
-  });
+  const { resume } = await quiesce({ persist });
   expect(persist).toHaveBeenLastCalledWith(retained);
   expect(mocks.browserCurrent).toHaveBeenCalledTimes(3);
   await resume();
-  expect(
-    mocks.command.mock.calls.filter((call) => call[1][0] === "unpause").map((call) => call[1][1]),
-  ).toEqual([browserId, id]);
+  expect(commands("unpause")).toEqual([browserId, id]);
   expect(mocks.command.mock.calls.map((call) => call[1][0])).toEqual([
     "inspect",
     "pause",
@@ -140,10 +131,10 @@ it("records each released generation before a later resume failure and re-fences
   mocks.command.mockImplementation(async (_engine, args: string[]) => {
     const runtimeId = args.at(-1) === "other" || args.at(-1) === otherId ? otherId : id;
     if (args.includes("{{.State.Paused}}")) {
-      return { code: 0, stdout: String(pausedIds.has(runtimeId)), stderr: "" };
+      return success(String(pausedIds.has(runtimeId)));
     }
     if (args[0] === "inspect") {
-      return { code: 0, stdout: runtimeId + " true " + pausedIds.has(runtimeId), stderr: "" };
+      return success(runtimeId + " true " + pausedIds.has(runtimeId));
     }
     if (args[0] === "pause") {
       pausedIds.add(args[1]!);
@@ -156,20 +147,18 @@ it("records each released generation before a later resume failure and re-fences
         return { code: 1, stdout: "", stderr: "container is not paused" };
       }
     }
-    return { code: 0, stdout: "", stderr: "" };
+    return success();
   });
   const input = {
-    workspaceDir: entry.workspaceDir,
-    assertCurrent: () => {},
     persist: (rows: typeof retained) => {
       retained = [...rows];
     },
   };
-  const { resume } = await quiesceLocalWorkspace({ ...input, retained });
+  const { resume } = await quiesce({ ...input, retained });
   await expect(resume()).rejects.toThrow("resume failed");
   expect(retained).toEqual([{ name: "owned", id }]);
   failFirst = false;
-  const { resume: recovered } = await quiesceLocalWorkspace({ ...input, retained });
+  const { resume: recovered } = await quiesce({ ...input, retained });
   expect(pausedIds).toEqual(new Set([id, otherId]));
   await recovered();
   expect(retained).toEqual([]);
@@ -216,22 +205,16 @@ it.each(["inspect", "pause", "resume-inspect", "unpause"])(
             );
           });
         }
-        return {
-          code: 0,
-          stdout: action === "resume-inspect" ? String(paused) : `${id} true ${paused}`,
-          stderr: "",
-        };
+        return success(action === "resume-inspect" ? String(paused) : `${id} true ${paused}`);
       },
     );
     const input = {
-      workspaceDir: entry.workspaceDir,
-      assertCurrent: () => {},
       persist: (rows: typeof retained) => {
         retained = [...rows];
       },
     };
     const operation = (async () => {
-      const control = await quiesceLocalWorkspace({ ...input, retained });
+      const control = await quiesce({ ...input, retained });
       await control.resume();
     })().then(
       () => {
@@ -253,7 +236,7 @@ it.each(["inspect", "pause", "resume-inspect", "unpause"])(
       cleanup.resolve();
       expect(await operation).toBe(abortedCommand);
       expect(retained).toEqual(phase === "inspect" ? [] : [{ name: "owned", id }]);
-      const recovery = await quiesceLocalWorkspace({ ...input, retained });
+      const recovery = await quiesce({ ...input, retained });
       await recovery.resume();
       expect(retained).toEqual([]);
       expect(paused).toBe(false);
@@ -275,11 +258,9 @@ it.each([
     let retiring = false;
     mocks.command.mockImplementation(async (_engine, args: string[]) => {
       if (args.includes("{{.State.Paused}}")) {
-        return removed
-          ? { code: 1, stdout: "", stderr: "no such container" }
-          : { code: 0, stdout: "true", stderr: "" };
+        return removed ? { code: 1, stdout: "", stderr: "no such container" } : success("true");
       }
-      return { code: 0, stdout: args[0] === "inspect" ? id + " true false" : "", stderr: "" };
+      return success(args[0] === "inspect" ? id + " true false" : "");
     });
     mocks.current.mockImplementation(() => {
       if (retiring && owner === "registry") {
@@ -287,9 +268,7 @@ it.each([
       }
     });
     const persist = vi.fn();
-    const { resume } = await quiesceLocalWorkspace({
-      workspaceDir: entry.workspaceDir,
-      retained: [],
+    const { resume } = await quiesce({
       persist,
       assertCurrent: () => {
         if (retiring && owner === "workspace") {
@@ -305,6 +284,6 @@ it.each([
       await expect(resume()).rejects.toThrow(error);
       expect(persist).toHaveBeenLastCalledWith([{ name: "owned", id }]);
     }
-    expect(mocks.command.mock.calls.some((call) => call[1][0] === "unpause")).toBe(false);
+    expect(commands("unpause")).toHaveLength(0);
   },
 );

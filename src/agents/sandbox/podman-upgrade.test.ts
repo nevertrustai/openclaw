@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterEach, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { sandboxRecreateCommand } from "../../commands/sandbox.js";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -23,23 +24,19 @@ vi.mock("../../process/exec.js", async (importOriginal) => ({
   spawnCommand,
 }));
 
-let root: string | undefined;
+const dirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(async () => {
   await closeOpenClawStateDatabaseAsync();
   closeOpenClawStateDatabaseForTest();
   clearRuntimeConfigSnapshot();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  if (root) {
-    await fs.rm(root, { recursive: true, force: true });
-    root = undefined;
-  }
 });
 
 it.each([false, true])(
   "recovers a HOST-pinned sandbox before switching connections (Machine: %s)",
   async (machine) => {
-    root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-podman-upgrade-"));
+    const root = dirs.make("openclaw-podman-upgrade-");
     vi.stubEnv("OPENCLAW_STATE_DIR", root);
     vi.spyOn(os, "homedir").mockReturnValue(root);
     const workspaceDir = path.join(root, "workspace");
@@ -94,6 +91,7 @@ it.each([false, true])(
       [newUri, new Map([["unrelated-runtime", unrelatedId]])],
     ]);
     const calls: string[][] = [];
+    const commands = (action: string) => calls.filter((args) => args.includes(action));
     let oldUnreachable = false;
     spawnCommand.mockImplementation(async ([command, ...originalArgs]: string[]) => {
       expect(command).toBe("podman");
@@ -240,9 +238,7 @@ it.each([false, true])(
     oldUnreachable = false;
     await recreate();
     expect(await readRegistryEntry(containerName)).toBeNull();
-    expect(calls.filter((args) => args.includes("rm"))).toEqual([
-      [...oldTarget.globalArgs, "rm", "-f", containerName],
-    ]);
+    expect(commands("rm")).toEqual([[...oldTarget.globalArgs, "rm", "-f", containerName]]);
     expect(physical.get(oldUri)?.size).toBe(0);
     expect(physical.get(newUri)?.size).toBe(1);
     await assertWorkspaceAndUnrelatedRuntimeUnchanged();
@@ -250,17 +246,15 @@ it.each([false, true])(
     vi.stubEnv("CONTAINER_CONNECTION", "new-machine");
     await ensure();
     expect(await readRegistryEntry(containerName)).toMatchObject({ backendTarget: newTarget });
-    const create = calls.find((args) => args.includes("create"))!;
+    const create = commands("create")[0]!;
     expect(create.slice(0, newTarget.globalArgs.length + 1)).toEqual([
       ...newTarget.globalArgs,
       "create",
     ]);
-    expect(calls.filter((args) => args.includes("start"))).toEqual([
-      [...newTarget.globalArgs, "start", newId],
-    ]);
+    expect(commands("start")).toEqual([[...newTarget.globalArgs, "start", newId]]);
     expect(physical.get(newUri)?.get(containerName)).toBe(newId);
     expect(physical.get(newUri)?.size).toBe(2);
     await assertWorkspaceAndUnrelatedRuntimeUnchanged();
-    expect(calls.filter((args) => args.includes("rm"))).toHaveLength(1);
+    expect(commands("rm")).toHaveLength(1);
   },
 );

@@ -70,9 +70,15 @@ afterEach(async () => {
 });
 
 async function setup(kind: "container" | "browser", running = true) {
-  await (kind === "container"
-    ? registry.updateRegistry(entry)
-    : registry.updateBrowserRegistry(entry));
+  const [update, remove, read] =
+    kind === "container"
+      ? ([registry.updateRegistry, registry.removeRegistryEntry, registry.readRegistry] as const)
+      : ([
+          registry.updateBrowserRegistry,
+          registry.removeBrowserRegistryEntry,
+          registry.readBrowserRegistry,
+        ] as const);
+  await update(entry);
   const capturedBridge = bridge();
   if (kind === "browser") {
     BROWSER_BRIDGES.set(entry.sessionKey, capturedBridge);
@@ -120,23 +126,17 @@ async function setup(kind: "container" | "browser", running = true) {
   };
   const replace = async () => {
     replacePhysical();
-    if (kind === "container") {
-      await registry.removeRegistryEntry(entry.containerName);
-      await registry.updateRegistry({ ...entry, createdAtMs: 2 });
-    } else {
-      await registry.removeBrowserRegistryEntry(entry.containerName);
-      await registry.updateBrowserRegistry({ ...entry, createdAtMs: 2 });
-    }
+    await remove(entry.containerName);
+    await update({ ...entry, createdAtMs: 2 });
   };
-  const rows = async () =>
-    (kind === "container" ? await registry.readRegistry() : await registry.readBrowserRegistry())
-      .entries;
   return {
     custody,
     physical,
     command,
     capturedBridge,
-    rows,
+    rows: async () => (await read()).entries,
+    removals: () =>
+      command.mock.calls.filter(([, args]) => args[0] === "rm").map(([, args]) => args.at(-1)),
     replace,
     replacePhysical,
     revoke: () => {
@@ -156,9 +156,7 @@ it.each(["container", "browser"] as const)(
       await h.custody.retire();
       await h.custody.resume();
       expect(h.physical.size).toBe(0);
-      expect(
-        h.command.mock.calls.filter(([, args]) => args[0] === "rm").map(([, args]) => args.at(-1)),
-      ).toEqual([oldId]);
+      expect(h.removals()).toEqual([oldId]);
       expect(h.command.mock.calls.some(([, args]) => args[0] === "pause")).toBe(running);
       expect(await h.rows()).toEqual([]);
       expect(BROWSER_BRIDGES.size).toBe(0);
@@ -212,9 +210,7 @@ it.each(["before", "during"] as const)(
     }
     expect(await h.rows()).toEqual([]);
     expect(h.physical.has(oldId)).toBe(false);
-    expect(
-      h.command.mock.calls.filter(([, args]) => args[0] === "rm").map(([, args]) => args.at(-1)),
-    ).toEqual([oldId]);
+    expect(h.removals()).toEqual([oldId]);
   },
 );
 
@@ -228,9 +224,7 @@ it("retires the captured allocation without chasing a rebound physical name", as
   expect(h.physical.has(oldId)).toBe(false);
   expect(await h.rows()).toEqual([]);
   expect(BROWSER_BRIDGES.size).toBe(0);
-  expect(
-    h.command.mock.calls.filter(([, args]) => args[0] === "rm").map(([, args]) => args.at(-1)),
-  ).toEqual([oldId]);
+  expect(h.removals()).toEqual([oldId]);
 });
 
 it.each(["container", "browser"] as const)(
@@ -246,7 +240,7 @@ it.each(["container", "browser"] as const)(
     });
     h.command.mockClear();
     await missing.retire();
-    expect(h.command.mock.calls.some(([, args]) => args[0] === "rm")).toBe(false);
+    expect(h.removals()).toHaveLength(0);
     expect(await h.rows()).toEqual([]);
   },
 );

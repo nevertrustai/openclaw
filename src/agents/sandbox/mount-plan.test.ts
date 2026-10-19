@@ -25,6 +25,18 @@ vi.mock("./docker-mount-source.js", async (importOriginal) => {
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 let root: string;
+const bind = (Source: string, Destination: string, RW = true) => ({
+  Type: "bind",
+  Source,
+  Destination,
+  RW,
+});
+const namespaceBind = (source: string, destination: string, writable = true) => ({
+  type: "bind",
+  source,
+  destination,
+  writable,
+});
 beforeEach(() => {
   vi.resetAllMocks();
   root = fs.realpathSync(tempDirs.make("openclaw-mount-plan-"));
@@ -43,14 +55,9 @@ beforeEach(() => {
     fs.mkdirSync(path.join(root, subdir), { recursive: true });
   }
   vi.mocked(resolveDockerSourceNamespace).mockResolvedValue([
-    { type: "bind", source: "/host/state", destination: root, writable: true },
-    { type: "bind", source: "/host/agent", destination: path.join(root, "agent"), writable: true },
-    {
-      type: "bind",
-      source: "/host/materialized skills",
-      destination: path.join(root, "materialized"),
-      writable: true,
-    },
+    namespaceBind("/host/state", root),
+    namespaceBind("/host/agent", path.join(root, "agent")),
+    namespaceBind("/host/materialized skills", path.join(root, "materialized")),
   ]);
 });
 
@@ -63,6 +70,13 @@ function params(access: "none" | "ro" | "rw") {
     workdir: "/workspace",
     workspaceAccess: access,
   };
+}
+
+function prepare(
+  access: "none" | "ro" | "rw",
+  overrides: Partial<Parameters<typeof prepareSandboxMountPlan>[0]> = {},
+) {
+  return prepareSandboxMountPlan({ ...params(access), ...overrides });
 }
 
 async function matchesContainer(
@@ -87,10 +101,7 @@ describe("managed mount plan", () => {
     const workspace = path.join(root, "agent");
     fs.mkdirSync(path.join(workspace, ".openclaw"), { mode: 0o750 });
     fs.writeFileSync(path.join(workspace, ".openclaw/project.json"), "preserved");
-    const plan = await prepareSandboxMountPlan({
-      ...params("rw"),
-      workspaceSource: "managed-worktree",
-    });
+    const plan = await prepare("rw", { workspaceSource: "managed-worktree" });
     const target = path.join(workspace, ".openclaw/sandbox-skills/skills");
     expect(fs.statSync(target).uid).toBe(fs.statSync(workspace).uid);
     if (process.platform !== "win32") {
@@ -111,8 +122,7 @@ describe("managed mount plan", () => {
       return undefined;
     });
     await expect(
-      prepareSandboxMountPlan({
-        ...params("rw"),
+      prepare("rw", {
         workspaceSource: "managed-worktree",
         assertCurrent: () => {
           if (!current) {
@@ -132,9 +142,7 @@ describe("managed mount plan", () => {
       path.join(root, "agent/.openclaw"),
       process.platform === "win32" ? "junction" : "dir",
     );
-    await expect(
-      prepareSandboxMountPlan({ ...params("rw"), workspaceSource: "managed-worktree" }),
-    ).rejects.toThrow();
+    await expect(prepare("rw", { workspaceSource: "managed-worktree" })).rejects.toThrow();
     expect(fs.readdirSync(outside)).toEqual([]);
   });
 
@@ -164,8 +172,7 @@ describe("managed mount plan", () => {
   );
 
   it("preserves custom daemon sources while keeping protected skill mounts authoritative", async () => {
-    const plan = await prepareSandboxMountPlan({
-      ...params("rw"),
+    const plan = await prepare("rw", {
       binds: ["/custom/host:/data:ro", "/custom/override:/workspace/skills:rw"],
     });
     expect(plan.binds).toContain("/custom/host:/data:ro");
@@ -174,8 +181,7 @@ describe("managed mount plan", () => {
   });
 
   it("selects the last custom destination while preserving its raw daemon bind", async () => {
-    const plan = await prepareSandboxMountPlan({
-      ...params("rw"),
+    const plan = await prepare("rw", {
       binds: ["/daemon/A:/data:ro", "/daemon/B:/data/:rw", "invalid-bind"],
     });
     expect(plan.binds).toContain("/daemon/B:/data/:rw");
@@ -185,8 +191,7 @@ describe("managed mount plan", () => {
   });
 
   it("keeps meaningful source and target whitespace through create and retained comparison", async () => {
-    const plan = await prepareSandboxMountPlan({
-      ...params("rw"),
+    const plan = await prepare("rw", {
       workspaceDir: path.join(root, "empty"),
       agentWorkspaceDir: path.join(root, "empty"),
       binds: ["/daemon/A:/data:ro", "/daemon/B :/data :rw"],
@@ -199,15 +204,14 @@ describe("managed mount plan", () => {
     ]);
     await expect(
       matchesContainer(plan, [
-        { Type: "bind", Source: "/host/state/empty", Destination: "/workspace", RW: true },
-        {
-          Type: "bind",
-          Source: "/host/materialized skills/skills",
-          Destination: "/workspace/.openclaw/sandbox-skills/skills",
-          RW: false,
-        },
-        { Type: "bind", Source: "/daemon/A", Destination: "/data", RW: false },
-        { Type: "bind", Source: "/daemon/B ", Destination: "/data ", RW: true },
+        bind("/host/state/empty", "/workspace"),
+        bind(
+          "/host/materialized skills/skills",
+          "/workspace/.openclaw/sandbox-skills/skills",
+          false,
+        ),
+        bind("/daemon/A", "/data", false),
+        bind("/daemon/B ", "/data "),
       ]),
     ).resolves.toBe(true);
   });
@@ -229,33 +233,13 @@ describe("managed mount plan", () => {
       vi.mocked(resolveDockerSourceNamespace).mockResolvedValue([
         ...namespace!,
         ...["private", "agent"].flatMap((workspace) => [
-          {
-            type: "bind",
-            source: `/host/${workspace}-data`,
-            destination: path.join(root, workspace, "data"),
-            writable: false,
-          },
-          {
-            type: "bind",
-            source: `/host/${workspace}-nested`,
-            destination: path.join(root, workspace, "data/nested"),
-            writable: true,
-          },
-          {
-            type: "bind",
-            source: `/host/${workspace}-skill`,
-            destination: path.join(root, workspace, "skills/nested"),
-            writable: true,
-          },
+          namespaceBind(`/host/${workspace}-data`, path.join(root, workspace, "data"), false),
+          namespaceBind(`/host/${workspace}-nested`, path.join(root, workspace, "data/nested")),
+          namespaceBind(`/host/${workspace}-skill`, path.join(root, workspace, "skills/nested")),
         ]),
-        {
-          type: "bind",
-          source: "/host/materialized-skill",
-          destination: path.join(root, "materialized/skills/nested"),
-          writable: true,
-        },
+        namespaceBind("/host/materialized-skill", path.join(root, "materialized/skills/nested")),
       ]);
-      const plan = await prepareSandboxMountPlan(params(access));
+      const plan = await prepare(access);
       const workspace = access === "rw" ? "agent" : "private";
       expect(plan.binds).toContain(`/host/${workspace}-data:/workspace/data:ro,z`);
       expect(plan.binds).toContain(
@@ -280,22 +264,14 @@ describe("managed mount plan", () => {
         destination: path.join(root, "private/data"),
         writable: true,
       },
-      {
-        type: "bind",
-        source: "/host/hidden",
-        destination: path.join(root, "private/data/nested"),
-        writable: true,
-      },
+      namespaceBind("/host/hidden", path.join(root, "private/data/nested")),
     ]);
-    await expect(prepareSandboxMountPlan(params("none"))).rejects.toThrow(
-      "unsupported nested volume mount",
-    );
-    const plan = await prepareSandboxMountPlan({
-      ...params("none"),
+    await expect(prepare("none")).rejects.toThrow("unsupported nested volume mount");
+    const plan = await prepare("none", {
       binds: ["/custom/data:/workspace/data/:ro"],
     });
     expect(plan.binds).toContain("/custom/data:/workspace/data/:ro");
-    expect(plan.binds.some((bind) => bind.startsWith("/host/hidden:"))).toBe(false);
+    expect(plan.binds.some((mount) => mount.startsWith("/host/hidden:"))).toBe(false);
   });
 
   it("keeps protected skills read-only on a read-only Gateway source", async () => {
@@ -318,15 +294,14 @@ describe("retained mount identity", () => {
   it.runIf(process.platform !== "win32").each(["/host/a\\b", "/host/a/b"])(
     "compares literal POSIX source bytes for retained %s",
     async (source) => {
-      const plan = await prepareSandboxMountPlan({
-        ...params("none"),
+      const plan = await prepare("none", {
         workspaceDir: path.join(root, "empty"),
         binds: ["/host/a\\b:/data:ro"],
       });
       expect(
         await matchesContainer(plan, [
-          { Type: "bind", Source: "/host/state/empty", Destination: "/workspace", RW: true },
-          { Type: "bind", Source: source, Destination: "/data", RW: false },
+          bind("/host/state/empty", "/workspace"),
+          bind(source, "/data", false),
         ]),
       ).toBe(source === "/host/a\\b");
     },
@@ -370,42 +345,31 @@ describe("retained mount identity", () => {
   ])(
     "compares tmpfs visibility/access without reinterpreting engine options: $configured / $actual",
     async ({ configured, actual, matches }) => {
-      const plan = await prepareSandboxMountPlan({
-        ...params("none"),
+      const plan = await prepare("none", {
         workspaceDir: path.join(root, "empty"),
         tmpfs: [`/workspace/cache:${configured}`],
       });
       expect(
-        await matchesContainer(
-          plan,
-          [{ Type: "bind", Source: "/host/state/empty", Destination: "/workspace", RW: true }],
-          { "/workspace/cache": actual, "/run": "rw,nosuid,nodev" },
-        ),
+        await matchesContainer(plan, [bind("/host/state/empty", "/workspace")], {
+          "/workspace/cache": actual,
+          "/run": "rw,nosuid,nodev",
+        }),
       ).toBe(matches);
     },
   );
 
   it("rejects a removed bind even on a pre-fix container", async () => {
-    const plan = await prepareSandboxMountPlan({
-      ...params("none"),
-      workspaceDir: path.join(root, "empty"),
-    });
+    const plan = await prepare("none", { workspaceDir: path.join(root, "empty") });
     expect(
       await matchesContainer(plan, [
-        { Type: "bind", Source: "/host/state/empty", Destination: "/workspace", RW: true },
-        {
-          Type: "bind",
-          Source: "/old/source",
-          Destination: "/agent",
-          RW: false,
-        },
+        bind("/host/state/empty", "/workspace"),
+        bind("/old/source", "/agent", false),
       ]),
     ).toBe(false);
   });
 
   it("accepts an unchanged mount with a trailing-slash workdir and ignores unrelated image volumes", async () => {
-    const plan = await prepareSandboxMountPlan({
-      ...params("none"),
+    const plan = await prepare("none", {
       workspaceDir: path.join(root, "empty"),
       workdir: "/workspace/",
     });
@@ -414,7 +378,7 @@ describe("retained mount identity", () => {
       await matchesContainer(
         plan,
         [
-          { Type: "bind", Source: "/host/state/empty", Destination: "/workspace/", RW: true },
+          bind("/host/state/empty", "/workspace/"),
           { Type: "volume", Source: "/engine/volume", Destination: "/image-data", RW: true },
         ],
         { "/tmp": "rw" },
@@ -425,8 +389,7 @@ describe("retained mount identity", () => {
   it.each(["source", "permission", "type", "tmpfs"])(
     "rejects a stale custom bind %s",
     async (change) => {
-      const plan = await prepareSandboxMountPlan({
-        ...params("none"),
+      const plan = await prepare("none", {
         workspaceDir: path.join(root, "empty"),
         binds: ["/host/data:/workspace/data:ro"],
       });
@@ -434,7 +397,7 @@ describe("retained mount identity", () => {
         await matchesContainer(
           plan,
           [
-            { Type: "bind", Source: "/host/state/empty", Destination: "/workspace", RW: true },
+            bind("/host/state/empty", "/workspace"),
             {
               Type: change === "type" ? "volume" : "bind",
               Source: change === "source" ? "/old/data" : "/host/data",
@@ -450,21 +413,15 @@ describe("retained mount identity", () => {
 
   it("accepts intentional custom binds and case-insensitive Windows sources at managed destinations", async () => {
     vi.mocked(resolveDockerSourceNamespace).mockResolvedValue(undefined);
-    const plan = await prepareSandboxMountPlan({
-      ...params("ro"),
+    const plan = await prepare("ro", {
       workspaceDir: "C:/Users/Example/project",
       agentWorkspaceDir: "C:/Users/Example/project",
       binds: ["D:\\Skills:/workspace/skills:ro"],
     });
     expect(
       await matchesContainer(plan, [
-        {
-          Type: "bind",
-          Source: "c:\\users\\example\\project",
-          Destination: "/workspace",
-          RW: false,
-        },
-        { Type: "bind", Source: "d:\\skills", Destination: "/workspace/skills", RW: false },
+        bind("c:\\users\\example\\project", "/workspace", false),
+        bind("d:\\skills", "/workspace/skills", false),
       ]),
     ).toBe(true);
   });
@@ -481,15 +438,7 @@ it.each([false, true])(
         ? `${"a".repeat(64)} ${running} false`
         : args[0] === "inspect"
           ? JSON.stringify({
-              Mounts: [
-                {
-                  Type: "bind",
-                  Source: source,
-                  Destination: "/workspace",
-                  RW: true,
-                },
-                ...nested,
-              ],
+              Mounts: [bind(source, "/workspace"), ...nested],
               Tmpfs: {},
             })
           : "1 1 0:1 / / rw - overlay overlay rw\n2 1 0:2 /private /workspace rw - ext4 /dev/root rw\n";
