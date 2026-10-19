@@ -124,8 +124,11 @@ async function bootHydrator(
   parent: GatewaySessionRow,
   childPage: Promise<SessionsListResult>,
   currentRows: HydrationParams["currentRows"],
+  refreshedParent = parent,
 ) {
-  const described = vi.fn(async () => ({ session: parent }));
+  const described = vi
+    .fn(async () => ({ session: refreshedParent }))
+    .mockResolvedValueOnce({ session: parent });
   const client = createTestGatewayClient(async (method, params) => {
     if (method === "sessions.describe") {
       return described();
@@ -338,8 +341,12 @@ describe("SwarmRosterHydrator", () => {
       };
       const childPage = createDeferred<SessionsListResult>();
       // Warm child presentation does not certify the fresh descriptor's counts.
-      const { hydrator, described } = await bootHydrator(parent, childPage.promise, () => children);
-      described.mockResolvedValue({ session: current });
+      const { hydrator, described } = await bootHydrator(
+        parent,
+        childPage.promise,
+        () => children,
+        current,
+      );
       childPage.resolve(result(children, 0, children.length));
       await vi.advanceTimersByTimeAsync(0);
       expect(described).toHaveBeenCalledTimes(reads);

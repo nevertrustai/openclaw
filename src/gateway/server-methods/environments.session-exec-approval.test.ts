@@ -59,8 +59,9 @@ it.for([
         }),
       );
     }
-    const manager = createTestApprovalManager<ExecApprovalRequestPayload>(test, {
-      resolveAllowedDecisions: resolveExecApprovalRequestAllowedDecisions,
+    const manager = createTestApprovalManager(test, {
+      resolveAllowedDecisions: (request: ExecApprovalRequestPayload) =>
+        resolveExecApprovalRequestAllowedDecisions(request),
       validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
     });
     const delivered = createDeferredCore<ExecApprovalRequest>();
@@ -208,8 +209,9 @@ it.for([
 
 for (const decision of ["allow-once", "deny"] as const) {
   it(`shows stdin and honors ${decision} exactly once`, async (test) => {
-    const manager = createTestApprovalManager<ExecApprovalRequestPayload>(test, {
-      resolveAllowedDecisions: resolveExecApprovalRequestAllowedDecisions,
+    const manager = createTestApprovalManager(test, {
+      resolveAllowedDecisions: (request: ExecApprovalRequestPayload) =>
+        resolveExecApprovalRequestAllowedDecisions(request),
     });
     const broadcast = vi.fn(async (_event: string, request: ExecApprovalRequest) => {
       expect(request.request.command).toContain("script-from-stdin");

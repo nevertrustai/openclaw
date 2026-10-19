@@ -156,8 +156,19 @@ describe("Teams mention policy in bot-created channel threads", () => {
     { name: "mention required", change: { requireMentionInBotThreads: true } },
   ])("uses current admission policy after ownership lookup: $name", async ({ change }) => {
     const rootId = `bot-thread-reread-${++sequence}`;
-    const { cfg, handle } = setup({ groupPolicy: "allowlist", groupAllowFrom: ["user-aad"] });
+    const cfg: OpenClawConfig = {
+      channels: {
+        msteams: {
+          groupPolicy: "allowlist",
+          groupAllowFrom: ["user-aad"],
+          requireMention: true,
+          requireMentionInBotThreads: false,
+        },
+      },
+    };
     setRuntimeConfigSnapshot(cfg);
+    const { deps } = createMessageHandlerDeps(cfg);
+    const handler = createMSTeamsMessageHandler(deps);
     await sendChannelMessage({ messageId: rootId });
     const lookup = sentMessages.wasMSTeamsMessageSentWithPersistence;
     vi.spyOn(sentMessages, "wasMSTeamsMessageSentWithPersistence").mockImplementationOnce(
@@ -169,7 +180,15 @@ describe("Teams mention policy in bot-created channel threads", () => {
         return owned;
       },
     );
-    await handle({ conversation: conversation(rootId) });
+    await handler(
+      createTurnContext(
+        buildChannelActivity({
+          id: `reply-${sequence}`,
+          entities: [],
+          conversation: conversation(rootId),
+        }),
+      ),
+    );
     expect(dispatch).not.toHaveBeenCalled();
   });
 

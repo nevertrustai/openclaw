@@ -93,17 +93,32 @@ it.each([
     label: "non-advancing cursor",
     read: () => ({ ...page, jobs: [], total: 1, hasMore: true, nextOffset: 0 }),
     error: "pagination did not advance",
+    calls: 1,
+  },
+  {
+    label: "page bound",
+    read: ({ offset = 0 }: { offset?: number }) => ({
+      ...page,
+      jobs: [{ id: `page-${offset}`, name: `Page ${offset}` }],
+      total: 51,
+      offset,
+      hasMore: true,
+      nextOffset: offset + 1,
+    }),
+    error: "pagination exceeded maximum pages",
+    calls: 50,
   },
   {
     label: "missing job",
     read: () => ({ ...page, jobs: [], total: 0 }),
     error: "Automation not found: missing. Run `openclaw cron list` to see recent automation ids.",
+    calls: 1,
   },
-])("cron show rejects $label (#83856)", async ({ read, error }) => {
+])("cron show rejects $label (#83856)", async ({ read, error, calls }) => {
   mockPages(read);
   await expect(run(["show", "missing", "--json"])).rejects.toThrow("exit 1");
   expect(defaultRuntime.error).toHaveBeenCalledWith(expect.stringContaining(error));
-  expect(listCalls()).toHaveLength(1);
+  expect(listCalls()).toHaveLength(calls);
 });
 
 it("renders a legacy job without state instead of crashing (#173631)", async () => {
