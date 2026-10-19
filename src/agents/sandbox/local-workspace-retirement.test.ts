@@ -29,30 +29,8 @@ function bridge(): CachedBrowserBridge {
       server: createServer(),
       port: 0,
       baseUrl: "http://127.0.0.1",
-      state: {
-        resolved: {
-          enabled: true,
-          evaluateEnabled: false,
-          controlPort: 0,
-          cdpPortRangeStart: 0,
-          cdpPortRangeEnd: 0,
-          cdpProtocol: "http",
-          cdpHost: "127.0.0.1",
-          cdpIsLoopback: true,
-          remoteCdpTimeoutMs: 1000,
-          remoteCdpHandshakeTimeoutMs: 1000,
-          localLaunchTimeoutMs: 1000,
-          localCdpReadyTimeoutMs: 1000,
-          actionTimeoutMs: 1000,
-          color: "#000000",
-          headless: true,
-          noSandbox: false,
-          attachOnly: true,
-          defaultProfile: "fixture",
-          profiles: {},
-          extraArgs: [],
-          tabCleanup: { enabled: false, idleMinutes: 1, maxTabsPerSession: 1, sweepMinutes: 1 },
-        },
+      get state(): never {
+        throw new Error("Retirement must use server identity, not browser configuration");
       },
     },
   };
@@ -108,16 +86,12 @@ async function setup(kind: "container" | "browser", running = true) {
     }
     return { code: 0, stdout: "", stderr: "" };
   });
-  let current = true;
+  const authority = new AbortController();
   const custody = await quiesceLocalWorkspace({
     workspaceDir: entry.workspaceDir,
     retained: [],
     persist: () => {},
-    assertCurrent: () => {
-      if (!current) {
-        throw new Error("lease revoked");
-      }
-    },
+    assertCurrent: () => authority.signal.throwIfAborted(),
   });
   const replacePhysical = () => {
     physical.delete(oldId);
@@ -139,9 +113,7 @@ async function setup(kind: "container" | "browser", running = true) {
       command.mock.calls.filter(([, args]) => args[0] === "rm").map(([, args]) => args.at(-1)),
     replace,
     replacePhysical,
-    revoke: () => {
-      current = false;
-    },
+    revoke: () => authority.abort(new Error("lease revoked")),
     onRemove: (fn: () => Promise<void>) => {
       afterRemove = fn;
     },
@@ -186,13 +158,17 @@ it.each([
     expect(bridgeApi.stopBrowserBridgeServer).not.toHaveBeenCalled();
   },
 );
-it.each(["before", "during"] as const)(
-  "preserves a replacement bridge installed %s captured bridge shutdown",
+it.each(["before", "during", "rebound"] as const)(
+  "does not chase a browser replacement at %s bridge shutdown",
   async (when) => {
     const h = await setup("browser");
     const replacement = bridge();
     const replace = async () => {
-      BROWSER_BRIDGES.set(entry.sessionKey, replacement);
+      if (when === "rebound") {
+        h.replacePhysical();
+      } else {
+        BROWSER_BRIDGES.set(entry.sessionKey, replacement);
+      }
     };
     if (when === "before") {
       await replace();
@@ -200,32 +176,19 @@ it.each(["before", "during"] as const)(
       vi.mocked(bridgeApi.stopBrowserBridgeServer).mockImplementationOnce(replace);
     }
     await expect(h.custody.retire()).resolves.toBeUndefined();
-    expect(BROWSER_BRIDGES.get(entry.sessionKey)).toBe(replacement);
-    expect(bridgeApi.stopBrowserBridgeServer).not.toHaveBeenCalledWith(replacement.bridge.server);
-    expect(bridgeApi.stopBrowserBridgeServer).toHaveBeenCalledTimes(when === "during" ? 1 : 0);
-    if (when === "during") {
-      expect(bridgeApi.stopBrowserBridgeServer).toHaveBeenCalledWith(
-        h.capturedBridge.bridge.server,
-      );
-    }
+    expect(BROWSER_BRIDGES.get(entry.sessionKey)).toBe(
+      when === "rebound" ? undefined : replacement,
+    );
+    expect(BROWSER_BRIDGES.size).toBe(when === "rebound" ? 0 : 1);
+    expect(h.physical.has(newId)).toBe(when === "rebound");
+    expect(vi.mocked(bridgeApi.stopBrowserBridgeServer).mock.calls).toEqual(
+      when === "before" ? [] : [[h.capturedBridge.bridge.server]],
+    );
     expect(await h.rows()).toEqual([]);
     expect(h.physical.has(oldId)).toBe(false);
     expect(h.removals()).toEqual([oldId]);
   },
 );
-
-it("retires the captured allocation without chasing a rebound physical name", async () => {
-  const h = await setup("browser");
-  vi.mocked(bridgeApi.stopBrowserBridgeServer).mockImplementationOnce(async () =>
-    h.replacePhysical(),
-  );
-  await expect(h.custody.retire()).resolves.toBeUndefined();
-  expect(h.physical.has(newId)).toBe(true);
-  expect(h.physical.has(oldId)).toBe(false);
-  expect(await h.rows()).toEqual([]);
-  expect(BROWSER_BRIDGES.size).toBe(0);
-  expect(h.removals()).toEqual([oldId]);
-});
 
 it.each(["container", "browser"] as const)(
   "forgets confirmed-absent %s metadata without destructive name fallback",

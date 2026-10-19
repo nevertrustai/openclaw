@@ -42,14 +42,11 @@ beforeEach(() => {
   root = fs.realpathSync(tempDirs.make("openclaw-mount-plan-"));
   for (const subdir of [
     "empty",
-    "private/skills",
     "private/skills/nested",
     "private/data/nested",
-    "agent/skills",
     "agent/skills/nested",
     "agent/data/nested",
     "agent/.agents/skills",
-    "materialized/skills",
     "materialized/skills/nested",
   ]) {
     fs.mkdirSync(path.join(root, subdir), { recursive: true });
@@ -61,39 +58,41 @@ beforeEach(() => {
   ]);
 });
 
-function params(access: "none" | "ro" | "rw") {
-  return {
+function prepare(
+  access: "none" | "ro" | "rw",
+  overrides: Partial<Parameters<typeof prepareSandboxMountPlan>[0]> = {},
+) {
+  return prepareSandboxMountPlan({
     engine: DOCKER_SANDBOX_ENGINE,
     workspaceDir: path.join(root, access === "rw" ? "agent" : "private"),
     agentWorkspaceDir: path.join(root, "agent"),
     skillsWorkspaceDir: path.join(root, "materialized"),
     workdir: "/workspace",
     workspaceAccess: access,
-  };
+    ...overrides,
+  });
 }
+const prepareEmpty = (overrides: Partial<Parameters<typeof prepareSandboxMountPlan>[0]> = {}) =>
+  prepare("none", { workspaceDir: path.join(root, "empty"), ...overrides });
 
-function prepare(
-  access: "none" | "ro" | "rw",
-  overrides: Partial<Parameters<typeof prepareSandboxMountPlan>[0]> = {},
-) {
-  return prepareSandboxMountPlan({ ...params(access), ...overrides });
-}
-
-async function matchesContainer(
+async function expectMounts(
   plan: Awaited<ReturnType<typeof prepareSandboxMountPlan>>,
   mounts: { Type: string; Source: string; Destination: string; RW: boolean }[],
   tmpfs: Record<string, string> | null = null,
+  matches = true,
 ) {
   vi.mocked(execContainer).mockResolvedValue({
     stdout: JSON.stringify({ Mounts: mounts, Tmpfs: tmpfs }),
     stderr: "",
     code: 0,
   });
-  return sandboxMountPlanMatchesContainer({
-    engine: DOCKER_SANDBOX_ENGINE,
-    containerName: "retained",
-    plan,
-  });
+  expect(
+    await sandboxMountPlanMatchesContainer({
+      engine: DOCKER_SANDBOX_ENGINE,
+      containerName: "retained",
+      plan,
+    }),
+  ).toBe(matches);
 }
 
 describe("managed mount plan", () => {
@@ -202,18 +201,12 @@ describe("managed mount plan", () => {
       "/daemon/A:/data:ro",
       "/daemon/B :/data :rw",
     ]);
-    await expect(
-      matchesContainer(plan, [
-        bind("/host/state/empty", "/workspace"),
-        bind(
-          "/host/materialized skills/skills",
-          "/workspace/.openclaw/sandbox-skills/skills",
-          false,
-        ),
-        bind("/daemon/A", "/data", false),
-        bind("/daemon/B ", "/data "),
-      ]),
-    ).resolves.toBe(true);
+    await expectMounts(plan, [
+      bind("/host/state/empty", "/workspace"),
+      bind("/host/materialized skills/skills", "/workspace/.openclaw/sandbox-skills/skills", false),
+      bind("/daemon/A", "/data", false),
+      bind("/daemon/B ", "/data "),
+    ]);
   });
 
   it("honors a normalized custom override without translating the replaced source", async () => {
@@ -294,16 +287,15 @@ describe("retained mount identity", () => {
   it.runIf(process.platform !== "win32").each(["/host/a\\b", "/host/a/b"])(
     "compares literal POSIX source bytes for retained %s",
     async (source) => {
-      const plan = await prepare("none", {
-        workspaceDir: path.join(root, "empty"),
+      const plan = await prepareEmpty({
         binds: ["/host/a\\b:/data:ro"],
       });
-      expect(
-        await matchesContainer(plan, [
-          bind("/host/state/empty", "/workspace"),
-          bind(source, "/data", false),
-        ]),
-      ).toBe(source === "/host/a\\b");
+      await expectMounts(
+        plan,
+        [bind("/host/state/empty", "/workspace"), bind(source, "/data", false)],
+        null,
+        source === "/host/a\\b",
+      );
     },
   );
 
@@ -345,69 +337,66 @@ describe("retained mount identity", () => {
   ])(
     "compares tmpfs visibility/access without reinterpreting engine options: $configured / $actual",
     async ({ configured, actual, matches }) => {
-      const plan = await prepare("none", {
-        workspaceDir: path.join(root, "empty"),
+      const plan = await prepareEmpty({
         tmpfs: [`/workspace/cache:${configured}`],
       });
-      expect(
-        await matchesContainer(plan, [bind("/host/state/empty", "/workspace")], {
+      await expectMounts(
+        plan,
+        [bind("/host/state/empty", "/workspace")],
+        {
           "/workspace/cache": actual,
           "/run": "rw,nosuid,nodev",
-        }),
-      ).toBe(matches);
+        },
+        matches,
+      );
     },
   );
 
   it("rejects a removed bind even on a pre-fix container", async () => {
-    const plan = await prepare("none", { workspaceDir: path.join(root, "empty") });
-    expect(
-      await matchesContainer(plan, [
-        bind("/host/state/empty", "/workspace"),
-        bind("/old/source", "/agent", false),
-      ]),
-    ).toBe(false);
+    const plan = await prepareEmpty();
+    await expectMounts(
+      plan,
+      [bind("/host/state/empty", "/workspace"), bind("/old/source", "/agent", false)],
+      null,
+      false,
+    );
   });
 
   it("accepts an unchanged mount with a trailing-slash workdir and ignores unrelated image volumes", async () => {
-    const plan = await prepare("none", {
-      workspaceDir: path.join(root, "empty"),
+    const plan = await prepareEmpty({
       workdir: "/workspace/",
     });
     expect(plan.binds).toEqual(["/host/state/empty:/workspace:z"]);
-    expect(
-      await matchesContainer(
-        plan,
-        [
-          bind("/host/state/empty", "/workspace/"),
-          { Type: "volume", Source: "/engine/volume", Destination: "/image-data", RW: true },
-        ],
-        { "/tmp": "rw" },
-      ),
-    ).toBe(true);
+    await expectMounts(
+      plan,
+      [
+        bind("/host/state/empty", "/workspace/"),
+        { Type: "volume", Source: "/engine/volume", Destination: "/image-data", RW: true },
+      ],
+      { "/tmp": "rw" },
+    );
   });
 
   it.each(["source", "permission", "type", "tmpfs"])(
     "rejects a stale custom bind %s",
     async (change) => {
-      const plan = await prepare("none", {
-        workspaceDir: path.join(root, "empty"),
+      const plan = await prepareEmpty({
         binds: ["/host/data:/workspace/data:ro"],
       });
-      expect(
-        await matchesContainer(
-          plan,
-          [
-            bind("/host/state/empty", "/workspace"),
-            {
-              Type: change === "type" ? "volume" : "bind",
-              Source: change === "source" ? "/old/data" : "/host/data",
-              Destination: "/workspace/data",
-              RW: change === "permission",
-            },
-          ],
-          change === "tmpfs" ? { "/workspace/data": "rw" } : null,
-        ),
-      ).toBe(false);
+      await expectMounts(
+        plan,
+        [
+          bind("/host/state/empty", "/workspace"),
+          {
+            Type: change === "type" ? "volume" : "bind",
+            Source: change === "source" ? "/old/data" : "/host/data",
+            Destination: "/workspace/data",
+            RW: change === "permission",
+          },
+        ],
+        change === "tmpfs" ? { "/workspace/data": "rw" } : null,
+        false,
+      );
     },
   );
 
@@ -418,12 +407,10 @@ describe("retained mount identity", () => {
       agentWorkspaceDir: "C:/Users/Example/project",
       binds: ["D:\\Skills:/workspace/skills:ro"],
     });
-    expect(
-      await matchesContainer(plan, [
-        bind("c:\\users\\example\\project", "/workspace", false),
-        bind("d:\\skills", "/workspace/skills", false),
-      ]),
-    ).toBe(true);
+    await expectMounts(plan, [
+      bind("c:\\users\\example\\project", "/workspace", false),
+      bind("d:\\skills", "/workspace/skills", false),
+    ]);
   });
 });
 

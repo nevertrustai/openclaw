@@ -25,6 +25,13 @@ vi.mock("../../process/exec.js", async (importOriginal) => ({
 }));
 
 const dirs = useAutoCleanupTempDirTracker(afterEach);
+const commandResult = (stdout = "", stderr = "") => ({
+  failed: Boolean(stderr),
+  isCanceled: false,
+  exitCode: stderr ? 125 : 0,
+  stdout: Buffer.from(stdout),
+  stderr: Buffer.from(stderr),
+});
 afterEach(async () => {
   await closeOpenClawStateDatabaseAsync();
   closeOpenClawStateDatabaseForTest();
@@ -45,9 +52,7 @@ it.each([false, true])(
     await fs.writeFile(sentinelPath, "Preserve workspace data across Podman recovery.\n");
     const snapshotWorkspace = async () => ({
       files: (await fs.readdir(workspaceDir)).toSorted(),
-      sentinelHash: createHash("sha256")
-        .update(await fs.readFile(sentinelPath))
-        .digest("hex"),
+      sentinel: await fs.readFile(sentinelPath, "utf8"),
     });
     const originalWorkspace = await snapshotWorkspace();
     const config: OpenClawConfig = {
@@ -92,6 +97,22 @@ it.each([false, true])(
     ]);
     const calls: string[][] = [];
     const commands = (action: string) => calls.filter((args) => args.includes(action));
+    const metadata: Record<string, string> = {
+      "--version": "podman version 4.8.0\n",
+      system: JSON.stringify([
+        { Name: "old-machine", URI: oldUri, Identity: oldIdentity },
+        { Name: "new-machine", URI: newUri, Identity: newIdentity, Default: true },
+      ]),
+      machine: JSON.stringify(
+        [61001, 61002].map((port, index) => ({
+          Name: index === 0 ? "old-machine" : "new-machine",
+          Running: true,
+          Port: port,
+          RemoteUsername: "core",
+          IdentityPath: index === 0 ? oldIdentity : newIdentity,
+        })),
+      ),
+    };
     let oldUnreachable = false;
     spawnCommand.mockImplementation(async ([command, ...originalArgs]: string[]) => {
       expect(command).toBe("podman");
@@ -106,47 +127,30 @@ it.each([false, true])(
         }
       }
       const containers = expectDefined(physical.get(uri), "selected Podman store");
-      let stdout = "";
-      let stderr = "";
-      let code = 0;
-      if (args[0] === "--version") {
-        stdout = "podman version 4.8.0\n";
-      } else if (args[0] === "system") {
-        stdout = JSON.stringify([
-          { Name: "old-machine", URI: oldUri, Identity: oldIdentity },
-          { Name: "new-machine", URI: newUri, Identity: newIdentity, Default: true },
-        ]);
-      } else if (args[0] === "machine") {
-        stdout = JSON.stringify(
-          [61001, 61002].map((port, index) => ({
-            Name: index === 0 ? "old-machine" : "new-machine",
-            Running: true,
-            Port: port,
-            RemoteUsername: "core",
-            IdentityPath: index === 0 ? oldIdentity : newIdentity,
-          })),
-        );
-      } else if (uri === oldUri && oldUnreachable) {
-        code = 125;
-        stderr = "connection refused";
-      } else if (args[0] === "info") {
-        stdout = "true\ttrue\t\t5.0.0\n";
-      } else if (args[0] === "inspect") {
+      if (Object.hasOwn(metadata, args[0]!)) {
+        return commandResult(metadata[args[0]!]);
+      }
+      if (uri === oldUri && oldUnreachable) {
+        return commandResult("", "connection refused");
+      }
+      if (args[0] === "info") {
+        return commandResult("true\ttrue\t\t5.0.0\n");
+      }
+      if (args[0] === "inspect") {
         const id = containers.get(args.at(-1)!);
         if (!id) {
-          code = 125;
-          stderr = `no container with name or id ${args.at(-1)} found`;
-        } else if (args[2] === "{{.State.Running}}") {
-          stdout = "true";
-        } else if (args[2] === "{{.Id}}") {
-          stdout = id;
-        } else if (args[2] === "{{.ImageName}}\t{{.Image}}") {
-          stdout = `${cfg.docker.image}\tsha256:fixture`;
-        } else {
-          throw new Error(`Unexpected inspection: ${args.join(" ")}`);
+          return commandResult("", `no container with name or id ${args.at(-1)} found`);
         }
+        const fields: Record<string, string> = {
+          "{{.State.Running}}": "true",
+          "{{.Id}}": id,
+          "{{.ImageName}}\t{{.Image}}": `${cfg.docker.image}\tsha256:fixture`,
+        };
+        return commandResult(
+          expectDefined(fields[args[2]!], `Unexpected inspection: ${args.join(" ")}`),
+        );
       } else if (args[0] === "image") {
-        stdout = "sha256:fixture";
+        return commandResult("sha256:fixture");
       } else if (args[0] === "rm") {
         expect(containers.delete(args.at(-1)!)).toBe(true);
       } else if (args[0] === "create") {
@@ -154,17 +158,11 @@ it.each([false, true])(
         const name = expectDefined(args[args.indexOf("--name") + 1], "Podman container name");
         expect(containers.has(name)).toBe(false);
         containers.set(name, newId);
-        stdout = newId;
+        return commandResult(newId);
       } else if (args[0] !== "start") {
         throw new Error(`Unexpected command: ${args.join(" ")}`);
       }
-      return {
-        failed: code !== 0,
-        isCanceled: false,
-        exitCode: code,
-        stdout: Buffer.from(stdout),
-        stderr: Buffer.from(stderr),
-      };
+      return commandResult();
     });
     // Released builds recorded HOST even when the newer client selected CONNECTION.
     const releasedEntry = {

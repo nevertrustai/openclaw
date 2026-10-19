@@ -19,7 +19,10 @@ vi.mock("./docker.js", () => ({
   execContainer: mocks.command,
   validateSandboxContainerEngineTarget: async () => {},
 }));
-import { quiesceLocalWorkspace } from "./local-workspace-quiescence.js";
+import {
+  quiesceLocalWorkspace,
+  type LocalWorkspacePausedRuntime,
+} from "./local-workspace-quiescence.js";
 const id = "a".repeat(64);
 const entry = {
   containerName: "owned",
@@ -28,23 +31,27 @@ const entry = {
   workspaceDir: "/owned/projection",
 };
 const success = (stdout = "") => ({ code: 0, stdout, stderr: "" });
+let retained: LocalWorkspacePausedRuntime[];
+const persist = vi.fn((rows: LocalWorkspacePausedRuntime[]) => {
+  retained = [...rows];
+});
 const commands = (action: string) =>
   mocks.command.mock.calls.filter(([, args]) => args[0] === action).map(([, args]) => args[1]);
 function quiesce(overrides: Partial<Parameters<typeof quiesceLocalWorkspace>[0]> = {}) {
   return quiesceLocalWorkspace({
     workspaceDir: entry.workspaceDir,
-    retained: [],
-    persist: () => {},
+    retained,
+    persist,
     assertCurrent: () => {},
     ...overrides,
   });
 }
 beforeEach(() => {
-  mocks.command.mockReset();
-  mocks.current.mockReset();
-  mocks.read.mockReset().mockResolvedValue({ entries: [entry] });
-  mocks.browsers.mockReset().mockResolvedValue({ entries: [] });
-  mocks.browserCurrent.mockReset();
+  Object.values(mocks).forEach((mock) => mock.mockReset());
+  retained = [];
+  persist.mockClear();
+  mocks.read.mockResolvedValue({ entries: [entry] });
+  mocks.browsers.mockResolvedValue({ entries: [] });
 });
 
 it.each(["true", "false"])(
@@ -80,11 +87,10 @@ it.each([
 
 it("persists exact container and browser custody before pausing and resumes only those IDs", async () => {
   const browserId = "b".repeat(64);
-  const retained = [
+  const expected = [
     { name: "owned", id },
     { name: "browser-owned", id: browserId },
   ];
-  const persist = vi.fn();
   mocks.browsers.mockResolvedValue({
     entries: [
       { ...entry, containerName: "browser-owned" },
@@ -93,7 +99,7 @@ it("persists exact container and browser custody before pausing and resumes only
   });
   mocks.command.mockImplementation(async (_engine, args: string[]) => {
     if (args[0] === "pause") {
-      expect(persist).toHaveBeenLastCalledWith(args[1] === id ? retained.slice(0, 1) : retained);
+      expect(persist).toHaveBeenLastCalledWith(args[1] === id ? expected.slice(0, 1) : expected);
     }
     return success(
       args.includes("{{.State.Paused}}")
@@ -103,21 +109,14 @@ it("persists exact container and browser custody before pausing and resumes only
           : "",
     );
   });
-  const { resume } = await quiesce({ persist });
-  expect(persist).toHaveBeenLastCalledWith(retained);
+  const { resume } = await quiesce();
+  expect(persist).toHaveBeenLastCalledWith(expected);
   expect(mocks.browserCurrent).toHaveBeenCalledTimes(3);
   await resume();
   expect(commands("unpause")).toEqual([browserId, id]);
-  expect(mocks.command.mock.calls.map((call) => call[1][0])).toEqual([
-    "inspect",
-    "pause",
-    "inspect",
-    "pause",
-    "inspect",
-    "unpause",
-    "inspect",
-    "unpause",
-  ]);
+  expect(mocks.command.mock.calls.map((call) => call[1][0])).toEqual(
+    "inspect pause inspect pause inspect unpause inspect unpause".split(" "),
+  );
   expect(mocks.command.mock.calls[7]?.[1]).toEqual(["unpause", id]);
   expect(persist).toHaveBeenLastCalledWith([]);
 });
@@ -125,7 +124,6 @@ it("persists exact container and browser custody before pausing and resumes only
 it("records each released generation before a later resume failure and re-fences running recovery", async () => {
   const otherId = "b".repeat(64);
   const pausedIds = new Set<string>();
-  let retained: Array<{ name: string; id: string }> = [];
   let failFirst = true;
   mocks.read.mockResolvedValue({ entries: [entry, { ...entry, containerName: "other" }] });
   mocks.command.mockImplementation(async (_engine, args: string[]) => {
@@ -149,16 +147,11 @@ it("records each released generation before a later resume failure and re-fences
     }
     return success();
   });
-  const input = {
-    persist: (rows: typeof retained) => {
-      retained = [...rows];
-    },
-  };
-  const { resume } = await quiesce({ ...input, retained });
+  const { resume } = await quiesce();
   await expect(resume()).rejects.toThrow("resume failed");
   expect(retained).toEqual([{ name: "owned", id }]);
   failFirst = false;
-  const { resume: recovered } = await quiesce({ ...input, retained });
+  const { resume: recovered } = await quiesce();
   expect(pausedIds).toEqual(new Set([id, otherId]));
   await recovered();
   expect(retained).toEqual([]);
@@ -178,7 +171,6 @@ it.each(["inspect", "pause", "resume-inspect", "unpause"])(
     const cleanup = createDeferred();
     const abortedCommand = Object.assign(new Error("Aborted"), { name: "AbortError" });
     let paused = false;
-    let retained: Array<{ name: string; id: string }> = [];
     let fail = true;
     let aborted = false;
     let settled = false;
@@ -194,38 +186,28 @@ it.each(["inspect", "pause", "resume-inspect", "unpause"])(
         if (fail && action === phase) {
           fail = false;
           entered.resolve();
-          await new Promise<void>((_resolve, reject) => {
-            signal?.addEventListener(
-              "abort",
-              () => {
-                aborted = true;
-                void cleanup.promise.then(() => reject(abortedCommand));
-              },
-              { once: true },
-            );
-          });
+          const interrupted = createDeferred();
+          signal?.addEventListener(
+            "abort",
+            () => {
+              aborted = true;
+              interrupted.resolve();
+            },
+            { once: true },
+          );
+          await interrupted.promise;
+          await cleanup.promise;
+          throw abortedCommand;
         }
         return success(action === "resume-inspect" ? String(paused) : `${id} true ${paused}`);
       },
     );
-    const input = {
-      persist: (rows: typeof retained) => {
-        retained = [...rows];
-      },
-    };
-    const operation = (async () => {
-      const control = await quiesce({ ...input, retained });
-      await control.resume();
-    })().then(
-      () => {
+    const operation = quiesce()
+      .then((control) => control.resume())
+      .catch((error: unknown) => error)
+      .finally(() => {
         settled = true;
-        return undefined;
-      },
-      (error: unknown) => {
-        settled = true;
-        return error;
-      },
-    );
+      });
     try {
       await entered.promise;
       await vi.advanceTimersByTimeAsync(29_999);
@@ -236,7 +218,7 @@ it.each(["inspect", "pause", "resume-inspect", "unpause"])(
       cleanup.resolve();
       expect(await operation).toBe(abortedCommand);
       expect(retained).toEqual(phase === "inspect" ? [] : [{ name: "owned", id }]);
-      const recovery = await quiesce({ ...input, retained });
+      const recovery = await quiesce();
       await recovery.resume();
       expect(retained).toEqual([]);
       expect(paused).toBe(false);
@@ -267,9 +249,7 @@ it.each([
         throw new Error("runtime retired");
       }
     });
-    const persist = vi.fn();
     const { resume } = await quiesce({
-      persist,
       assertCurrent: () => {
         if (retiring && owner === "workspace") {
           throw new Error("revoked");
