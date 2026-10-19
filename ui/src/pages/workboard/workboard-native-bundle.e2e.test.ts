@@ -1,19 +1,21 @@
-import { writeFile } from "node:fs/promises";
-import path from "node:path";
 import type { WorkboardCard } from "@openclaw/workboard-contract";
-import { webkit, type Browser, type Locator, type Page } from "playwright";
+import { webkit, type Browser } from "playwright";
 import { expect, it } from "vitest";
 import { createControlUiE2eSuite } from "../../e2e/control-ui-e2e-suite.test-support.ts";
-import {
-  takeControlUiScreenshotFrame,
-  waitForControlUiProofSurface,
-} from "../../test-helpers/control-ui-e2e-screenshot.ts";
 import {
   controlUiBundledSettingsStorageKey,
   controlUiE2eWaitTimeoutMs,
   installMockGateway,
 } from "../../test-helpers/control-ui-e2e.ts";
 import { workboardUi } from "../../test-helpers/control-ui-workboard-fixture.ts";
+import {
+  createWorkboardProof,
+  button,
+  expectFocus,
+  focused,
+  makeBoard,
+  makeCard,
+} from "./workboard.e2e.test-support.ts";
 
 let webkitBrowser: Browser | undefined;
 const suite = createControlUiE2eSuite({
@@ -28,77 +30,39 @@ const suite = createControlUiE2eSuite({
     },
   },
 });
-const engines = ["chromium", "webkit"] as const;
 const views = [
   { name: "desktop", viewport: { width: 1440, height: 1000 } },
   { name: "mobile", viewport: { width: 390, height: 844 } },
 ] as const;
-const themes = ["light", "dark"] as const;
-const captureProof = process.env.OPENCLAW_CAPTURE_UI_PROOF === "1";
-const card: WorkboardCard = {
-  id: "native-proof",
-  title: "Review release readiness",
-  notes: "Confirm the operator can inspect a task and return to the board.",
-  labels: ["release"],
-  status: "todo",
-  priority: "normal",
-  position: 1000,
-  createdAt: 1_780_336_800_000,
-  updatedAt: 1_780_336_800_000,
-  agentId: "main",
-  metadata: { automation: { boardId: "ops" } },
-};
-const board = {
-  id: "ops",
-  name: "Operations",
-  total: 1,
-  active: 1,
-  archived: 0,
-  byStatus: { todo: 1 },
-};
+const card = makeCard(
+  {
+    id: "native-proof",
+    title: "Review release readiness",
+    labels: ["release"],
+    metadata: { automation: { boardId: "ops" } },
+  },
+  1_780_336_800_000,
+);
+const board = makeBoard("ops", { name: "Operations", total: 1, active: 1, byStatus: { todo: 1 } });
 
 const cardsResponse = (cards: WorkboardCard[]) => ({
   boards: [board],
   cards,
   statuses: ["todo", "done"],
 });
-const button = (scope: Page | Locator, name: string) =>
-  scope.getByRole("button", { name, exact: true });
-const focused = (locator: Locator) =>
-  locator.evaluate((element) => element === document.activeElement);
-const expectFocus = async (locator: Locator) => {
-  await expect.poll(() => focused(locator)).toBe(true);
-};
-
-async function capture(
-  page: Page,
-  engine: (typeof engines)[number],
-  name: string,
-  surface: Locator,
-  content: Locator[],
-) {
-  if (!captureProof) {
-    return;
-  }
-  const filename = path.join(suite.artifactDir, `${name}.png`);
-  if (engine === "chromium") {
-    const frame = await takeControlUiScreenshotFrame(page, surface, content, {
-      animations: "disabled",
-    });
-    await writeFile(filename, frame.png);
-  } else {
-    // The shared frame encoder uses CDP; WebKit retains the same semantic readiness.
-    await waitForControlUiProofSurface(surface, content);
-    await page.screenshot({ path: filename, animations: "disabled" });
-  }
-}
 
 suite.define(() => {
-  it.each(engines)(
+  it.each(["chromium", "webkit"] as const)(
     "loads the native bundle and preserves overlay focus and card identity in %s",
     async (engine) => {
+      const proof = createWorkboardProof(
+        suite,
+        "workboard-native-bundle-overlay-parity",
+        undefined,
+        { captureMode: engine },
+      );
       for (const view of views) {
-        for (const theme of themes) {
+        for (const theme of ["light", "dark"] as const) {
           const options = {
             colorScheme: theme,
             locale: "en-US",
@@ -142,70 +106,56 @@ suite.define(() => {
             expect(report.params).toMatchObject({ pluginId: "workboard", status: "activated" });
             expect([...requestedAssets].some((url) => url.endsWith("/index.js"))).toBe(true);
             const prefix = `${engine}-${view.name}-${theme}`;
-            const heading = page.locator(".workboard-page-title");
-            await capture(page, engine, `${prefix}-board`, page.locator(".workboard-main"), [
-              heading,
+            await proof.capture(page, `${prefix}-board`, page.locator(".workboard-main"), [
+              page.locator(".workboard-page-title"),
               tile,
             ]);
 
-            const retained = await tile.elementHandle();
-            if (!retained) {
-              throw new Error("Native Workboard card did not mount");
-            }
-            try {
-              await tile.focus();
-              await gateway.setMethodResponse(
-                "workboard.cards.list",
-                cardsResponse([{ ...card, labels: ["reviewed"], updatedAt: card.updatedAt + 1 }]),
-              );
-              await gateway.emitGatewayEvent("plugin.workboard.changed", {
-                epoch: "native-proof",
-                revision: 1,
-              });
-              await tile.getByText("reviewed", { exact: true }).waitFor();
-              expect(
-                await retained.evaluate(
-                  (element) => element === document.querySelector(".workboard-card"),
-                ),
-              ).toBe(true);
-              expect(await focused(tile)).toBe(true);
+            const retained = expectDefined(await tile.elementHandle(), "Native Workboard card");
+            await tile.focus();
+            await gateway.setMethodResponse(
+              "workboard.cards.list",
+              cardsResponse([{ ...card, labels: ["reviewed"], updatedAt: card.updatedAt + 1 }]),
+            );
+            await gateway.emitGatewayEvent("plugin.workboard.changed", {
+              epoch: "native-proof",
+              revision: 1,
+            });
+            await tile.getByText("reviewed", { exact: true }).waitFor();
+            expect(
+              await retained.evaluate(
+                (element) => element === document.querySelector(".workboard-card"),
+              ),
+            ).toBe(true);
+            expect(await focused(tile)).toBe(true);
 
-              await page.keyboard.press("Enter");
-              const details = page.getByRole("dialog", { name: card.title, exact: true });
-              const detailContent = page.locator(".workboard-detail");
-              await details.waitFor();
-              await expect
-                .poll(() => details.evaluate((element) => element.matches(":focus-within")))
-                .toBe(true);
-              await capture(page, engine, `${prefix}-details`, details, [
-                detailContent.getByRole("tab", { name: "Overview", exact: true }),
-              ]);
-              const actions = button(detailContent, "Card actions");
-              await actions.click();
-              const edit = button(detailContent, "Edit card");
-              await edit.waitFor();
-              await edit.focus();
-              await page.keyboard.press("Escape");
-              expect(await details.isVisible()).toBe(true);
-              await expect.poll(() => actions.getAttribute("aria-expanded")).toBe("false");
-              expect(await focused(actions)).toBe(true);
-              await page.keyboard.press("Escape");
-              await details.waitFor({ state: "detached" });
-              await expectFocus(tile);
-            } finally {
-              await retained.dispose();
-            }
+            await page.keyboard.press("Enter");
+            const details = page.getByRole("dialog", { name: card.title, exact: true });
+            const detailContent = page.locator(".workboard-detail");
+            await details.waitFor();
+            await expectFocus(details, true);
+            await proof.capture(page, `${prefix}-details`, details, [
+              detailContent.getByRole("tab", { name: "Overview", exact: true }),
+            ]);
+            const actions = button(detailContent, "Card actions");
+            await actions.click();
+            await button(detailContent, "Edit card").focus();
+            await page.keyboard.press("Escape");
+            expect(await details.isVisible()).toBe(true);
+            await expect.poll(() => actions.getAttribute("aria-expanded")).toBe("false");
+            expect(await focused(actions)).toBe(true);
+            await page.keyboard.press("Escape");
+            await details.waitFor({ state: "detached" });
+            await expectFocus(tile);
 
             const create = button(page.locator(".workboard-heading__actions"), "New card");
             await create.focus();
             await page.keyboard.press("Enter");
             const modal = page.getByRole("dialog", { name: "New card", exact: true });
-            const title = page
-              .locator(".workboard-card-draft")
-              .getByLabel("Title", { exact: true });
+            const title = modal.getByLabel("Title", { exact: true });
             await title.waitFor();
             await expectFocus(title);
-            await capture(page, engine, `${prefix}-create`, modal, [title]);
+            await proof.capture(page, `${prefix}-create`, modal, [title]);
             await page.keyboard.press("Escape");
             await modal.waitFor({ state: "detached" });
             await expectFocus(create);
@@ -224,3 +174,4 @@ suite.define(() => {
     120_000,
   );
 });
+import { expectDefined } from "@openclaw/normalization-core";

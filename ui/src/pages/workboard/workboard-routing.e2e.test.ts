@@ -1,17 +1,21 @@
-import { copyFile, mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { BrowserContext, Page } from "playwright";
+import type { Locator, Page } from "playwright";
 import { expect, it } from "vitest";
 import { createControlUiE2eSuite } from "../../e2e/control-ui-e2e-suite.test-support.ts";
-import { createControlUiE2eArtifactDir } from "../../test-helpers/control-ui-e2e-artifacts.ts";
-import { takeControlUiViewportScreenshot } from "../../test-helpers/control-ui-e2e-screenshot.ts";
 import {
   controlUiBundledSettingsStorageKey,
-  controlUiE2eWaitTimeoutMs,
   installMockGateway,
   waitForControlUiRoute,
 } from "../../test-helpers/control-ui-e2e.ts";
 import { workboardUi } from "../../test-helpers/control-ui-workboard-fixture.ts";
+import {
+  createWorkboardProof,
+  button,
+  configSnapshot,
+  expectFocus,
+  makeBoard,
+  makeCard,
+} from "./workboard.e2e.test-support.ts";
 
 const suite = createControlUiE2eSuite({
   name: "Control UI Workboard routing",
@@ -19,70 +23,32 @@ const suite = createControlUiE2eSuite({
     `Playwright Chromium is not installed at ${executablePath}.`,
 });
 
-const captureUiProofEnabled = process.env.OPENCLAW_CAPTURE_UI_PROOF === "1";
 const artifactParent = path.resolve(process.cwd(), ".artifacts/control-ui-e2e/workboard-routing");
 const boards = [
-  { id: "default", total: 0, active: 0, archived: 0, byStatus: {} },
-  {
-    id: "ops",
-    name: "Operations",
-    icon: "⚙",
-    color: "#22c55e",
-    total: 0,
-    active: 0,
-    archived: 0,
-    byStatus: {},
-  },
+  makeBoard("default"),
+  makeBoard("ops", { name: "Operations", icon: "⚙", color: "#22c55e" }),
 ];
 
-function configSnapshot(enabled: boolean) {
-  const config = { plugins: { entries: { workboard: { enabled } } } };
-  return {
-    config,
-    hash: `workboard-routing-${enabled}`,
-    path: "/tmp/openclaw-e2e/openclaw.json",
-    raw: JSON.stringify(config),
-    resolved: config,
-    sourceConfig: config,
-  };
-}
-
-function sessionsListResponse() {
-  return {
-    count: 0,
-    defaults: { contextTokens: null, model: null, modelProvider: null },
-    path: "",
-    sessions: [],
-    ts: 1,
-  };
-}
+const sessions = {
+  count: 0,
+  defaults: { contextTokens: null, model: null, modelProvider: null },
+  path: "",
+  sessions: [],
+  ts: 1,
+};
 
 function installWorkboard(page: Page, extra: Parameters<typeof installMockGateway>[1] = {}) {
   return installMockGateway(page, {
     ...workboardUi,
     ...extra,
     methodResponses: {
-      "config.get": configSnapshot(true),
-      "sessions.list": sessionsListResponse(),
+      "config.get": configSnapshot("workboard-routing-true"),
+      "sessions.list": sessions,
       "workboard.boards.list": { boards },
       "workboard.cards.list": { boards, cards: [], statuses: ["todo", "done"] },
       ...extra.methodResponses,
     },
   });
-}
-
-async function capture(
-  page: Page,
-  artifactDir: string,
-  name: string,
-  content: Parameters<typeof takeControlUiViewportScreenshot>[2],
-) {
-  if (captureUiProofEnabled) {
-    await writeFile(
-      path.join(artifactDir, `${name}.png`),
-      await takeControlUiViewportScreenshot(page, page.locator(".shell"), content),
-    );
-  }
 }
 
 function boardEntry(page: Page) {
@@ -97,53 +63,19 @@ function pinnedBoard(page: Page) {
   );
 }
 
-async function newRecordedPage(
-  artifactDir: string,
-  label: string,
-): Promise<{
-  context: BrowserContext;
-  page: Page;
-  rawVideoDir: string;
-}> {
-  const rawVideoDir = path.join(artifactDir, `${label}-raw`);
-  if (captureUiProofEnabled) {
-    await mkdir(rawVideoDir, { recursive: true });
-  }
-  const context = await suite.browser.newContext({
-    locale: "en-US",
-    recordVideo: captureUiProofEnabled
-      ? { dir: rawVideoDir, size: { width: 1600, height: 1000 } }
-      : undefined,
-    serviceWorkers: "block",
-    viewport: { width: 1600, height: 1000 },
-  });
-  const page = await context.newPage();
-  page.setDefaultTimeout(controlUiE2eWaitTimeoutMs);
-  return { context, page, rawVideoDir };
-}
-
-async function closeRecordedPage(
-  recorded: Awaited<ReturnType<typeof newRecordedPage>>,
-  artifactDir: string,
-  label: string,
-) {
-  const video = recorded.page.video();
-  await recorded.context.close();
-  if (video) {
-    await copyFile(await video.path(), path.join(artifactDir, `${label}.webm`));
-  }
-  if (captureUiProofEnabled) {
-    await rm(recorded.rawVideoDir, { force: true, recursive: true });
-  }
+function agentValue(picker: Locator) {
+  return picker.evaluate((element) => (element as HTMLElement & { value: string }).value);
 }
 
 suite.define(() => {
   it("routes, pins, persists, and normalizes Workboard boards", async () => {
-    const artifactDir = captureUiProofEnabled
-      ? createControlUiE2eArtifactDir("workboard-routing", artifactParent)
-      : "";
-    const recorded = await newRecordedPage(artifactDir, "routing");
-    const { page } = recorded;
+    const proof = createWorkboardProof(
+      suite,
+      "workboard-routing",
+      { width: 1600, height: 1000 },
+      { parent: artifactParent },
+    );
+    const { page, close } = await proof.open("routing");
     try {
       const gateway = await installWorkboard(page);
 
@@ -159,14 +91,14 @@ suite.define(() => {
       await filterTrigger.click();
       await page.getByRole("button", { name: /^Filter by board:/u }).waitFor();
       await filterTrigger.click();
-      await capture(page, artifactDir, "01-board-route", [headerGlyph]);
+      await proof.capture(page, "01-board-route", page.locator(".shell"), [headerGlyph]);
 
       const sidebar = page.locator("openclaw-app-sidebar");
-      await sidebar.getByRole("button", { name: "Pages", exact: true }).click();
+      await button(sidebar, "Pages").click();
       const workboardEntry = sidebar.locator(".sidebar-pages__entry").filter({
         has: page.locator('[data-sidebar-entry="plugin:workboard/workboard"]'),
       });
-      await workboardEntry.getByRole("button", { name: "Pin", exact: true }).click();
+      await button(workboardEntry, "Pin").click();
       const pinnedWorkboard = sidebar.locator(
         '.sidebar-rail [data-sidebar-entry="plugin:workboard/workboard"]',
       );
@@ -176,14 +108,14 @@ suite.define(() => {
       );
       const entry = boardEntry(page);
       await entry.getByRole("link", { name: "Operations", exact: true }).waitFor();
-      await entry.getByRole("button", { name: "Pin", exact: true }).click();
+      await button(entry, "Pin").click();
       const pinned = pinnedBoard(page);
       await pinned.waitFor();
       expect(await pinned.getAttribute("href")).toBe("/workboard/ops");
       expect(await entry.getByRole("link", { name: "Operations", exact: true }).isVisible()).toBe(
         true,
       );
-      expect(await entry.getByRole("button", { name: "Unpin", exact: true }).count()).toBe(1);
+      expect(await button(entry, "Unpin").count()).toBe(1);
       await expect
         .poll(() =>
           page.evaluate((key) => {
@@ -193,7 +125,7 @@ suite.define(() => {
         )
         .toContain("plugin:workboard/board-ops");
       expect(await gateway.getRequests("sessions.patch")).toHaveLength(0);
-      await capture(page, artifactDir, "02-pinned-board", [pinned]);
+      await proof.capture(page, "02-pinned-board", page.locator(".shell"), [pinned]);
 
       await page.goto(`${suite.server.baseUrl}workboard?board=ops&agent=main`);
       await waitForControlUiRoute(page, {
@@ -201,8 +133,6 @@ suite.define(() => {
         routeId: "workboard",
         search: "?agent=main",
       });
-      expect(new URL(page.url()).searchParams.get("board")).toBeNull();
-      expect(new URL(page.url()).searchParams.get("agent")).toBe("main");
 
       await page.reload();
       await pinned.waitFor();
@@ -212,7 +142,7 @@ suite.define(() => {
       expect(await pinnedWorkboard.locator(".nav-item__children, .nav-item--child").count()).toBe(
         0,
       );
-      await capture(page, artifactDir, "03-legacy-normalized-and-persisted", [
+      await proof.capture(page, "03-legacy-normalized-and-persisted", page.locator(".shell"), [
         page.locator(".workboard-page-title", { hasText: "Operations" }),
       ]);
 
@@ -223,11 +153,10 @@ suite.define(() => {
         routeId: "workboard",
         search: "?agent=main",
       });
-      expect(new URL(page.url()).searchParams.get("agent")).toBe("main");
       await page.locator(".workboard-page-title", { hasText: "Workboard" }).waitFor();
       expect(await page.evaluate(() => history.length)).toBe(historyBeforeMissingBoard + 1);
     } finally {
-      await closeRecordedPage(recorded, artifactDir, "routing");
+      await close();
     }
   });
 
@@ -239,17 +168,11 @@ suite.define(() => {
         viewport: { width: 1600, height: 1000 },
       },
       async ({ page }) => {
-        const createdCard = {
+        const createdCard = makeCard({
           id: "writer-card",
           title: "Keep the writer task visible",
-          status: "todo",
-          priority: "normal",
-          labels: [],
           agentId: "writer",
-          position: 1000,
-          createdAt: 1,
-          updatedAt: 1,
-        };
+        });
 
         const gateway = await installWorkboard(page, {
           methodResponses: {
@@ -269,23 +192,10 @@ suite.define(() => {
 
         const agentScope = page.locator(".workboard-agent-filter openclaw-agent-select");
         await agentScope.locator(".agent-select__trigger").click();
-        await expect
-          .poll(() =>
-            agentScope
-              .locator(".agent-select__option[data-agent-option]")
-              .filter({ hasText: "Main" })
-              .evaluate((option) => option === document.activeElement),
-          )
-          .toBe(true);
-        await agentScope
-          .locator(".agent-select__option[data-agent-option]")
-          .filter({ hasText: "Writer" })
-          .click();
-        await expect
-          .poll(() =>
-            agentScope.evaluate((select) => (select as HTMLElement & { value: string }).value),
-          )
-          .toBe("writer");
+        const agentOptions = agentScope.locator(".agent-select__option[data-agent-option]");
+        await expectFocus(agentOptions.filter({ hasText: "Main" }));
+        await agentOptions.filter({ hasText: "Writer" }).click();
+        await expect.poll(() => agentValue(agentScope)).toBe("writer");
         await expect
           .poll(
             () =>
@@ -303,13 +213,8 @@ suite.define(() => {
         await page.getByRole("button", { name: /New card/u }).click();
 
         const createForm = page.locator(".workboard-draft");
-        await expect
-          .poll(() =>
-            createForm
-              .locator(".workboard-agent-select openclaw-agent-select")
-              .evaluate((select) => (select as HTMLElement & { value: string }).value),
-          )
-          .toBe("writer");
+        const draftAgent = createForm.locator(".workboard-agent-select openclaw-agent-select");
+        await expect.poll(() => agentValue(draftAgent)).toBe("writer");
         await createForm.getByLabel("Title").fill(createdCard.title);
         await createForm.getByRole("button", { name: /^Create$/u }).click();
 
@@ -320,9 +225,7 @@ suite.define(() => {
         });
         await gateway.resolveDeferred("workboard.cards.create", { card: createdCard });
 
-        await page.locator(".workboard-card", { hasText: createdCard.title }).waitFor({
-          state: "visible",
-        });
+        await page.locator(".workboard-card", { hasText: createdCard.title }).waitFor();
       },
     );
   });
@@ -334,8 +237,8 @@ suite.define(() => {
         const gateway = await installWorkboard(page);
         await page.goto(`${suite.server.baseUrl}apps`);
         const sidebar = page.locator("openclaw-app-sidebar");
-        await sidebar.getByRole("button", { name: "Pages", exact: true }).click();
-        await boardEntry(page).getByRole("button", { name: "Pin", exact: true }).click();
+        await button(sidebar, "Pages").click();
+        await button(boardEntry(page), "Pin").click();
         const pinned = pinnedBoard(page);
         await pinned.click();
         await page.locator(".workboard-page-title", { hasText: "Operations" }).waitFor();
@@ -373,15 +276,15 @@ suite.define(() => {
       const gateway = await installMockGateway(page, {
         nativePlugins: [],
         methodResponses: {
-          "config.get": configSnapshot(false),
-          "sessions.list": sessionsListResponse(),
+          "config.get": configSnapshot("workboard-routing-false", false),
+          "sessions.list": sessions,
           "workboard.boards.list": { boards },
         },
       });
       await page.goto(`${suite.server.baseUrl}chat`);
       const sidebar = page.locator("openclaw-app-sidebar");
       await gateway.waitForRequest("config.get");
-      await sidebar.getByRole("button", { name: "Pages", exact: true }).click();
+      await button(sidebar, "Pages").click();
       const pages = sidebar.locator(".sidebar-pages");
       await pages.waitFor();
       expect(await pages.getByRole("link", { name: "Workboard", exact: true }).count()).toBe(0);

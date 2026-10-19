@@ -6,9 +6,11 @@ import type { ApplicationContext, ApplicationNavigationOptions } from "../../app
 import { createApplicationGateway } from "../../test-helpers/application-context.ts";
 import { resolveWorkboardRouteLocation } from "./route-location.ts";
 
-function routeFixture(
-  initialLocation: RouteLocation = { pathname: "/ui/settings/about", search: "", hash: "" },
-) {
+function at(pathname: string, search = "", hash = ""): RouteLocation {
+  return { pathname, search, hash };
+}
+
+function routeFixture(initialLocation = at("/ui/settings/about")) {
   const basePath = "/ui";
   let location = initialLocation;
   let historyListener: ((location: RouteLocation) => void) | undefined;
@@ -40,17 +42,7 @@ function routeFixture(
   const redirects: Promise<void>[] = [];
   const context = {
     basePath,
-    gateway: createApplicationGateway({
-      phase: "stopped",
-      client: null,
-      offlineStable: false,
-      hello: null,
-      canvasPluginSurfaceUrl: null,
-      assistantAgentId: null,
-      sessionKey: "agent:main:main",
-      lastError: null,
-      lastErrorCode: null,
-    }).gateway,
+    gateway: createApplicationGateway().gateway,
     runtimeConfig: {
       ensureLoaded: () => metadata.promise,
     },
@@ -99,19 +91,12 @@ function routeFixture(
   };
 }
 
-const legacyBoardLocation: RouteLocation = {
-  pathname: "/ui/workboard",
-  search: "?board=ops&agent=writer",
-  hash: "#original",
-};
+const legacyBoardLocation = at("/ui/workboard", "?board=ops&agent=writer", "#original");
+const canonicalBoardLocation = at("/ui/workboard/ops", "?agent=writer", "#original");
 
 describe("Workboard route navigation ownership", () => {
   it("keeps a newer query and hash on the same board when old route loading finishes", async () => {
-    const location = {
-      pathname: "/ui/workboard/ops",
-      search: "?agent=reviewer",
-      hash: "#latest",
-    };
+    const location = at("/ui/workboard/ops", "?agent=reviewer", "#latest");
     const fixture = routeFixture();
     await fixture.started;
     const oldNavigation = fixture.navigate(legacyBoardLocation);
@@ -134,11 +119,7 @@ describe("Workboard route navigation ownership", () => {
     await fixture.expectLocation(activeLocation);
     expect(fixture.router.getState().matches[0]?.routeId).toBe("about");
     await fixture.navigate(legacyBoardLocation);
-    await fixture.expectLocation({
-      pathname: "/ui/workboard/ops",
-      search: "?agent=writer",
-      hash: "#original",
-    });
+    await fixture.expectLocation(canonicalBoardLocation);
     expect(fixture.router.getState().matches[0]?.data).toMatchObject({ boardFilter: "ops" });
   });
 
@@ -151,43 +132,27 @@ describe("Workboard route navigation ownership", () => {
         fixture.pop(legacyBoardLocation);
       }
       await fixture.loading.promise;
-      const canonicalLocation = {
-        pathname: "/ui/workboard/ops",
-        search: "?agent=writer",
-        hash: "#original",
-      };
-      expect.soft(fixture.history.location()).toEqual(canonicalLocation);
+      expect.soft(fixture.history.location()).toEqual(canonicalBoardLocation);
       fixture.resolve();
       await fixture.started;
       await Promise.all(fixture.redirects);
       await vi.waitFor(() => {
-        expect(fixture.router.getState().status).toBe("success");
-        expect(fixture.router.getState().location).toEqual(canonicalLocation);
+        expect(fixture.router.getState()).toMatchObject({
+          status: "success",
+          location: canonicalBoardLocation,
+        });
       });
       expect(fixture.router.getState().matches[0]?.data).toMatchObject({ boardFilter: "ops" });
     },
   );
 });
 
-describe("Workboard route location", () => {
-  it("normalizes an invalid legacy board to the all-boards route", () => {
-    expect(
-      resolveWorkboardRouteLocation(
-        {
-          pathname: "/ui/workboard",
-          search: "?board=not%20valid&agent=main",
-          hash: "",
-        },
-        "/ui",
-      ),
-    ).toEqual({
-      boardFilter: "__all__",
-      search: "?agent=main",
-      canonicalLocation: {
-        pathname: "/ui/workboard",
-        search: "?agent=main",
-        hash: "",
-      },
-    });
+it("normalizes an invalid legacy board to the all-boards route", () => {
+  expect(
+    resolveWorkboardRouteLocation(at("/ui/workboard", "?board=not%20valid&agent=main"), "/ui"),
+  ).toEqual({
+    boardFilter: "__all__",
+    search: "?agent=main",
+    canonicalLocation: at("/ui/workboard", "?agent=main"),
   });
 });
