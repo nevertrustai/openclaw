@@ -54,6 +54,7 @@ const restartPlan = {
 } satisfies GatewayReloadPlan;
 
 type CoordinatorOptions = Parameters<typeof createGatewayRestartCoordinator>[0];
+const coordinators: ReturnType<typeof createGatewayRestartCoordinator>[] = [];
 
 function createCoordinator(
   {
@@ -62,7 +63,7 @@ function createCoordinator(
   }: Partial<CoordinatorOptions["params"]>,
   options: Partial<Omit<CoordinatorOptions, "params">> = {},
 ) {
-  return createGatewayRestartCoordinator({
+  const coordinator = createGatewayRestartCoordinator({
     params: { logReload: { info: vi.fn(), warn: vi.fn() }, ...params, scheduler },
     reloadSignal: options.reloadSignal ?? beginGatewayReloadLifecycle(),
     restartRecoveryAvailable: true,
@@ -71,6 +72,8 @@ function createCoordinator(
     formatDeferredWorkStatus: () => "no active work",
     ...options,
   });
+  coordinators.push(coordinator);
+  return coordinator;
 }
 
 beforeEach(() => {
@@ -80,6 +83,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const coordinator of coordinators.splice(0)) {
+    coordinator.stopRestartRetries();
+  }
+  vi.restoreAllMocks();
   restartModule.resetGatewayRestartStateForInProcessRestart();
   resetGatewayWorkAdmission();
   vi.useRealTimers();
@@ -90,22 +97,18 @@ describe("gateway restart readiness preflight", () => {
     const coordinator = createCoordinator({
       requestRecoveryRestart: vi.fn(() => ({ status: "emitted" as const })),
     });
-    try {
-      const lifecycle = coordinator.beginGatewayRestartLifecycle();
-      expect(coordinator.hasOutstandingGatewayRestart()).toBe(false);
-      lifecycle.settle("committed");
-      expect(coordinator.hasOutstandingGatewayRestart()).toBe(false);
+    const lifecycle = coordinator.beginGatewayRestartLifecycle();
+    expect(coordinator.hasOutstandingGatewayRestart()).toBe(false);
+    lifecycle.settle("committed");
+    expect(coordinator.hasOutstandingGatewayRestart()).toBe(false);
 
-      coordinator.pauseGatewayRestartForConfigCandidate();
-      expect(coordinator.hasOutstandingGatewayRestart()).toBe(false);
+    coordinator.pauseGatewayRestartForConfigCandidate();
+    expect(coordinator.hasOutstandingGatewayRestart()).toBe(false);
 
-      expect(coordinator.requestGatewayRestart(restartPlan, {}).status).toBe("accepted");
-      expect(coordinator.hasOutstandingGatewayRestart()).toBe(true);
-      coordinator.stopRestartRetries();
-      expect(coordinator.hasOutstandingGatewayRestart()).toBe(false);
-    } finally {
-      coordinator.stopRestartRetries();
-    }
+    expect(coordinator.requestGatewayRestart(restartPlan, {}).status).toBe("accepted");
+    expect(coordinator.hasOutstandingGatewayRestart()).toBe(true);
+    coordinator.stopRestartRetries();
+    expect(coordinator.hasOutstandingGatewayRestart()).toBe(false);
   });
 
   it("keeps the current lifecycle serving until an explicit request is restart-ready", async () => {
@@ -120,38 +123,34 @@ describe("gateway restart readiness preflight", () => {
     const coordinator = createCoordinator(params);
     vi.useFakeTimers();
 
-    try {
-      expect(
-        coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig, {
-          prepareRuntimeConfig,
-        }).status,
-      ).toBe("accepted");
-      await vi.advanceTimersByTimeAsync(0);
+    expect(
+      coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig, {
+        prepareRuntimeConfig,
+      }).status,
+    ).toBe("accepted");
+    await vi.advanceTimersByTimeAsync(0);
 
-      expect(assertRestartReady).toHaveBeenCalledOnce();
-      expect(prepareRuntimeConfig).not.toHaveBeenCalled();
-      expect(requestRecoveryRestart).not.toHaveBeenCalled();
-      expect(logReload.warn).toHaveBeenCalledWith(
-        "gateway restart preflight failed: Error: state schema is noncanonical",
-      );
+    expect(assertRestartReady).toHaveBeenCalledOnce();
+    expect(prepareRuntimeConfig).not.toHaveBeenCalled();
+    expect(requestRecoveryRestart).not.toHaveBeenCalled();
+    expect(logReload.warn).toHaveBeenCalledWith(
+      "gateway restart preflight failed: Error: state schema is noncanonical",
+    );
 
-      await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(1_000);
 
-      expect(assertRestartReady).toHaveBeenCalledOnce();
-      expect(requestRecoveryRestart).not.toHaveBeenCalled();
-      expect(logReload.info).not.toHaveBeenCalledWith(
-        "all operations and replies completed; restarting gateway now",
-      );
+    expect(assertRestartReady).toHaveBeenCalledOnce();
+    expect(requestRecoveryRestart).not.toHaveBeenCalled();
+    expect(logReload.info).not.toHaveBeenCalledWith(
+      "all operations and replies completed; restarting gateway now",
+    );
 
-      coordinator.requestGatewayRestart(restartPlan, {}, { prepareRuntimeConfig });
-      await vi.advanceTimersByTimeAsync(0);
+    coordinator.requestGatewayRestart(restartPlan, {}, { prepareRuntimeConfig });
+    await vi.advanceTimersByTimeAsync(0);
 
-      expect(assertRestartReady).toHaveBeenCalledTimes(2);
-      expect(prepareRuntimeConfig).toHaveBeenCalledOnce();
-      expect(requestRecoveryRestart).toHaveBeenCalledOnce();
-    } finally {
-      coordinator.stopRestartRetries();
-    }
+    expect(assertRestartReady).toHaveBeenCalledTimes(2);
+    expect(prepareRuntimeConfig).toHaveBeenCalledOnce();
+    expect(requestRecoveryRestart).toHaveBeenCalledOnce();
   });
 
   it("prepares outside the restart-signal fence so lease holders can finish", async () => {
@@ -178,21 +177,17 @@ describe("gateway restart readiness preflight", () => {
       requestRecoveryRestart,
     });
 
-    try {
-      coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig, {
-        prepareRuntimeConfig,
-      });
-      await vi.advanceTimersByTimeAsync(1_000);
+    coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig, {
+      prepareRuntimeConfig,
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
 
-      expect(prepareRuntimeConfig).toHaveBeenCalledOnce();
-      expect(requestRecoveryRestart).toHaveBeenCalledExactlyOnceWith(
-        "config reload: gateway.port",
-        undefined,
-      );
-      expect(logReload.warn).not.toHaveBeenCalledWith(expect.stringContaining("failed"));
-    } finally {
-      coordinator.stopRestartRetries();
-    }
+    expect(prepareRuntimeConfig).toHaveBeenCalledOnce();
+    expect(requestRecoveryRestart).toHaveBeenCalledExactlyOnceWith(
+      "config reload: gateway.port",
+      undefined,
+    );
+    expect(logReload.warn).not.toHaveBeenCalledWith(expect.stringContaining("failed"));
   });
 
   it("reports a pending restart preparation instead of waiting silently", async () => {
@@ -201,21 +196,17 @@ describe("gateway restart readiness preflight", () => {
     const logReload = { info: vi.fn(), warn: vi.fn() };
     const coordinator = createCoordinator({ logReload, requestRecoveryRestart });
 
-    try {
-      coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig, {
-        prepareRuntimeConfig: () => new Promise<OpenClawConfig>(() => {}),
-      });
-      await vi.advanceTimersByTimeAsync(30_000);
+    coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig, {
+      prepareRuntimeConfig: () => new Promise<OpenClawConfig>(() => {}),
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
 
-      expect(requestRecoveryRestart).not.toHaveBeenCalled();
-      expect(logReload.warn).toHaveBeenLastCalledWith(
-        expect.stringMatching(
-          /^restart still deferred after \d+ms with restart preparation pending; no active work$/,
-        ),
-      );
-    } finally {
-      coordinator.stopRestartRetries();
-    }
+    expect(requestRecoveryRestart).not.toHaveBeenCalled();
+    expect(logReload.warn).toHaveBeenLastCalledWith(
+      expect.stringMatching(
+        /^restart still deferred after \d+ms with restart preparation pending; no active work$/,
+      ),
+    );
   });
 
   it("keeps the timed-out deferral cancellable so a later request can supersede it", async () => {
@@ -238,23 +229,18 @@ describe("gateway restart readiness preflight", () => {
       },
     );
 
-    try {
-      coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig, {
-        prepareRuntimeConfig: async () => ({}) as OpenClawConfig,
-      });
-      expect(deferSpy).toHaveBeenCalledOnce();
+    coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig, {
+      prepareRuntimeConfig: async () => ({}) as OpenClawConfig,
+    });
+    expect(deferSpy).toHaveBeenCalledOnce();
 
-      capturedHooks?.onTimeout?.(1, 300_000);
+    capturedHooks?.onTimeout?.(1, 300_000);
 
-      coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig, {
-        prepareRuntimeConfig: async () => ({}) as OpenClawConfig,
-      });
+    coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig, {
+      prepareRuntimeConfig: async () => ({}) as OpenClawConfig,
+    });
 
-      expect(cancel).toHaveBeenCalled();
-    } finally {
-      deferSpy.mockRestore();
-      coordinator.stopRestartRetries();
-    }
+    expect(cancel).toHaveBeenCalled();
   });
   it("forces the restart at the deadline when production timeout diagnostics cannot inspect work", async () => {
     vi.useFakeTimers();
@@ -267,31 +253,27 @@ describe("gateway restart readiness preflight", () => {
       { logReload, requestRecoveryRestart },
       { reloadSignal, ...tracker },
     );
-    try {
-      expect(coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig).status).toBe(
-        "accepted",
-      );
-      queueSize.mockImplementation(() => {
-        throw new Error("pending-work store unavailable");
-      });
-      await vi.advanceTimersByTimeAsync(299_500);
-      expect(requestRecoveryRestart).not.toHaveBeenCalled();
+    expect(coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig).status).toBe(
+      "accepted",
+    );
+    queueSize.mockImplementation(() => {
+      throw new Error("pending-work store unavailable");
+    });
+    await vi.advanceTimersByTimeAsync(299_500);
+    expect(requestRecoveryRestart).not.toHaveBeenCalled();
 
-      await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(500);
 
-      expect(requestRecoveryRestart).toHaveBeenCalledExactlyOnceWith(
-        "config reload: gateway.port",
-        { force: true, waitMs: 300_000, reason: "config reload forced restart" },
-      );
-      expect(logReload.warn).toHaveBeenCalledWith(
-        expect.stringContaining(
-          "pending work unknown (Error: pending-work store unavailable); forcing restart",
-        ),
-      );
-    } finally {
-      coordinator.stopRestartRetries();
-      queueSize.mockRestore();
-    }
+    expect(requestRecoveryRestart).toHaveBeenCalledExactlyOnceWith("config reload: gateway.port", {
+      force: true,
+      waitMs: 300_000,
+      reason: "config reload forced restart",
+    });
+    expect(logReload.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "pending work unknown (Error: pending-work store unavailable); forcing restart",
+      ),
+    );
   });
 
   it.each(["check error", "timeout"])(
@@ -316,24 +298,20 @@ describe("gateway restart readiness preflight", () => {
           formatDeferredWorkStatus: () => "1 active agent run",
         },
       );
-      try {
-        coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig);
-        failedProbe = failure === "check error";
-        await vi.advanceTimersByTimeAsync(failedProbe ? 500 : 300_000);
-        if (failedProbe) {
-          expect(requestRecoveryRestart).not.toHaveBeenCalled();
-        } else {
-          expect(requestRecoveryRestart).toHaveBeenCalledOnce();
-        }
-        coordinator.stopRestartRetries();
-        const reads = getActiveCounts.mock.calls.length;
-        const emissions = requestRecoveryRestart.mock.calls.length;
-        await vi.advanceTimersByTimeAsync(2_000);
-        expect(getActiveCounts).toHaveBeenCalledTimes(reads);
-        expect(requestRecoveryRestart).toHaveBeenCalledTimes(emissions);
-      } finally {
-        coordinator.stopRestartRetries();
+      coordinator.requestGatewayRestart(restartPlan, {} as OpenClawConfig);
+      failedProbe = failure === "check error";
+      await vi.advanceTimersByTimeAsync(failedProbe ? 500 : 300_000);
+      if (failedProbe) {
+        expect(requestRecoveryRestart).not.toHaveBeenCalled();
+      } else {
+        expect(requestRecoveryRestart).toHaveBeenCalledOnce();
       }
+      coordinator.stopRestartRetries();
+      const reads = getActiveCounts.mock.calls.length;
+      const emissions = requestRecoveryRestart.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(getActiveCounts).toHaveBeenCalledTimes(reads);
+      expect(requestRecoveryRestart).toHaveBeenCalledTimes(emissions);
     },
   );
 });

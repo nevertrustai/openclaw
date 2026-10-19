@@ -6,11 +6,7 @@ import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
 } from "../config/runtime-snapshot.js";
-import {
-  attachRuntimeConfigWriteApplication,
-  createRuntimeConfigWriteApplication,
-  type RuntimeConfigWriteApplicationStatus,
-} from "../config/runtime-write-application.js";
+import type { RuntimeConfigWriteApplicationStatus } from "../config/runtime-write-application.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { withPluginLifecycleLease } from "../plugins/plugin-lifecycle-lease.js";
 import {
@@ -46,6 +42,7 @@ import {
   createDefaultGatewayReloadState,
   createDirectConfigWriteFixture,
   createTestConfigRevisionProjector,
+  publishConfigWrite,
 } from "./server-reload-handlers.config.test-support.js";
 import { startManagedGatewayConfigReloader } from "./server-reload-managed.js";
 import { SharedGatewaySessionGenerationState } from "./server-shared-auth-generation.js";
@@ -196,14 +193,10 @@ async function createReloadFixture(
     },
     submit(config: OpenClawConfig, hash: string, revision: number) {
       assert(writer.ref.current);
-      const application = createRuntimeConfigWriteApplication();
-      writer.ref.current(
-        attachRuntimeConfigWriteApplication(
-          createConfigWriteNotification(config, hash, revision, "runtime", "source"),
-          application,
-        ),
+      return publishConfigWrite(
+        writer.ref.current,
+        createConfigWriteNotification(config, hash, revision, "runtime", "source"),
       );
-      return application.result;
     },
   };
 }

@@ -1,6 +1,3 @@
-/**
- * Gateway request context construction tests.
- */
 import { writeFileSync } from "node:fs";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import {
@@ -57,6 +54,33 @@ function makeDeviceClient(connId: string, deviceId: string, role = "primary") {
     connId,
     connect: { device: { id: deviceId }, role },
     socket: { close: vi.fn() },
+  };
+}
+
+function approvalClient(
+  connId: string,
+  clientId: Parameters<typeof makeGatewayClient>[0]["clientId"],
+  overrides: Partial<Parameters<typeof makeGatewayClient>[0]> = {},
+) {
+  return makeGatewayClient({ connId, clientId, scopes: ["operator.approvals"], ...overrides });
+}
+
+function deviceContext(clients: ReturnType<typeof makeDeviceClient>[]) {
+  const invalidateSessionsForDevice = vi.fn();
+  const disconnectSessionsForDevice = vi.fn();
+  const invalidateConnectionForPairingChange = vi.fn();
+  const context = createGatewayRequestContext(
+    makeContextParams({
+      clients: new Set(clients) as never,
+      watchNodeHttpRuntime: { invalidateSessionsForDevice, disconnectSessionsForDevice },
+      nodeRegistry: { invalidateConnectionForPairingChange } as never,
+    }),
+  );
+  return {
+    context,
+    invalidateSessionsForDevice,
+    disconnectSessionsForDevice,
+    invalidateConnectionForPairingChange,
   };
 }
 
@@ -396,16 +420,9 @@ describe("createGatewayRequestContext", () => {
 
   it("does not treat scoped CLI or backend callers as approval delivery routes", () => {
     const clients = new Set([
-      makeGatewayClient({
-        connId: "cli",
-        clientId: GATEWAY_CLIENT_IDS.CLI,
-        scopes: ["operator.admin"],
-      }),
-      makeGatewayClient({
-        connId: "backend",
-        clientId: GATEWAY_CLIENT_IDS.GATEWAY_CLIENT,
+      approvalClient("cli", GATEWAY_CLIENT_IDS.CLI, { scopes: ["operator.admin"] }),
+      approvalClient("backend", GATEWAY_CLIENT_IDS.GATEWAY_CLIENT, {
         mode: GATEWAY_CLIENT_MODES.BACKEND,
-        scopes: ["operator.approvals"],
       }),
     ]) as never;
     const context = createGatewayRequestContext(makeContextParams({ clients }));
@@ -417,58 +434,29 @@ describe("createGatewayRequestContext", () => {
 
   it("preserves only clients that handle each approval kind", () => {
     const clients = new Set([
-      makeGatewayClient({
-        connId: "control-ui",
-        clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
+      approvalClient("control-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, {
         mode: GATEWAY_CLIENT_MODES.WEBCHAT,
-        scopes: ["operator.approvals"],
       }),
-      makeGatewayClient({
-        connId: "ios",
-        clientId: GATEWAY_CLIENT_IDS.IOS_APP,
+      approvalClient("ios", GATEWAY_CLIENT_IDS.IOS_APP, {
         mode: GATEWAY_CLIENT_MODES.UI,
         scopes: ["operator.admin"],
       }),
-      makeGatewayClient({
-        connId: "bridge",
-        clientId: GATEWAY_CLIENT_IDS.CLI,
-        scopes: ["operator.approvals"],
+      approvalClient("bridge", GATEWAY_CLIENT_IDS.CLI, {
         caps: [GATEWAY_CLIENT_CAPS.APPROVALS],
       }),
-      makeGatewayClient({
-        connId: "acp",
-        clientId: GATEWAY_CLIENT_IDS.CLI,
-        scopes: ["operator.approvals"],
+      approvalClient("acp", GATEWAY_CLIENT_IDS.CLI, {
         caps: [GATEWAY_CLIENT_CAPS.EXEC_APPROVALS],
       }),
-      makeGatewayClient({
-        connId: "tui",
-        clientId: GATEWAY_CLIENT_IDS.TUI,
-        scopes: ["operator.approvals"],
-      }),
-      makeGatewayClient({
-        connId: "plugin-bridge",
-        clientId: GATEWAY_CLIENT_IDS.CLI,
-        scopes: ["operator.approvals"],
+      approvalClient("tui", GATEWAY_CLIENT_IDS.TUI),
+      approvalClient("plugin-bridge", GATEWAY_CLIENT_IDS.CLI, {
         caps: [GATEWAY_CLIENT_CAPS.PLUGIN_APPROVALS],
       }),
-      makeGatewayClient({
-        connId: "runtime",
-        clientId: GATEWAY_CLIENT_IDS.GATEWAY_CLIENT,
+      approvalClient("runtime", GATEWAY_CLIENT_IDS.GATEWAY_CLIENT, {
         mode: GATEWAY_CLIENT_MODES.BACKEND,
-        scopes: ["operator.approvals"],
         approvalRuntime: true,
       }),
-      makeGatewayClient({
-        connId: "invalidated-ui",
-        clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
-        scopes: ["operator.approvals"],
-        invalidated: true,
-      }),
-      makeGatewayClient({
-        connId: "unscoped-ui",
-        clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
-      }),
+      approvalClient("invalidated-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, { invalidated: true }),
+      approvalClient("unscoped-ui", GATEWAY_CLIENT_IDS.CONTROL_UI, { scopes: [] }),
     ]) as never;
     const context = createGatewayRequestContext(makeContextParams({ clients }));
 
@@ -494,20 +482,8 @@ describe("createGatewayRequestContext", () => {
   it("invalidateClientsForDevice sets the flag on matching clients without closing the socket", () => {
     const target = makeDeviceClient("conn-target", "device-1");
     const unrelated = makeDeviceClient("conn-unrelated", "device-2");
-    const clients = new Set([target, unrelated]) as never;
-    const invalidateDeviceTransports = vi.fn();
-    const invalidateConnectionForPairingChange = vi.fn();
-
-    const context = createGatewayRequestContext(
-      makeContextParams({
-        clients,
-        watchNodeHttpRuntime: {
-          invalidateSessionsForDevice: invalidateDeviceTransports,
-          disconnectSessionsForDevice: vi.fn(),
-        },
-        nodeRegistry: { invalidateConnectionForPairingChange } as never,
-      }),
-    );
+    const { context, invalidateSessionsForDevice, invalidateConnectionForPairingChange } =
+      deviceContext([target, unrelated]);
     const detached = captureGatewayDeviceRevocation(context, { deviceId: "device-1" }, () => true);
     onTestFinished(detached.release);
     expect(detached.isCurrent()).toBe(true);
@@ -526,25 +502,14 @@ describe("createGatewayRequestContext", () => {
 
     expect((unrelated as { invalidated?: boolean }).invalidated).toBeUndefined();
     expect(unrelated.socket.close).not.toHaveBeenCalled();
-    expect(invalidateDeviceTransports).toHaveBeenCalledWith("device-1", {
+    expect(invalidateSessionsForDevice).toHaveBeenCalledWith("device-1", {
       reason: "device-token-rotated",
     });
   });
 
   it("disconnectClientsForDevice also marks the invalidated flag before closing", () => {
     const target = makeDeviceClient("conn-target", "device-1");
-    const clients = new Set([target]) as never;
-    const disconnectDeviceTransports = vi.fn();
-
-    const context = createGatewayRequestContext(
-      makeContextParams({
-        clients,
-        watchNodeHttpRuntime: {
-          invalidateSessionsForDevice: vi.fn(),
-          disconnectSessionsForDevice: disconnectDeviceTransports,
-        },
-      }),
-    );
+    const { context, disconnectSessionsForDevice } = deviceContext([target]);
     const detached = captureGatewayDeviceRevocation(context, { deviceId: "device-1" }, () => true);
     onTestFinished(detached.release);
     expect(detached.isCurrent()).toBe(true);
@@ -554,7 +519,7 @@ describe("createGatewayRequestContext", () => {
     expect((target as { invalidated?: boolean }).invalidated).toBe(true);
     expect((target as { invalidatedReason?: string }).invalidatedReason).toBe("device-removed");
     expect(target.socket.close).toHaveBeenCalledWith(4001, "device removed");
-    expect(disconnectDeviceTransports).toHaveBeenCalledWith("device-1", undefined);
+    expect(disconnectSessionsForDevice).toHaveBeenCalledWith("device-1", undefined);
   });
 
   it.each(["live", "disconnected"])(

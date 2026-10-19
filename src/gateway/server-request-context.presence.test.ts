@@ -319,6 +319,18 @@ describe("createGatewayRequestContext presence", () => {
         vi.mocked(params.runtime.broadcast).mock.calls.filter(([event]) => event === "presence");
       const rows = () =>
         listSystemPresence().filter((entry) => entry.user?.identity?.id === profile.id);
+      const advancePresence = () => params.presenceClock.advanceBy(200);
+      const renameAt = async (offset: number, displayName: string) => {
+        clock.mockReturnValue(started + offset);
+        context.refreshConnectedUserProfile?.({
+          id: profile.id,
+          displayName,
+          avatarRevision: "1",
+          hasAvatar: false,
+          updatedAt: started + offset,
+        });
+        await advancePresence();
+      };
       const typeAt = async (offset: number, tab = tabs[0]!) => {
         clock.mockReturnValue(started + offset);
         const requestParams = { sessionKey, sessionId, typing: true };
@@ -337,7 +349,7 @@ describe("createGatewayRequestContext presence", () => {
           respond,
         });
         expect(respond).toHaveBeenCalledWith(true, { ok: true, broadcast: false });
-        await params.presenceClock.advanceBy(200);
+        await advancePresence();
       };
 
       for (let second = 0; second < 30; second++) {
@@ -355,44 +367,26 @@ describe("createGatewayRequestContext presence", () => {
       await typeAt(30_000);
       expect(events()).toHaveLength(2);
 
-      clock.mockReturnValue(started + 31_000);
-      context.refreshConnectedUserProfile?.({
-        id: profile.id,
-        displayName: "Renamed Person",
-        avatarRevision: "1",
-        hasAvatar: false,
-        updatedAt: started + 31_000,
-      });
-      await params.presenceClock.advanceBy(200);
+      await renameAt(31_000, "Renamed Person");
       expect(events()).toHaveLength(3);
       expect(rows().every((row) => row.user?.name === "Renamed Person")).toBe(true);
       health.mockReturnValue(12);
       context.publishPresence();
-      await params.presenceClock.advanceBy(200);
+      await advancePresence();
       expect(events()).toHaveLength(4);
       await typeAt(32_000, tabs[1]!);
       expect(events()).toHaveLength(4);
 
-      clock.mockReturnValue(started + 179_000);
-      context.refreshConnectedUserProfile?.({
-        id: profile.id,
-        displayName: "Renamed Again",
-        avatarRevision: "1",
-        hasAvatar: false,
-        updatedAt: started + 179_000,
-      });
-      await params.presenceClock.advanceBy(200);
+      await renameAt(179_000, "Renamed Again");
       expect(events()).toHaveLength(5);
       await typeAt(180_000, tabs[1]!);
       expect(events()).toHaveLength(6);
-      expect(events().map((call) => call[2]?.stateVersion)).toEqual([
-        { presence: 1, health: 11 },
-        { presence: 2, health: 11 },
-        { presence: 3, health: 11 },
-        { presence: 4, health: 12 },
-        { presence: 5, health: 12 },
-        { presence: 6, health: 12 },
-      ]);
+      expect(events().map((call) => call[2]?.stateVersion)).toEqual(
+        [11, 11, 11, 12, 12, 12].map((healthVersion, index) => ({
+          presence: index + 1,
+          health: healthVersion,
+        })),
+      );
       expect(presenceVersion).toBe(6);
       expect(events().at(-1)?.[1]).toMatchObject({
         presence: expect.arrayContaining([

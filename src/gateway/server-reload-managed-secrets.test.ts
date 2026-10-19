@@ -91,13 +91,16 @@ const prepare = (config: OpenClawConfig) =>
     env: {},
   });
 
-function activatorOptions() {
-  return {
+function createActivator(
+  overrides: Partial<Parameters<typeof createRuntimeSecretsActivator>[0]> = {},
+) {
+  return createRuntimeSecretsActivator({
     logSecrets: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     emitStateEvent: vi.fn(),
     prepareRuntimeSecretsSnapshot: ({ config }: { config: OpenClawConfig }) => prepare(config),
     activateRuntimeSecretsSnapshot: activateSecretsRuntimeSnapshot,
-  };
+    ...overrides,
+  });
 }
 
 function expectAuthoredSource(source: OpenClawConfig) {
@@ -112,6 +115,54 @@ function expectAuthoredSource(source: OpenClawConfig) {
   ).toBe("none");
 }
 
+function expectContextTokens(model: string, expected: number | undefined) {
+  expect(resolveContextTokensForModel({ model, allowAsyncLoad: false })).toBe(expected);
+}
+
+type SecretHandlerOptions = Parameters<typeof createManagedReloadSecretHandlers>[0];
+
+function createSecretHandlers(
+  activateRuntimeSecrets: SecretHandlerOptions["params"]["activateRuntimeSecrets"],
+  prepareSnapshot: typeof prepare,
+  applyHotReload: SecretHandlerOptions["applyHotReload"],
+) {
+  return createManagedReloadSecretHandlers({
+    params: {
+      activateRuntimeSecrets,
+      resolveSharedGatewaySessionGenerationForConfig: () => undefined,
+      sharedGatewaySessionGenerationState: new SharedGatewaySessionGenerationState({
+        current: undefined,
+        required: null,
+      }),
+      clients: [],
+      commitRuntimePolicy: vi.fn(),
+      reconcileRuntimePolicy: vi.fn(),
+    },
+    prepareRuntimeCandidate: (config) => config,
+    tryPrepareRuntimeSecrets: async (config) => ({
+      snapshot: await prepareSnapshot(config),
+      expectedRevision: getActiveSecretsRuntimeSnapshotRevision(),
+    }),
+    applyHotReload,
+    hasPendingModelRuntimeReload: () => false,
+  });
+}
+
+async function prepareCandidates() {
+  return [
+    await prepare({ gateway: { port: 18789 } }),
+    await prepare({ gateway: { port: 18790 } }),
+  ] as const;
+}
+
+function expectPublishedConfigs(
+  publication: ReturnType<typeof vi.fn<(config: OpenClawConfig | null) => Promise<void>>>,
+  ...configs: OpenClawConfig[]
+) {
+  expect(publication.mock.calls.map(([config]) => config)).toEqual(configs);
+  expect(getActiveSecretsRuntimeSnapshotState()?.config).toEqual(configs.at(-1));
+}
+
 async function createReload(
   commit: () => Promise<void>,
   beforePublication?: () => Promise<void>,
@@ -120,19 +171,8 @@ async function createReload(
 ) {
   activateSecretsRuntimeSnapshotWithSource(await prepare(initial.config), initial.source);
   expectAuthoredSource(initial.source);
-  const activateRuntimeSecrets = createRuntimeSecretsActivator(activatorOptions());
+  const activateRuntimeSecrets = createActivator();
   // Only secret publication is exercised here; the service tail is injected at its existing seam.
-  const params = {
-    activateRuntimeSecrets,
-    resolveSharedGatewaySessionGenerationForConfig: () => undefined,
-    sharedGatewaySessionGenerationState: new SharedGatewaySessionGenerationState({
-      current: undefined,
-      required: null,
-    }),
-    clients: [],
-    commitRuntimePolicy: vi.fn(),
-    reconcileRuntimePolicy: vi.fn(),
-  };
   const applyHotReload = vi.fn<
     Parameters<typeof createManagedReloadSecretHandlers>[0]["applyHotReload"]
   >(async (_plan, _config, publication) => {
@@ -169,16 +209,7 @@ async function createReload(
     }
     return "applied";
   });
-  const { onHotReload } = createManagedReloadSecretHandlers({
-    params,
-    prepareRuntimeCandidate: (config) => config,
-    tryPrepareRuntimeSecrets: async (config) => ({
-      snapshot: await prepare(config),
-      expectedRevision: getActiveSecretsRuntimeSnapshotRevision(),
-    }),
-    applyHotReload,
-    hasPendingModelRuntimeReload: () => false,
-  });
+  const { onHotReload } = createSecretHandlers(activateRuntimeSecrets, prepare, applyHotReload);
   const ownership: GatewayConfigReloadTransactionOwnership = {
     isCurrent: () => true,
     checkpoint: async () => {},
@@ -225,28 +256,13 @@ describe("managed reload authored source", () => {
         env: { RELOAD_KEY: "resolved-fixture-key" },
       });
     activateSecretsRuntimeSnapshotWithSource(await prepareSnapshot(initial), initial);
-    const activateRuntimeSecrets = createRuntimeSecretsActivator({
-      ...activatorOptions(),
+    const activateRuntimeSecrets = createActivator({
       prepareRuntimeSecretsSnapshot: ({ config }) => prepareSnapshot(config),
     });
-    const handlers = createManagedReloadSecretHandlers({
-      params: {
-        activateRuntimeSecrets,
-        resolveSharedGatewaySessionGenerationForConfig: () => undefined,
-        sharedGatewaySessionGenerationState: new SharedGatewaySessionGenerationState({
-          current: undefined,
-          required: null,
-        }),
-        clients: [],
-        commitRuntimePolicy: vi.fn(),
-        reconcileRuntimePolicy: vi.fn(),
-      },
-      prepareRuntimeCandidate: (config) => config,
-      tryPrepareRuntimeSecrets: async (config) => ({
-        snapshot: await prepareSnapshot(config),
-        expectedRevision: getActiveSecretsRuntimeSnapshotRevision(),
-      }),
-      applyHotReload: async (_plan, _config, publication) => {
+    const handlers = createSecretHandlers(
+      activateRuntimeSecrets,
+      prepareSnapshot,
+      async (_plan, _config, publication) => {
         let committed = false;
         await publication!.publish(
           async () => {
@@ -256,8 +272,7 @@ describe("managed reload authored source", () => {
         );
         return "applied";
       },
-      hasPendingModelRuntimeReload: () => false,
-    });
+    );
     const refresh = vi.spyOn(skillsDiscovery, "refreshSkillsDiscovery").mockResolvedValue();
     const { clock, scheduler } = createConfigReloadTestClock();
     const snapshot = makeSnapshot({ config: source, hash: "saved-secret-source" });
@@ -308,8 +323,7 @@ describe("managed reload authored source", () => {
     const snapshot = makeSnapshot({ config, hash: "candidate" });
     const published = vi.fn();
     const policies: Array<OpenClawConfig | null> = [];
-    const activate = createRuntimeSecretsActivator({
-      ...activatorOptions(),
+    const activate = createActivator({
       beforeSnapshotPublication: async (policy) => {
         policies.push(policy);
         if (policy === prepared.config) {
@@ -357,8 +371,7 @@ describe("managed reload authored source", () => {
   it.each(["success", "hook fails", "publisher fails", "publisher replaces then fails"] as const)(
     "commits the exact target and reconciles publication outcome: %s",
     async (outcome) => {
-      const initial = await prepare({ gateway: { port: 18789 } });
-      const candidate = await prepare({ gateway: { port: 18790 } });
+      const [initial, candidate] = await prepareCandidates();
       activateSecretsRuntimeSnapshot(initial);
       const publisherFails = outcome.startsWith("publisher");
       const replaced = outcome === "publisher replaces then fails";
@@ -373,8 +386,7 @@ describe("managed reload authored source", () => {
           }
         }
       });
-      const activate = createRuntimeSecretsActivator({
-        ...activatorOptions(),
+      const activate = createActivator({
         beforeSnapshotPublication,
         activateRuntimeSecretsSnapshot: publisherFails
           ? (snapshot) => {
@@ -395,10 +407,7 @@ describe("managed reload authored source", () => {
       const survivor = outcome === "success" || replaced ? candidate : initial;
       if (outcome !== "success") {
         await expect(publication).rejects.toBe(failure);
-        expect(beforeSnapshotPublication.mock.calls.map(([config]) => config)).toEqual([
-          candidate.config,
-          survivor.config,
-        ]);
+        expectPublishedConfigs(beforeSnapshotPublication, candidate.config, survivor.config);
       } else {
         await expect(publication).resolves.toBe(candidate);
         expect(beforeSnapshotPublication).toHaveBeenCalledExactlyOnceWith(candidate.config);
@@ -410,8 +419,7 @@ describe("managed reload authored source", () => {
   it.each(["snapshot", "admission"] as const)(
     "reconciles the survivor when %s ownership changes during the durable hook",
     async (supersession) => {
-      const initial = await prepare({ gateway: { port: 18789 } });
-      const candidate = await prepare({ gateway: { port: 18790 } });
+      const [initial, candidate] = await prepareCandidates();
       const successor = await prepare({ gateway: { port: 18791 } });
       activateSecretsRuntimeSnapshot(initial);
       const entered = createDeferred();
@@ -422,9 +430,7 @@ describe("managed reload authored source", () => {
           await release.promise;
         }
       });
-      const activator = createRuntimeSecretsActivator({
-        ...activatorOptions(),
-        activateRuntimeSecretsSnapshot: activateSecretsRuntimeSnapshot,
+      const activator = createActivator({
         beforeSnapshotPublication,
       });
       let current = true;
@@ -447,19 +453,14 @@ describe("managed reload authored source", () => {
       await expect(pending).resolves.toBeNull();
       expect(published).not.toHaveBeenCalled();
       const survivor = supersession === "snapshot" ? successor : initial;
-      expect(beforeSnapshotPublication.mock.calls.map(([config]) => config)).toEqual([
-        candidate.config,
-        survivor.config,
-      ]);
-      expect(getActiveSecretsRuntimeSnapshotState()?.config).toEqual(survivor.config);
+      expectPublishedConfigs(beforeSnapshotPublication, candidate.config, survivor.config);
     },
   );
 
   it.each([false, true])(
     "durably publishes the exact three-way rollback (inside callback: %s)",
     async (insideCallback) => {
-      const initial = await prepare({ gateway: { port: 18789 } });
-      const candidate = await prepare({ gateway: { port: 18790 } });
+      const [initial, candidate] = await prepareCandidates();
       const descendant = await prepare({ gateway: { port: 18790, bind: "lan" } });
       const merged = { gateway: { port: 18789, bind: "lan" } };
       activateSecretsRuntimeSnapshot(initial);
@@ -468,9 +469,7 @@ describe("managed reload authored source", () => {
           config === candidate.config ? initial.config : descendant.config,
         );
       });
-      const activator = createRuntimeSecretsActivator({
-        ...activatorOptions(),
-        activateRuntimeSecretsSnapshot: activateSecretsRuntimeSnapshot,
+      const activator = createActivator({
         beforeSnapshotPublication,
       });
       let publishedRevision = 0;
@@ -500,11 +499,7 @@ describe("managed reload authored source", () => {
       if (!insideCallback) {
         await restoreMerged(activator.restoreSnapshotIfCurrent);
       }
-      expect(beforeSnapshotPublication.mock.calls.map(([config]) => config)).toEqual([
-        candidate.config,
-        merged,
-      ]);
-      expect(getActiveSecretsRuntimeSnapshotState()?.config).toEqual(merged);
+      expectPublishedConfigs(beforeSnapshotPublication, candidate.config, merged);
     },
   );
 
@@ -602,12 +597,8 @@ describe("managed reload authored source", () => {
     const { ownership, run } = await createReload(
       async () => {
         // The candidate is visible before commit; a cold synchronous reader can cache its limits.
-        expect(resolveContextTokensForModel({ model: "gpt-5.6-luna", allowAsyncLoad: false })).toBe(
-          65_536,
-        );
-        expect(
-          resolveContextTokensForModel({ model: candidateOnlyModel, allowAsyncLoad: false }),
-        ).toBe(16_384);
+        expectContextTokens("gpt-5.6-luna", 65_536);
+        expectContextTokens(candidateOnlyModel, 16_384);
         throw failure;
       },
       undefined,
@@ -631,12 +622,8 @@ describe("managed reload authored source", () => {
       expect(ownership.markRuntimeCommitted).not.toHaveBeenCalled();
       expectAuthoredSource(initial.source);
       expect(getActiveSecretsRuntimeSnapshotState()?.config).toEqual(initial.config);
-      expect(resolveContextTokensForModel({ model: "gpt-5.6-luna", allowAsyncLoad: false })).toBe(
-        32_768,
-      );
-      expect(
-        resolveContextTokensForModel({ model: candidateOnlyModel, allowAsyncLoad: false }),
-      ).toBeUndefined();
+      expectContextTokens("gpt-5.6-luna", 32_768);
+      expectContextTokens(candidateOnlyModel, undefined);
     })();
     await verification;
   });
