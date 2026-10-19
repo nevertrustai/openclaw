@@ -1,7 +1,7 @@
 import Foundation
-import OpenClawKit
 import OpenClawProtocol
 import Testing
+@testable import OpenClawKit
 
 struct GatewayConnectChallengeSupportTests {
     @Test func `parses gateway issued timestamp`() {
