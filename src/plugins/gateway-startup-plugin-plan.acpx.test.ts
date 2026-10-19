@@ -1,11 +1,24 @@
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import acpxManifest from "../../extensions/acpx/openclaw.plugin.json" with { type: "json" };
-import codexManifest from "../../extensions/codex/openclaw.plugin.json" with { type: "json" };
 import { materializePluginAutoEnableCandidates } from "../config/plugin-auto-enable.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveGatewayStartupPluginPlanFromRegistry } from "./gateway-startup-plugin-plan.js";
 import { createInstalledPluginIndexFixture } from "./gateway-startup.test-helpers.js";
 import type { PluginManifestRecord, PluginManifestRegistry } from "./manifest-registry.js";
+import { loadPluginManifest } from "./manifest.js";
+
+function loadBundledManifest(pluginId: string) {
+  const result = loadPluginManifest(
+    fileURLToPath(new URL(`../../extensions/${pluginId}/`, import.meta.url)),
+  );
+  if (!result.ok) {
+    throw new Error(result.error);
+  }
+  return result.manifest;
+}
+
+const acpxManifest = loadBundledManifest("acpx");
+const codexManifest = loadBundledManifest("codex");
 
 function createManifestRegistry(
   plugin: Pick<PluginManifestRecord, "id" | "enabledByDefault" | "activation" | "contracts">,
