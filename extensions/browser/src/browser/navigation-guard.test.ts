@@ -23,6 +23,18 @@ const PROXY_ENV_KEYS = [
   "all_proxy",
 ] as const;
 
+function strictPolicy(allowedHostnames: string[]) {
+  return { dangerouslyAllowPrivateNetwork: false, allowedHostnames };
+}
+
+type Request = Parameters<typeof assertBrowserNavigationRedirectChainAllowed>[0]["request"];
+function redirectChain(...urls: string[]): Request {
+  return urls.reduce<Request>(
+    (previous, url) => ({ url: () => url, redirectedFrom: () => previous ?? null }),
+    null,
+  );
+}
+
 describe("browser navigation guard", () => {
   beforeEach(() => {
     for (const key of PROXY_ENV_KEYS) {
@@ -36,18 +48,12 @@ describe("browser navigation guard", () => {
 
   it("blocks private loopback URLs by default", async () => {
     await expect(
-      assertBrowserNavigationAllowed({
-        url: "http://127.0.0.1:8080",
-      }),
+      assertBrowserNavigationAllowed({ url: "http://127.0.0.1:8080" }),
     ).rejects.toBeInstanceOf(SsrFBlockedError);
   });
 
   it("allows about:blank", async () => {
-    await expect(
-      assertBrowserNavigationAllowed({
-        url: "about:blank",
-      }),
-    ).resolves.toBeUndefined();
+    await expect(assertBrowserNavigationAllowed({ url: "about:blank" })).resolves.toBeUndefined();
   });
 
   it.each(["file:///etc/passwd", "about:srcdoc"])(
@@ -62,10 +68,7 @@ describe("browser navigation guard", () => {
   it("blocks hostnames that resolve to private addresses by default", async () => {
     const lookupFn = createLookupFn("127.0.0.1");
     await expect(
-      assertBrowserNavigationAllowed({
-        url: "https://example.com",
-        lookupFn,
-      }),
+      assertBrowserNavigationAllowed({ url: "https://example.com", lookupFn }),
     ).rejects.toBeInstanceOf(SsrFBlockedError);
   });
 
@@ -77,13 +80,7 @@ describe("browser navigation guard", () => {
       check: (options: Parameters<typeof assertBrowserNavigationAllowed>[0]) =>
         assertBrowserNavigationRedirectChainAllowed({
           ...options,
-          request: {
-            url: () => options.url,
-            redirectedFrom: () => ({
-              url: () => "https://example.com/start",
-              redirectedFrom: () => null,
-            }),
-          },
+          request: redirectChain("https://example.com/start", options.url),
         }),
     },
   ])("cancels a stalled $name DNS check without waiting for lookup", async ({ check }) => {
@@ -123,10 +120,7 @@ describe("browser navigation guard", () => {
       assertBrowserNavigationAllowed({
         url: "https://agent.internal",
         lookupFn,
-        ssrfPolicy: {
-          dangerouslyAllowPrivateNetwork: false,
-          allowedHostnames: ["agent.internal"],
-        },
+        ssrfPolicy: strictPolicy(["agent.internal"]),
       }),
     ).resolves.toBeUndefined();
   });
@@ -137,10 +131,7 @@ describe("browser navigation guard", () => {
       assertBrowserNavigationAllowed({
         url: "https://sub.example.com",
         lookupFn,
-        ssrfPolicy: {
-          dangerouslyAllowPrivateNetwork: false,
-          allowedHostnames: ["*.example.com"],
-        },
+        ssrfPolicy: strictPolicy(["*.example.com"]),
       }),
     ).resolves.toBeUndefined();
   });
@@ -153,10 +144,7 @@ describe("browser navigation guard", () => {
         assertBrowserNavigationAllowed({
           url: `https://${hostname}`,
           lookupFn,
-          ssrfPolicy: {
-            dangerouslyAllowPrivateNetwork: false,
-            allowedHostnames: ["*.example.com"],
-          },
+          ssrfPolicy: strictPolicy(["*.example.com"]),
         }),
       ).rejects.toThrow(/dns rebinding protections are unavailable/i);
       expect(lookupFn).not.toHaveBeenCalled();
@@ -167,10 +155,7 @@ describe("browser navigation guard", () => {
     vi.stubEnv("HTTP_PROXY", "http://127.0.0.1:7890");
     const lookupFn = createLookupFn("93.184.216.34");
     await expect(
-      assertBrowserNavigationAllowed({
-        url: "https://example.com",
-        lookupFn,
-      }),
+      assertBrowserNavigationAllowed({ url: "https://example.com", lookupFn }),
     ).resolves.toBeUndefined();
     expect(lookupFn).toHaveBeenCalledWith("example.com", { all: true });
   });
@@ -200,11 +185,9 @@ describe("browser navigation guard", () => {
   });
 
   it("rejects invalid URLs", async () => {
-    await expect(
-      assertBrowserNavigationAllowed({
-        url: "not a url",
-      }),
-    ).rejects.toBeInstanceOf(InvalidBrowserNavigationUrlError);
+    await expect(assertBrowserNavigationAllowed({ url: "not a url" })).rejects.toBeInstanceOf(
+      InvalidBrowserNavigationUrlError,
+    );
   });
 
   it("blocks network URLs with embedded credentials before lookup", async () => {
@@ -220,18 +203,14 @@ describe("browser navigation guard", () => {
   });
 
   it("redacts malformed credential-bearing URLs from diagnostics", async () => {
-    const result = assertBrowserNavigationAllowed({
-      url: "https://user:secret@",
-    });
+    const result = assertBrowserNavigationAllowed({ url: "https://user:secret@" });
     await expect(result).rejects.toThrow("Invalid URL: [redacted credential-bearing URL]");
     await expect(result).rejects.not.toThrow("secret");
   });
 
   it("ignores non-network browser-internal final URLs", async () => {
     await expect(
-      assertBrowserNavigationResultAllowed({
-        url: "chrome-error://chromewebdata/",
-      }),
+      assertBrowserNavigationResultAllowed({ url: "chrome-error://chromewebdata/" }),
     ).resolves.toBeUndefined();
   });
 
@@ -247,20 +226,13 @@ describe("browser navigation guard", () => {
   it("blocks private intermediate redirect hops", async () => {
     const publicLookup = createLookupFn("93.184.216.34");
     const privateLookup = createLookupFn("127.0.0.1");
-    const finalRequest = {
-      url: () => "https://public.example/final",
-      redirectedFrom: () => ({
-        url: () => "http://private.example/internal",
-        redirectedFrom: () => ({
-          url: () => "https://public.example/start",
-          redirectedFrom: () => null,
-        }),
-      }),
-    };
-
     await expect(
       assertBrowserNavigationRedirectChainAllowed({
-        request: finalRequest,
+        request: redirectChain(
+          "https://public.example/start",
+          "http://private.example/internal",
+          "https://public.example/final",
+        ),
         lookupFn: vi.fn(async (hostname: string) =>
           hostname === "private.example"
             ? privateLookup(hostname, { all: true })
@@ -272,20 +244,13 @@ describe("browser navigation guard", () => {
 
   it("allows redirect chains when every hop is public", async () => {
     const lookupFn = createLookupFn("93.184.216.34");
-    const finalRequest = {
-      url: () => "https://public.example/final",
-      redirectedFrom: () => ({
-        url: () => "https://public.example/middle",
-        redirectedFrom: () => ({
-          url: () => "https://public.example/start",
-          redirectedFrom: () => null,
-        }),
-      }),
-    };
-
     await expect(
       assertBrowserNavigationRedirectChainAllowed({
-        request: finalRequest,
+        request: redirectChain(
+          "https://public.example/start",
+          "https://public.example/middle",
+          "https://public.example/final",
+        ),
         lookupFn,
       }),
     ).resolves.toBeUndefined();

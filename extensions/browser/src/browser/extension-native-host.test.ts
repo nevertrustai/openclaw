@@ -48,6 +48,9 @@ function requestJson(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({ v: 1, op: "bootstrap", nonce: NONCE, ...overrides });
 }
 
+const pairing = async () => ({ pairingString: PAIRING, topology: "local" });
+const failure = (code: string) => ({ v: 1, ok: false, code });
+
 async function* chunks(...values: Buffer[]) {
   for (const value of values) {
     yield value;
@@ -153,7 +156,7 @@ async function invokeHost(overrides: Partial<Parameters<typeof runBrowserNativeH
     expectedOrigins: [ORIGIN],
     input: chunks(frame(requestJson())),
     write: (value) => writes.push(value),
-    buildPairing: async () => ({ pairingString: PAIRING, topology: "local" }),
+    buildPairing: pairing,
     ensureRelay: async () => "skipped",
     ...overrides,
   });
@@ -219,11 +222,11 @@ describe("native host origin and topology boundary", () => {
         await substitute(args[0]);
         return open(...args);
       });
-      const buildPairing = vi.fn(async () => ({ pairingString: PAIRING, topology: "local" }));
+      const buildPairing = vi.fn(pairing);
       try {
         const result = await invokeHost({ ...fixture, buildPairing });
         expect(substituted).toBe(true);
-        expect(result.response).toEqual({ v: 1, ok: false, code: "manifest_invalid" });
+        expect(result.response).toEqual(failure("manifest_invalid"));
         expect(buildPairing).not.toHaveBeenCalled();
       } finally {
         openSpy.mockRestore();
@@ -237,28 +240,18 @@ describe("native host origin and topology boundary", () => {
     async (file, mode) => {
       const fixture = await nativeFixture();
       await fs.chmod(fixture[file], mode);
-      const buildPairing = vi.fn(async () => ({ pairingString: PAIRING, topology: "local" }));
+      const buildPairing = vi.fn(pairing);
       const result = await invokeHost({ ...fixture, buildPairing });
-      expect(result.response).toEqual({ v: 1, ok: false, code: "manifest_invalid" });
+      expect(result.response).toEqual(failure("manifest_invalid"));
       expect(buildPairing).not.toHaveBeenCalled();
     },
   );
 
   it("rejects a manifest with an extra valid origin before building pairing", async () => {
     const fixture = await nativeFixture([ORIGIN, OTHER_ORIGIN]);
-    const buildPairing = vi.fn(async () => ({ pairingString: PAIRING, topology: "local" }));
-
-    const response = await runBrowserNativeHost({
-      ...fixture,
-      callerOrigin: ORIGIN,
-      expectedOrigins: [ORIGIN],
-      input: chunks(frame(requestJson())),
-      write: vi.fn(),
-      buildPairing,
-      ensureRelay: async () => "skipped",
-    });
-
-    expect(response).toEqual({ v: 1, ok: false, code: "manifest_invalid" });
+    const buildPairing = vi.fn(pairing);
+    const { response } = await invokeHost({ ...fixture, buildPairing });
+    expect(response).toEqual(failure("manifest_invalid"));
     expect(buildPairing).not.toHaveBeenCalled();
   });
 
@@ -267,14 +260,10 @@ describe("native host origin and topology boundary", () => {
       invokeHost({
         buildPairing: async () => ({ pairingString: PAIRING, topology: "direct-remote" }),
       }).then((result) => result.response),
-    ).resolves.toEqual({ v: 1, ok: false, code: "manual_required" });
+    ).resolves.toEqual(failure("manual_required"));
     await expect(
       invokeHost({ platform: "win32" }).then((result) => result.response),
-    ).resolves.toEqual({
-      v: 1,
-      ok: false,
-      code: "manual_required",
-    });
+    ).resolves.toEqual(failure("manual_required"));
   });
 });
 
@@ -289,7 +278,7 @@ describe("native host ensure_relay", () => {
   ])("rejects %s without invoking the relay launcher", async (_label, raw) => {
     const ensureRelay = vi.fn(async () => "spawned" as const);
     const result = await invokeHost({ input: chunks(frame(raw)), ensureRelay });
-    expect(result.response).toEqual({ v: 1, ok: false, code: "invalid_request" });
+    expect(result.response).toEqual(failure("invalid_request"));
     expect(ensureRelay).not.toHaveBeenCalled();
   });
 
@@ -306,7 +295,7 @@ describe("native host ensure_relay", () => {
             entryPath: "/opt/openclaw/dist/extensions/browser/relay-daemon-entry.js",
           }),
       });
-      expect(result.response).toEqual({ v: 1, ok: false, code: "relay_unavailable" });
+      expect(result.response).toEqual(failure("relay_unavailable"));
       expect(probe).not.toHaveBeenCalled();
       expect(spawn).not.toHaveBeenCalled();
     },
@@ -347,9 +336,7 @@ describe("native host ensure_relay", () => {
                     browser: {
                       profiles: {
                         chrome: { driver: "extension" },
-                        work: {
-                          driver: "extension",
-                        },
+                        work: { driver: "extension" },
                       },
                     },
                   },
@@ -379,7 +366,7 @@ describe("native host ensure_relay", () => {
       callerOrigin: OTHER_ORIGIN,
       ensureRelay,
     });
-    expect(result.response).toEqual({ v: 1, ok: false, code: "origin_forbidden" });
+    expect(result.response).toEqual(failure("origin_forbidden"));
     expect(ensureRelay).not.toHaveBeenCalled();
   });
 });
