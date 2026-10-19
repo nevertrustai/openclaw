@@ -1,22 +1,13 @@
-import type { AgentSideConnection, PromptRequest, PromptResponse } from "@agentclientprotocol/sdk";
-import { createInMemorySessionStore } from "@openclaw/acp-core/session";
+import type { PromptResponse } from "@agentclientprotocol/sdk";
 import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, vi } from "vitest";
 import type { EventFrame } from "../../packages/gateway-protocol/src/index.js";
 import { createDeferred, withinTest } from "../../test/helpers/promise.js";
-import type { GatewayClient } from "../gateway/client.js";
-import {
-  createAcpConnection,
-  createAcpGateway,
-  createAcpGatewayAgent,
-} from "./translator.test-helpers.js";
+import { promptAgent } from "./translator.prompt-harness.test-support.js";
+import { createTranslatorScenario, expectSingleCall } from "./translator.scenario.test-support.js";
 
 const SESSION_KEY = "agent:main:shared";
 const SESSION_ID = "session-1";
-
-function promptRequest(sessionId = SESSION_ID, text = "hello"): PromptRequest {
-  return { sessionId, prompt: [{ type: "text", text }], _meta: {} };
-}
 
 function chat(runId: string, payload: Record<string, unknown> = {}): EventFrame {
   return {
@@ -40,43 +31,44 @@ function tool(runId: string, toolCallId = "tool-2"): EventFrame {
 }
 
 function createHarness(
-  options: { sessions?: string[]; accepted?: boolean; provenanceMode?: "meta" } = {},
+  options: {
+    sessions?: string[];
+    accepted?: boolean;
+    provenanceMode?: "meta";
+    send?: () => Promise<Record<string, unknown>>;
+  } = {},
 ) {
-  const sentRunIds: string[] = [];
-  const requestSpy = vi.fn(
+  const runIds: string[] = [];
+  const request = vi.fn(
     async (method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> => {
       if (method === "chat.send") {
         const runId = expectDefined(params?.idempotencyKey as string | undefined, "Gateway run id");
-        sentRunIds.push(runId);
+        runIds.push(runId);
+        if (options.send) {
+          return options.send();
+        }
         return options.accepted ? { runId, status: "started" } : new Promise<never>(() => {});
       }
       return {};
     },
   );
-  const connection = createAcpConnection();
-  const sessionUpdateSpy = vi.fn<AgentSideConnection["sessionUpdate"]>(async () => {});
-  connection.sessionUpdate = sessionUpdateSpy;
-  const sessionStore = createInMemorySessionStore();
-  for (const sessionId of options.sessions ?? [SESSION_ID]) {
-    sessionStore.createSession({ sessionId, sessionKey: SESSION_KEY, cwd: "/tmp" });
-  }
-  const agent = createAcpGatewayAgent(
-    connection,
-    createAcpGateway(requestSpy as GatewayClient["request"]),
-    { sessionStore, provenanceMode: options.provenanceMode },
-  );
-  return { agent, requestSpy, sessionUpdateSpy, sessionStore, sentRunIds };
+  const { agent, sessionStore, sessionUpdate } = createTranslatorScenario(request, {
+    sessions: options.sessions,
+    sessionKey: SESSION_KEY,
+    provenanceMode: options.provenanceMode,
+  });
+  return { agent, request, sessionUpdate, sessionStore, runIds };
 }
 
 type Harness = ReturnType<typeof createHarness>;
 type Pending = { promptPromise: Promise<PromptResponse>; runId: string };
 
-function blockAbort(harness: Harness, first: Pending) {
+function blockAbort(h: Harness, first: Pending) {
   const settled = vi.fn();
   void first.promptPromise.then(settled);
   const started = createDeferred();
   const released = createDeferred();
-  harness.requestSpy.mockImplementationOnce(async (method) => {
+  h.request.mockImplementationOnce(async (method) => {
     expect(method).toBe("chat.abort");
     expect(settled).not.toHaveBeenCalled();
     started.resolve();
@@ -86,82 +78,87 @@ function blockAbort(harness: Harness, first: Pending) {
   return { started: started.promise, release: released.resolve };
 }
 
-async function start(harness: Harness, sessionId = SESSION_ID): Promise<Pending> {
-  const before = harness.sentRunIds.length;
-  const promptPromise = harness.agent.prompt(promptRequest(sessionId));
-  await vi.waitFor(() => expect(harness.sentRunIds).toHaveLength(before + 1));
+async function start(h: Harness, sessionId = SESSION_ID): Promise<Pending> {
+  const before = h.runIds.length;
+  const promptPromise = promptAgent(h.agent, sessionId);
+  await vi.waitFor(() => expect(h.runIds).toHaveLength(before + 1));
   return {
     promptPromise,
-    runId: expectDefined(harness.sentRunIds[before], "submitted run id"),
+    runId: expectDefined(h.runIds[before], "submitted run id"),
   };
 }
 
-async function finish(harness: Harness, pending: Pending, seq = 1) {
-  await harness.agent.handleGatewayEvent(chat(pending.runId, { seq }));
+async function finish(h: Harness, pending: Pending, seq = 1) {
+  await h.agent.handleGatewayEvent(chat(pending.runId, { seq }));
   await expect(pending.promptPromise).resolves.toEqual({ stopReason: "end_turn" });
 }
 
-function expectAbort(harness: Harness, runId: string) {
-  expect(harness.requestSpy).toHaveBeenCalledWith("chat.abort", { sessionKey: SESSION_KEY, runId });
+function expectAbort(h: Harness, runId: string) {
+  expect(h.request).toHaveBeenCalledWith("chat.abort", { sessionKey: SESSION_KEY, runId });
+}
+
+async function blockedReplacement(accepted = false, text = "hello") {
+  const h = createHarness({ accepted });
+  const first = await start(h);
+  const abort = blockAbort(h, first);
+  const replacement = promptAgent(h.agent, SESSION_ID, text);
+  await abort.started;
+  return { h, first, abort, replacement };
 }
 
 describe("acp translator cancel and run scoping", () => {
   it("closes a replacement while its prior abort is pending and removes the session", async () => {
-    const harness = createHarness();
-    const first = await start(harness);
-    const abort = blockAbort(harness, first);
-    const replacement = harness.agent.prompt(promptRequest());
-    await abort.started;
-    const closed = harness.agent.closeSession({ sessionId: SESSION_ID, _meta: {} });
-    expectAbort(harness, first.runId);
-    expect(harness.sentRunIds).toEqual([first.runId]);
+    const { h, first, abort, replacement } = await blockedReplacement();
+    const closed = h.agent.closeSession({ sessionId: SESSION_ID, _meta: {} });
+    expectAbort(h, first.runId);
+    expect(h.runIds).toEqual([first.runId]);
     abort.release();
     await expect(closed).resolves.toEqual({});
-    expect(harness.sentRunIds).toEqual([first.runId]);
+    expect(h.runIds).toEqual([first.runId]);
     await expect(first.promptPromise).resolves.toEqual({ stopReason: "cancelled" });
     await expect(replacement).resolves.toEqual({ stopReason: "cancelled" });
-    expect(harness.sessionStore.getSession(SESSION_ID)).toBeUndefined();
+    expect(h.sessionStore.getSession(SESSION_ID)).toBeUndefined();
   });
 
   it("settles shutdown when a superseded prompt's abort never returns", async () => {
-    const harness = createHarness();
-    const first = await start(harness);
-    harness.requestSpy.mockImplementationOnce(async (method) => {
+    const h = createHarness();
+    const first = await start(h);
+    h.request.mockImplementationOnce(async (method) => {
       expect(method).toBe("chat.abort");
       return new Promise<never>(() => {});
     });
-    const replacement = harness.agent.prompt(promptRequest());
-    await vi.waitFor(() => expectAbort(harness, first.runId));
+    const replacement = promptAgent(h.agent);
+    await vi.waitFor(() => expectAbort(h, first.runId));
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const result = await Promise.race([
-      harness.agent.shutdown().then(() => "closed"),
+      h.agent.shutdown().then(() => "closed"),
       new Promise<string>((resolve) => {
         timeout = setTimeout(() => resolve("still pending"), 25);
       }),
     ]);
     clearTimeout(timeout);
     expect(result).toBe("closed");
-    expect(harness.sentRunIds).toEqual([first.runId]);
+    expect(h.runIds).toEqual([first.runId]);
     await expect(replacement).resolves.toEqual({ stopReason: "cancelled" });
   });
 
   it("closes an admitted prompt when shutdown interrupts its blocked final snapshot", async ({
     signal,
   }) => {
-    const harness = createHarness({ accepted: true });
-    const pending = await start(harness);
+    const h = createHarness({ accepted: true });
+    const pending = await start(h);
     const started = createDeferred();
     const snapshot = createDeferred<Record<string, unknown>>();
-    harness.requestSpy.mockImplementation(async (method) => {
+    h.request.mockImplementation(async (method) => {
       if (method === "sessions.list") {
         started.resolve();
         return snapshot.promise;
       }
       return {};
     });
-    const terminalEvent = harness.agent.handleGatewayEvent(chat(pending.runId));
+    const terminalEvent = h.agent.handleGatewayEvent(chat(pending.runId));
     await started.promise;
-    const shutdown = harness.agent.shutdown();
+    const shutdown = h.agent.shutdown();
     try {
       await withinTest(shutdown, signal);
       await expect(pending.promptPromise).resolves.toEqual({ stopReason: "cancelled" });
@@ -173,64 +170,51 @@ describe("acp translator cancel and run scoping", () => {
   });
 
   it("closes every queued overlapping admission when cancellation wins the blocked abort", async () => {
-    const harness = createHarness();
-    const first = await start(harness);
-    const abort = blockAbort(harness, first);
-    const second = harness.agent.prompt(promptRequest());
-    await abort.started;
-    const third = harness.agent.prompt(promptRequest());
-    const cancellation = harness.agent.cancel({ sessionId: SESSION_ID });
+    const { h, first, abort, replacement: second } = await blockedReplacement();
+    const third = promptAgent(h.agent);
+    const cancellation = h.agent.cancel({ sessionId: SESSION_ID });
     abort.release();
     await cancellation;
-    expect(harness.sentRunIds).toEqual([first.runId]);
+    expect(h.runIds).toEqual([first.runId]);
     for (const prompt of [first.promptPromise, second, third]) {
       await expect(prompt).resolves.toEqual({ stopReason: "cancelled" });
     }
   });
 
   it("submits only the latest of three overlapping prompts after the active abort settles", async () => {
-    const harness = createHarness({ accepted: true });
-    const first = await start(harness);
-    const abort = blockAbort(harness, first);
-    const second = harness.agent.prompt(promptRequest(SESSION_ID, "second"));
-    await abort.started;
-    const third = harness.agent.prompt(promptRequest(SESSION_ID, "third"));
+    const { h, first, abort, replacement: second } = await blockedReplacement(true, "second");
+    const third = promptAgent(h.agent, SESSION_ID, "third");
     await Promise.resolve();
-    expectAbort(harness, first.runId);
-    expect(harness.sentRunIds).toEqual([first.runId]);
+    expectAbort(h, first.runId);
+    expect(h.runIds).toEqual([first.runId]);
     abort.release();
-    await vi.waitFor(() => expect(harness.sentRunIds).toHaveLength(2));
+    await vi.waitFor(() => expect(h.runIds).toHaveLength(2));
     await expect(first.promptPromise).resolves.toEqual({ stopReason: "cancelled" });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
-    expect(harness.requestSpy.mock.calls.map(([method]) => method)).toEqual([
+    expect(h.request.mock.calls.map(([method]) => method)).toEqual([
       "chat.send",
       "chat.abort",
       "chat.send",
     ]);
     expect(
-      harness.requestSpy.mock.calls
+      h.request.mock.calls
         .filter(([method]) => method === "chat.send")
         .map(([, params]) => params?.message),
     ).toEqual(["[Working directory: /tmp]\n\nhello", "[Working directory: /tmp]\n\nthird"]);
-    const runId = expectDefined(harness.sentRunIds[1], "latest admitted run");
-    expect(harness.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(runId);
-    await finish(harness, { promptPromise: third, runId });
+    const runId = expectDefined(h.runIds[1], "latest admitted run");
+    expect(h.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(runId);
+    await finish(h, { promptPromise: third, runId });
   });
 
   it("does not replay a superseded prompt after its delayed provenance rejection", async () => {
-    const harness = createHarness({ provenanceMode: "meta" });
     const firstSend = createDeferred<Record<string, unknown>>();
-    harness.requestSpy.mockImplementation(async (method, params) => {
-      if (method !== "chat.send") {
-        return {};
-      }
-      harness.sentRunIds.push(
-        expectDefined(params?.idempotencyKey as string | undefined, "Gateway run id"),
-      );
-      return harness.sentRunIds.length === 1 ? firstSend.promise : new Promise<never>(() => {});
+    let sends = 0;
+    const h = createHarness({
+      provenanceMode: "meta",
+      send: () => (sends++ === 0 ? firstSend.promise : new Promise<never>(() => {})),
     });
-    const first = await start(harness);
-    const replacement = await start(harness);
+    const first = await start(h);
+    const replacement = await start(h);
     await expect(first.promptPromise).resolves.toEqual({ stopReason: "cancelled" });
     firstSend.reject(
       Object.assign(new Error("system provenance fields require admin scope"), {
@@ -241,53 +225,53 @@ describe("acp translator cancel and run scoping", () => {
     await new Promise<void>((resolve) => {
       setTimeout(resolve, 0);
     });
-    expect(harness.sentRunIds).toEqual([first.runId, replacement.runId]);
-    expect(harness.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(replacement.runId);
-    await finish(harness, replacement);
+    expect(h.runIds).toEqual([first.runId, replacement.runId]);
+    expect(h.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(replacement.runId);
+    await finish(h, replacement);
   });
 
   it("does not let a stale cancel completion remove a newer prompt", async () => {
-    const harness = createHarness();
-    const first = await start(harness);
-    const abort = blockAbort(harness, first);
-    const cancellation = harness.agent.cancel({ sessionId: SESSION_ID });
+    const h = createHarness();
+    const first = await start(h);
+    const abort = blockAbort(h, first);
+    const cancellation = h.agent.cancel({ sessionId: SESSION_ID });
     await abort.started;
-    const replacement = await start(harness);
+    const replacement = await start(h);
     abort.release();
     await cancellation;
     await expect(first.promptPromise).resolves.toEqual({ stopReason: "cancelled" });
-    expect(harness.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(replacement.runId);
-    await finish(harness, replacement);
+    expect(h.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(replacement.runId);
+    await finish(h, replacement);
   });
 
   it("cancel uses pending runId when there is no active run", async () => {
-    const harness = createHarness();
-    const pending = await start(harness);
-    harness.sessionStore.clearActiveRun(SESSION_ID);
-    await harness.agent.cancel({ sessionId: SESSION_ID });
-    expectAbort(harness, pending.runId);
+    const h = createHarness();
+    const pending = await start(h);
+    h.sessionStore.clearActiveRun(SESSION_ID);
+    await h.agent.cancel({ sessionId: SESSION_ID });
+    expectAbort(h, pending.runId);
     await expect(pending.promptPromise).resolves.toEqual({ stopReason: "cancelled" });
   });
 
   it("cancel from an idle session does not abort another session sharing its key", async () => {
-    const harness = createHarness({ sessions: [SESSION_ID, "session-2"] });
-    const pending = await start(harness, "session-2");
-    await harness.agent.cancel({ sessionId: SESSION_ID });
-    expect(harness.requestSpy.mock.calls.filter(([method]) => method === "chat.abort")).toEqual([]);
-    expect(harness.sessionStore.getSession("session-2")?.activeRunId).toBe(pending.runId);
-    await finish(harness, pending);
+    const h = createHarness({ sessions: [SESSION_ID, "session-2"] });
+    const pending = await start(h, "session-2");
+    await h.agent.cancel({ sessionId: SESSION_ID });
+    expect(h.request.mock.calls.filter(([method]) => method === "chat.abort")).toEqual([]);
+    expect(h.sessionStore.getSession("session-2")?.activeRunId).toBe(pending.runId);
+    await finish(h, pending);
   });
 
   it("drops stale text from a final snapshot after replacement during thought delivery", async () => {
-    const harness = createHarness();
-    const first = await start(harness);
+    const h = createHarness();
+    const first = await start(h);
     const started = createDeferred();
     const released = createDeferred();
-    harness.sessionUpdateSpy.mockImplementationOnce(async () => {
+    h.sessionUpdate.mockImplementationOnce(async () => {
       started.resolve();
       await released.promise;
     });
-    const staleSnapshot = harness.agent.handleGatewayEvent(
+    const staleSnapshot = h.agent.handleGatewayEvent(
       chat(first.runId, {
         message: {
           content: [
@@ -298,50 +282,43 @@ describe("acp translator cancel and run scoping", () => {
       }),
     );
     await started.promise;
-    expect(harness.sessionUpdateSpy).toHaveBeenCalledWith({
+    expect(h.sessionUpdate).toHaveBeenCalledWith({
       sessionId: SESSION_ID,
       update: {
         sessionUpdate: "agent_thought_chunk",
         content: { type: "text", text: "old hidden thought" },
       },
     });
-    const replacement = await start(harness);
+    const replacement = await start(h);
     released.resolve();
     await staleSnapshot;
     expect(
-      harness.sessionUpdateSpy.mock.calls.filter(
+      h.sessionUpdate.mock.calls.filter(
         ([payload]) => payload.update.sessionUpdate === "agent_message_chunk",
       ),
     ).toEqual([]);
-    expect(harness.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(replacement.runId);
+    expect(h.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(replacement.runId);
     await expect(first.promptPromise).resolves.toEqual({ stopReason: "cancelled" });
-    await finish(harness, replacement, 2);
+    await finish(h, replacement, 2);
   });
 
   it("routes only matching run events when session keys are shared", async () => {
-    const harness = createHarness({ sessions: [SESSION_ID, "session-2"] });
-    const first = await start(harness);
-    const second = await start(harness, "session-2");
-    harness.sessionUpdateSpy.mockClear();
-    await harness.agent.handleGatewayEvent(chat("run-other"));
-    await harness.agent.handleGatewayEvent(tool("run-other"));
-    expect(harness.sessionUpdateSpy).not.toHaveBeenCalled();
-    expect(harness.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(first.runId);
-    expect(harness.sessionStore.getSession("session-2")?.activeRunId).toBe(second.runId);
-    await harness.agent.handleGatewayEvent(tool(second.runId));
-    expect(harness.sessionUpdateSpy).toHaveBeenCalledTimes(1);
-    expect(harness.sessionUpdateSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionId: "session-2",
-        update: expect.objectContaining({
-          sessionUpdate: "tool_call",
-          toolCallId: "tool-2",
-          status: "in_progress",
-        }),
-      }),
-    );
-    await finish(harness, second, 2);
-    expect(harness.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(first.runId);
-    await finish(harness, first, 3);
+    const h = createHarness({ sessions: [SESSION_ID, "session-2"] });
+    const first = await start(h);
+    const second = await start(h, "session-2");
+    h.sessionUpdate.mockClear();
+    await h.agent.handleGatewayEvent(chat("run-other"));
+    await h.agent.handleGatewayEvent(tool("run-other"));
+    expect(h.sessionUpdate).not.toHaveBeenCalled();
+    expect(h.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(first.runId);
+    expect(h.sessionStore.getSession("session-2")?.activeRunId).toBe(second.runId);
+    await h.agent.handleGatewayEvent(tool(second.runId));
+    expectSingleCall(h.sessionUpdate, {
+      sessionId: "session-2",
+      update: { sessionUpdate: "tool_call", toolCallId: "tool-2", status: "in_progress" },
+    });
+    await finish(h, second, 2);
+    expect(h.sessionStore.getSession(SESSION_ID)?.activeRunId).toBe(first.runId);
+    await finish(h, first, 3);
   });
 });

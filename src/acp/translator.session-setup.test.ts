@@ -1,7 +1,5 @@
-import type { SessionUpdate } from "@agentclientprotocol/sdk";
-import { createInMemorySessionStore } from "@openclaw/acp-core/session";
+import type { NewSessionResponse, SessionUpdate } from "@agentclientprotocol/sdk";
 import { describe, expect, it, vi } from "vitest";
-import type { GatewayClient } from "../gateway/client.js";
 import { isAcpSessionKey } from "../sessions/session-key-utils.js";
 import {
   createNewSessionRequest,
@@ -16,11 +14,7 @@ import {
   expectSessionUpdate,
 } from "./translator.bridge-test-helpers.js";
 import type { GatewaySessionPresentationRow } from "./translator.presentation.js";
-import {
-  createAcpConnection,
-  createAcpGateway,
-  createAcpGatewayAgent,
-} from "./translator.test-helpers.js";
+import { createTranslatorScenario } from "./translator.scenario.test-support.js";
 
 vi.mock("./commands.js", () => ({ getAvailableCommands: () => [] }));
 
@@ -35,11 +29,7 @@ const row: GatewaySessionPresentationRow = {
   thinkingLevel: "high",
   modelProvider: "openai",
   model: "gpt-5.4",
-  thinkingLevels: [
-    { id: "off", label: "off" },
-    { id: "medium", label: "medium" },
-    { id: "max", label: "max" },
-  ],
+  thinkingLevels: ["off", "medium", "max"].map((id) => ({ id, label: id })),
   verboseLevel: "full",
   reasoningLevel: "stream",
   responseUsage: "tokens",
@@ -56,8 +46,6 @@ function harness(
     sessionCreateRateLimit?: { maxRequests: number; windowMs: number };
   } = {},
 ) {
-  const sessionStore = createInMemorySessionStore();
-  const connection = createAcpConnection();
   const request = vi.fn(async (method: string) => {
     if (method === "sessions.list" && options.row) {
       return { sessions: [options.row] };
@@ -70,18 +58,17 @@ function harness(
     }
     return { ok: true };
   });
-  const agent = createAcpGatewayAgent(
-    connection,
-    createAcpGateway(request as GatewayClient["request"]),
-    {
-      sessionStore,
-      sessionCreateRateLimit: options.sessionCreateRateLimit,
-    },
-  );
-  const sessionUpdate = connection["__sessionUpdateMock"];
+  const { agent, sessionStore, sessionUpdate } = createTranslatorScenario(request, {
+    sessions: [],
+    sessionCreateRateLimit: options.sessionCreateRateLimit,
+  });
   const expectUpdate = (update: SessionUpdate) =>
     expect(sessionUpdate).toHaveBeenCalledWith({ sessionId, update });
   return { agent, request, sessionStore, sessionUpdate, expectUpdate };
+}
+
+function expectModes(modes: NewSessionResponse["modes"], currentModeId: string, ids: string[]) {
+  expect(modes).toMatchObject({ currentModeId, availableModes: ids.map((id) => ({ id })) });
 }
 
 describe("ACP session bridge", () => {
@@ -102,15 +89,7 @@ describe("ACP session bridge", () => {
     const key = sessionStore.getSession(result.sessionId)?.sessionKey;
     expect(key).toMatch(/^acp-bridge:/);
     expect(isAcpSessionKey(key)).toBe(false);
-    expect(result.modes?.currentModeId).toBe("adaptive");
-    expect(result.modes?.availableModes.map((mode) => mode.id)).toEqual([
-      "off",
-      "minimal",
-      "low",
-      "medium",
-      "high",
-      "adaptive",
-    ]);
+    expectModes(result.modes, "adaptive", ["off", "minimal", "low", "medium", "high", "adaptive"]);
     expectConfigOption(result.configOptions, "thought_level", {
       currentValue: "adaptive",
       category: "thought_level",
@@ -140,13 +119,7 @@ describe("ACP session bridge", () => {
       }),
     });
     const result = await agent.loadSession(createLoadSessionRequest(sessionId));
-    expect(result.modes?.currentModeId).toBe("high");
-    expect(result.modes?.availableModes.map((mode) => mode.id)).toEqual([
-      "off",
-      "medium",
-      "max",
-      "high",
-    ]);
+    expectModes(result.modes, "high", ["off", "medium", "max", "high"]);
     for (const [id, currentValue] of Object.entries({
       thought_level: "high",
       verbose_level: "full",
@@ -164,7 +137,6 @@ describe("ACP session bridge", () => {
       expectUpdate({ sessionUpdate: kind, content: { type: "text", text } });
     }
     expectSessionUpdate(sessionUpdate, sessionId, "available_commands_update");
-    expectSessionUpdate(sessionUpdate, sessionId, "session_info_update");
     expectUpdate({
       sessionUpdate: "session_info_update",
       title: "Fix ACP bridge",
@@ -290,46 +262,36 @@ describe("acp session configuration", () => {
     await expect(setMode()).rejects.toThrow(/gateway rejected mode/i);
   });
 
-  it("emits current mode and thought-level config updates after a successful mode change", async () => {
-    const { setMode, request, sessionUpdate } = await configFixture();
-    await expect(setMode()).resolves.toEqual({});
-    expect(request).toHaveBeenCalledWith("sessions.patch", {
-      key: "session",
-      thinkingLevel: "high",
-    });
-    expect(sessionUpdate).toHaveBeenCalledWith({
-      sessionId: "session",
-      update: { sessionUpdate: "current_mode_update", currentModeId: "high" },
-    });
-    expectConfigOption(
-      expectSessionUpdate(sessionUpdate, "session", "config_option_update").configOptions,
-      "thought_level",
-      { currentValue: "high" },
-    );
-  });
-
   it.each([
-    { id: "thought_level", value: "minimal", patch: { thinkingLevel: "minimal" } },
-    { id: "fast_mode", value: "on", patch: { fastMode: true } },
-    { id: "response_usage", value: "inherit", patch: { responseUsage: null } },
-    { id: "response_usage", value: "off", patch: { responseUsage: "off" } },
-  ])("patches $id=$value and returns refreshed controls", async ({ id, value, patch }) => {
-    const { setOption, request, sessionUpdate } = await configFixture();
-    const result = await setOption(id, value);
-    expect(request).toHaveBeenCalledWith("sessions.patch", { key: "session", ...patch });
-    expectConfigOption(result.configOptions, id, { currentValue: value });
-    expectConfigOption(
-      expectSessionUpdate(sessionUpdate, "session", "config_option_update").configOptions,
-      id,
-      { currentValue: value },
-    );
-    if (id === "thought_level") {
-      expect(sessionUpdate).toHaveBeenCalledWith({
-        sessionId: "session",
-        update: { sessionUpdate: "current_mode_update", currentModeId: "minimal" },
-      });
-    }
-  });
+    { route: "mode", id: "thought_level", value: "high", patch: { thinkingLevel: "high" } },
+    { route: "config", id: "thought_level", value: "minimal", patch: { thinkingLevel: "minimal" } },
+    { route: "config", id: "fast_mode", value: "on", patch: { fastMode: true } },
+    { route: "config", id: "response_usage", value: "inherit", patch: { responseUsage: null } },
+    { route: "config", id: "response_usage", value: "off", patch: { responseUsage: "off" } },
+  ])(
+    "patches $id=$value via $route and refreshes controls",
+    async ({ route, id, value, patch }) => {
+      const { setMode, setOption, request, sessionUpdate } = await configFixture();
+      if (route === "mode") {
+        await expect(setMode()).resolves.toEqual({});
+      } else {
+        const result = await setOption(id, value);
+        expectConfigOption(result.configOptions, id, { currentValue: value });
+      }
+      expect(request).toHaveBeenCalledWith("sessions.patch", { key: "session", ...patch });
+      expectConfigOption(
+        expectSessionUpdate(sessionUpdate, "session", "config_option_update").configOptions,
+        id,
+        { currentValue: value },
+      );
+      if (id === "thought_level") {
+        expect(sessionUpdate).toHaveBeenCalledWith({
+          sessionId: "session",
+          update: { sessionUpdate: "current_mode_update", currentModeId: value },
+        });
+      }
+    },
+  );
 
   it("accepts forwarded timeout config options without patching Gateway sessions", async () => {
     const { setOption, request } = await configFixture();

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import {
   createSessionAgentHarness,
@@ -65,9 +65,14 @@ async function createHarness() {
 }
 
 describe("ACP commentary reclassification", () => {
+  let h: Awaited<ReturnType<typeof createHarness>>;
+  const readUpdates = ["read:in_progress", "read:completed"];
+  beforeEach(async () => {
+    h = await createHarness();
+  });
+
   it("preserves narration and the answer when the replacement is deferred", async () => {
     const answer = "OK.";
-    const h = await createHarness();
     const narration = "I will read the sample now.";
     await h.assistant("preview", narration, { delta: narration });
     await h.chat("I will");
@@ -80,18 +85,11 @@ describe("ACP commentary reclassification", () => {
     await h.chat(answer);
     await h.chat("", { replace: true });
     await h.finish(answer);
-    expect(h.updates()).toEqual([
-      "I will",
-      " read the sample now.",
-      "read:in_progress",
-      "read:completed",
-      answer,
-    ]);
+    expect(h.updates()).toEqual(["I will", " read the sample now.", ...readUpdates, answer]);
   });
 
   it("delivers the complete answer after two tool rounds", async () => {
     const answer = "Verified.";
-    const h = await createHarness();
     const expected: string[] = [];
     for (let round = 0; round < 2; round++) {
       const narration = round === 0 ? "I will read the sample now." : "Checking again.";
@@ -114,7 +112,6 @@ describe("ACP commentary reclassification", () => {
   });
 
   it("streams preamble-only snapshots once per item before the tool", async () => {
-    const h = await createHarness();
     const pending = [
       h.preamble("first", "Checking", {
         data: { kind: "preamble", itemId: "first", progressText: "Checking", phase: "update" },
@@ -142,7 +139,6 @@ describe("ACP commentary reclassification", () => {
   });
 
   it("resumes commentary from the last emitted snapshot after a divergent snapshot", async () => {
-    const h = await createHarness();
     await h.preamble("commentary", "Checking files");
     await h.preamble("commentary", "Reading files");
     await h.preamble("commentary", "Checking files now");
@@ -151,7 +147,6 @@ describe("ACP commentary reclassification", () => {
   });
 
   it("advances an item's boundary within an already displayed multi-item preview", async () => {
-    const h = await createHarness();
     await h.chat("Checking files.\nReading config.");
     await h.preamble("first", "Checking");
     await h.preamble("first", "Checking files.", { preamble: {} });
@@ -167,7 +162,6 @@ describe("ACP commentary reclassification", () => {
   ])(
     "keeps an earlier answer prefix (deferred=$deferred, chatFirst=$chatFirst)",
     async ({ deferred, chatFirst }) => {
-      const h = await createHarness();
       await h.assistant("earlier-answer", "First answer.", { phase: "final_answer" });
       await h.chat("First answer.");
       if (chatFirst) {
@@ -192,15 +186,13 @@ describe("ACP commentary reclassification", () => {
       expect(h.updates()).toEqual([
         "First answer.",
         "\n\nChecking again.",
-        "read:in_progress",
-        "read:completed",
+        ...readUpdates,
         "\n\nDone.",
       ]);
     },
   );
 
   it("keeps a distinct preamble with identical text and ignores another run", async () => {
-    const h = await createHarness();
     await h.chat("Answer.");
     await h.chat("", { replace: true, seq: 100 });
     await h.preamble("foreign", "Answer.", { seq: 100, runId: "other-run" });
@@ -209,26 +201,19 @@ describe("ACP commentary reclassification", () => {
     expect(h.updates()).toEqual(["Answer.", "Answer."]);
   });
   it("delivers a retained answer that was held before a reclassified item", async () => {
-    const h = await createHarness();
     await h.preamble("commentary", "Checking again.", {
       preamble: { retainedText: "First answer." },
     });
     await h.round();
     await h.finish("First answer.\n\nDone.");
-    expect(h.updates()).toEqual([
-      "First answer.\n\nChecking again.",
-      "read:in_progress",
-      "read:completed",
-      "\n\nDone.",
-    ]);
+    expect(h.updates()).toEqual(["First answer.\n\nChecking again.", ...readUpdates, "\n\nDone."]);
   });
 
   it("keeps legacy events without projection metadata compatible", async () => {
-    const h = await createHarness();
     await h.preamble("legacy", "Checking.", { preamble: undefined });
     await h.round();
     await h.chat("Done.");
     await h.finish();
-    expect(h.updates()).toEqual(["read:in_progress", "read:completed", "Done."]);
+    expect(h.updates()).toEqual([...readUpdates, "Done."]);
   });
 });

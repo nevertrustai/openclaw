@@ -1,19 +1,12 @@
-import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
-import type { GatewayClient } from "../gateway/client.js";
 import { createTestAcpEventLedger } from "./event-ledger.test-support.js";
 import {
   createChatEvent,
-  createSessionAgentHarness,
   observeSettlement,
   promptAgent,
 } from "./translator.prompt-harness.test-support.js";
-import {
-  createAcpConnection,
-  createAcpGateway,
-  createAcpGatewayAgent,
-} from "./translator.test-helpers.js";
+import { createTranslatorScenario } from "./translator.scenario.test-support.js";
 
 const sessionId = "session-1";
 const sessionKey = "agent:main:main";
@@ -24,11 +17,12 @@ const throwClose = () => {
 const disconnected = "Gateway disconnected: 1006: connection lost";
 const emptyReply = { status: "ok", terminalReply: { disposition: "empty" } };
 const timeout = { status: "timeout" };
+const abortCause = "Tool validation failed: command contains unsupported flag";
 type RequestHandler = (params?: Record<string, unknown>) => unknown;
 
-function harness(options: { send?: RequestHandler; wait?: RequestHandler } = {}) {
-  const sessionStore = createInMemorySessionStore();
-  sessionStore.createSession({ sessionId, sessionKey, cwd: "/tmp" });
+function harness(
+  options: { send?: RequestHandler; wait?: RequestHandler; sessionKey?: string } = {},
+) {
   const eventLedger = createTestAcpEventLedger();
   const recorded = createDeferred();
   const recordUserPrompt = eventLedger.recordUserPrompt.bind(eventLedger);
@@ -36,9 +30,6 @@ function harness(options: { send?: RequestHandler; wait?: RequestHandler } = {})
     await recordUserPrompt(params);
     recorded.resolve();
   };
-  const connection = createAcpConnection();
-  const sessionUpdate = vi.fn<typeof connection.sessionUpdate>(async () => {});
-  connection.sessionUpdate = sessionUpdate;
   let nextSend = createDeferred<string>();
   const request = vi.fn(async (method: string, params?: Record<string, unknown>) => {
     if (method === "chat.send") {
@@ -52,14 +43,10 @@ function harness(options: { send?: RequestHandler; wait?: RequestHandler } = {})
     }
     return method === "agent.wait" ? (options.wait?.(params) ?? {}) : {};
   });
-  const agent = createAcpGatewayAgent(
-    connection,
-    createAcpGateway(request as GatewayClient["request"]),
-    {
-      eventLedger,
-      sessionStore,
-    },
-  );
+  const { agent, sessionStore, sessionUpdate } = createTranslatorScenario(request, {
+    eventLedger,
+    sessionKey: options.sessionKey,
+  });
   return {
     agent,
     request,
@@ -81,8 +68,8 @@ function reconnect(agent: ReturnType<typeof harness>["agent"]) {
   agent.handleGatewayReconnect();
 }
 
-function finalEvent(runId: string, key = sessionKey) {
-  return createChatEvent({ runId, sessionKey: key, seq: 1, state: "final" });
+function chatEvent(runId: string, key = sessionKey, fields: Record<string, unknown> = {}) {
+  return createChatEvent({ runId, sessionKey: key, seq: 1, state: "final", ...fields });
 }
 
 async function expectNotice(h: ReturnType<typeof harness>, accepted: boolean) {
@@ -112,12 +99,9 @@ describe("acp translator stop reason mapping", () => {
     const prompt = h.start();
     h.sessionUpdate.mockRejectedValueOnce(new Error("client gone"));
     await h.agent.handleGatewayEvent(
-      createChatEvent({
-        runId: await prompt.sent,
-        sessionKey,
-        seq: 1,
+      chatEvent(await prompt.sent, sessionKey, {
         state: "aborted",
-        errorMessage: "Tool validation failed: command contains unsupported flag",
+        errorMessage: abortCause,
       }),
     );
     await expect(prompt.result).resolves.toEqual({ stopReason: "cancelled" });
@@ -125,10 +109,7 @@ describe("acp translator stop reason mapping", () => {
       sessionId,
       update: {
         sessionUpdate: "agent_message_chunk",
-        content: {
-          type: "text",
-          text: "[OpenClaw interruption] Tool validation failed: command contains unsupported flag",
-        },
+        content: { type: "text", text: `[OpenClaw interruption] ${abortCause}` },
       },
     });
     expect(h.sessionUpdate.mock.invocationCallOrder[0]).toBeLessThan(
@@ -137,39 +118,25 @@ describe("acp translator stop reason mapping", () => {
   });
 
   it("reconciles provisional session keys for subsequent prompts", async () => {
-    let sent = createDeferred<string>();
-    const request = vi.fn(async (method: string, params?: Record<string, unknown>) => {
-      if (method === "chat.send" && typeof params?.idempotencyKey === "string") {
-        sent.resolve(params.idempotencyKey);
-      }
-      return {};
-    });
-    const { agent, sessionStore } = createSessionAgentHarness(request as GatewayClient["request"], {
-      sessionKey: "acp:session-1",
-    });
-    const first = promptAgent(agent);
+    const h = harness({ sessionKey: "acp:session-1", send: () => ({}) });
+    const first = h.start();
     const canonical = "agent:main:acp:session-1";
-    await agent.handleGatewayEvent(
-      createChatEvent({
-        runId: await sent.promise,
-        sessionKey: canonical,
-        seq: 1,
-        state: "final",
+    await h.agent.handleGatewayEvent(
+      chatEvent(await first.sent, canonical, {
         message: { content: [{ type: "text", text: "first" }] },
       }),
     );
-    await expect(first).resolves.toEqual({ stopReason: "end_turn" });
-    expect(sessionStore.getSession(sessionId)?.sessionKey).toBe(canonical);
-    sent = createDeferred<string>();
-    const second = promptAgent(agent);
-    const runId = await sent.promise;
-    expect(request).toHaveBeenLastCalledWith(
+    await expect(first.result).resolves.toEqual({ stopReason: "end_turn" });
+    expect(h.sessionStore.getSession(sessionId)?.sessionKey).toBe(canonical);
+    const second = h.start();
+    const runId = await second.sent;
+    expect(h.request).toHaveBeenLastCalledWith(
       "chat.send",
       expect.objectContaining({ sessionKey: canonical }),
       { timeoutMs: null },
     );
-    await agent.handleGatewayEvent(finalEvent(runId, canonical));
-    await expect(second).resolves.toEqual({ stopReason: "end_turn" });
+    await h.agent.handleGatewayEvent(chatEvent(runId, canonical));
+    await expect(second.result).resolves.toEqual({ stopReason: "end_turn" });
   });
 
   it("keeps prompts pending across transient disconnects until a live final", async () => {
@@ -180,7 +147,7 @@ describe("acp translator stop reason mapping", () => {
     await Promise.resolve();
     expect(prompt.settlement).not.toHaveBeenCalled();
     h.agent.handleGatewayReconnect();
-    await h.agent.handleGatewayEvent(finalEvent(runId));
+    await h.agent.handleGatewayEvent(chatEvent(runId));
     await expect(prompt.result).resolves.toEqual({ stopReason: "end_turn" });
   });
 
@@ -371,7 +338,7 @@ describe("acp translator stop reason mapping", () => {
     firstSend.reject(closeError());
     await Promise.resolve();
     expect(second.settlement).not.toHaveBeenCalled();
-    await h.agent.handleGatewayEvent(finalEvent(runId));
+    await h.agent.handleGatewayEvent(chatEvent(runId));
     await expect(second.result).resolves.toEqual({ stopReason: "end_turn" });
   });
 

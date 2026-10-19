@@ -1,5 +1,3 @@
-/** Tests ACP session lifecycle, pagination, lineage, and terminal acknowledgements. */
-import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayClient } from "../gateway/client.js";
 import type { GatewaySessionRow } from "../gateway/session-utils.js";
@@ -10,6 +8,7 @@ import {
   createNewSessionRequest,
   createPromptRequest,
 } from "./translator.bridge-test-helpers.js";
+import { createTranslatorScenario } from "./translator.scenario.test-support.js";
 import {
   createAcpConnection,
   createAcpGateway,
@@ -45,29 +44,13 @@ function row(key: string, fields: Partial<GatewaySessionRow> = {}): GatewaySessi
   };
 }
 function sessions(rows: GatewaySessionRow[]) {
-  return {
-    ts: 1,
-    path: "/tmp/sessions.json",
-    count: rows.length,
-    totalCount: rows.length,
-    limitApplied: rows.length,
-    hasMore: false,
-    defaults: { modelProvider: null, model: null, contextTokens: null },
-    sessions: rows,
-  };
+  return { sessions: rows, hasMore: false };
 }
 function fixture(rows: GatewaySessionRow[] = [], handler?: RequestHandler) {
   const request = vi.fn(
     handler ?? (async (method) => (method === "sessions.list" ? sessions(rows) : { ok: true })),
   );
-  const connection = createAcpConnection();
-  const sessionStore = createInMemorySessionStore();
-  const agent = createAcpGatewayAgent(
-    connection,
-    createAcpGateway(request as GatewayClient["request"]),
-    { sessionStore },
-  );
-  return { agent, request, connection, sessionStore };
+  return { ...createTranslatorScenario(request, { sessions: [] }), request };
 }
 
 describe("acp translator stable lifecycle handlers", () => {
@@ -93,7 +76,6 @@ describe("acp translator stable lifecycle handlers", () => {
       const limit = typeof params?.limit === "number" ? params.limit : rows.length;
       return {
         ...sessions(rows.slice(0, limit)),
-        totalCount: rows.length,
         hasMore: limit < rows.length,
       };
     });
@@ -147,28 +129,6 @@ describe("acp translator stable lifecycle handlers", () => {
     );
   });
 
-  it("resumes an existing Gateway session without replaying transcript history", async () => {
-    const { agent, request, connection, sessionStore } = fixture([
-      row(sessionKey, { spawnedWorkspaceDir: cwd, derivedTitle: "Work session" }),
-    ]);
-    const result = await agent.resumeSession({ sessionId: sessionKey, cwd, mcpServers: [] });
-    expect(result.modes?.currentModeId).toBe("adaptive");
-    expect(
-      result.configOptions?.find((option) => option.id === "thought_level")?.currentValue,
-    ).toBe("adaptive");
-    expect(sessionStore.getSession(sessionKey)?.sessionKey).toBe(sessionKey);
-    expect(request.mock.calls.map(([method]) => method)).not.toContain("sessions.get");
-    expect(connection["__sessionUpdateMock"]).toHaveBeenCalledWith({
-      sessionId: sessionKey,
-      update: {
-        sessionUpdate: "session_info_update",
-        title: "Work session",
-        updatedAt: "2024-03-09T16:00:00.000Z",
-        _meta: { sessionKey, kind: "direct", spawnedWorkspaceDir: cwd },
-      },
-    });
-  });
-
   it("rejects resume for a missing Gateway session without creating bridge state", async () => {
     const { agent, sessionStore } = fixture();
     await expect(
@@ -177,36 +137,52 @@ describe("acp translator stable lifecycle handlers", () => {
     expect(sessionStore.hasSession("missing")).toBe(false);
   });
 
-  it("keeps snapshot lineage in the Gateway session key namespace", async () => {
-    const { agent, connection } = fixture([
-      row(sessionKey, {
-        ...lineage,
-        channel: "discord",
-        displayName: "Child",
-        spawnedWorkspaceDir: "/workspace/child",
-        updatedAt: 1_710_000_020_000,
-      }),
-    ]);
-    await agent.loadSession({
-      ...createLoadSessionRequest("client-local-session"),
-      _meta: { sessionKey },
-    });
-    expect(connection["__sessionUpdateMock"]).toHaveBeenCalledWith({
-      sessionId: "client-local-session",
-      update: {
-        sessionUpdate: "session_info_update",
-        title: "Child",
-        updatedAt: "2024-03-09T16:00:20.000Z",
-        _meta: {
-          sessionKey,
-          kind: "direct",
-          channel: "discord",
-          ...lineageMeta,
-          spawnedWorkspaceDir: "/workspace/child",
+  it.each(["resume", "load"] as const)(
+    "publishes %s snapshots in the Gateway namespace",
+    async (route) => {
+      const resume = route === "resume";
+      const sessionId = resume ? sessionKey : "client-local-session";
+      const title = resume ? "Work session" : "Child";
+      const spawnedWorkspaceDir = resume ? cwd : "/workspace/child";
+      const { agent, request, sessionUpdate, sessionStore } = fixture([
+        row(sessionKey, {
+          ...(resume
+            ? { derivedTitle: title }
+            : { ...lineage, channel: "discord", displayName: title }),
+          spawnedWorkspaceDir,
+          updatedAt: resume ? 1_710_000_000_000 : 1_710_000_020_000,
+        }),
+      ]);
+      const result = resume
+        ? await agent.resumeSession({ sessionId, cwd, mcpServers: [] })
+        : await agent.loadSession({
+            ...createLoadSessionRequest(sessionId),
+            _meta: { sessionKey },
+          });
+      expect(result.modes?.currentModeId).toBe("adaptive");
+      expect(result.configOptions?.find((option) => option.id === "thought_level")).toMatchObject({
+        currentValue: "adaptive",
+      });
+      expect(sessionStore.getSession(sessionId)?.sessionKey).toBe(sessionKey);
+      if (resume) {
+        expect(request.mock.calls.map(([method]) => method)).not.toContain("sessions.get");
+      }
+      expect(sessionUpdate).toHaveBeenCalledWith({
+        sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          title,
+          updatedAt: resume ? "2024-03-09T16:00:00.000Z" : "2024-03-09T16:00:20.000Z",
+          _meta: {
+            sessionKey,
+            kind: "direct",
+            spawnedWorkspaceDir,
+            ...(!resume ? { channel: "discord", ...lineageMeta } : {}),
+          },
         },
-      },
-    });
-  });
+      });
+    },
+  );
 
   it.each([
     { status: "timeout", stopReason: "cancelled" },
