@@ -433,12 +433,11 @@ async function executeSendWithResult(params: {
   toolOptions?: Partial<Parameters<typeof createMessageTool>[0]>;
   toolCallId?: string;
 }) {
-  const { config, getRuntimeConfig, ...toolOptions } = params.toolOptions ?? {};
-  const tool = createMessageTool({
-    getRuntimeConfig: getRuntimeConfig ?? (config ? () => config : mocks.getRuntimeConfig),
-    runMessageAction: mocks.runMessageAction as never,
-    ...toolOptions,
-  });
+  const { config, ...toolOptions } = params.toolOptions ?? {};
+  const tool = createMessageTool(toolOptions);
+  if (config) {
+    mocks.getRuntimeConfig.mockReturnValueOnce(config);
+  }
   const result = await tool.execute(params.toolCallId ?? "1", {
     action: "send",
     ...params.action,
@@ -658,7 +657,6 @@ describe("poll vote echo guard", () => {
       agentAccountId: "primary",
       agentSessionKey: sessionKey,
       sourceReplyDeliveryMode: "message_tool_only",
-      runMessageAction: mocks.runMessageAction as never,
     });
   }
 
@@ -847,7 +845,6 @@ describe("message tool secret scoping", () => {
       sourceReplyDeliveryMode: "message_tool_only",
       currentChannelProvider: "whatsapp",
       agentSessionKey: "agent:main:whatsapp:direct:123456789",
-      runMessageAction: mocks.runMessageAction as never,
     });
     hasCurrentInboundAudio = true;
 
@@ -881,8 +878,6 @@ describe("message tool secret scoping", () => {
       } satisfies MessageActionResult);
 
     const tool = createMessageTool({
-      getRuntimeConfig: mocks.getRuntimeConfig,
-      runMessageAction: mocks.runMessageAction as never,
       runId: "run-message-tool",
     });
 
@@ -936,8 +931,6 @@ describe("message tool secret scoping", () => {
       });
       mintedTurnCapabilities.push(turnCapability);
       const tool = createMessageTool({
-        getRuntimeConfig: mocks.getRuntimeConfig,
-        runMessageAction: mocks.runMessageAction as never,
         agentId: "main",
         agentSessionKey: sessionKey,
         runSessionKey,
@@ -991,8 +984,6 @@ describe("message tool secret scoping", () => {
     mintedTurnCapabilities.push(sourceLessCapability);
     const createSourceLessTool = (messageActionTurnCapability?: string) =>
       createMessageTool({
-        getRuntimeConfig: mocks.getRuntimeConfig,
-        runMessageAction: mocks.runMessageAction as never,
         agentId: "main",
         agentSessionKey: sessionKey,
         runId: "run-source-less",
@@ -1034,8 +1025,6 @@ describe("message tool secret scoping", () => {
     });
     revokeMessageActionTurnCapability(revokedCapability);
     const tool = createMessageTool({
-      getRuntimeConfig: mocks.getRuntimeConfig,
-      runMessageAction: mocks.runMessageAction as never,
       agentId: "main",
       agentSessionKey: sessionKey,
       runId: "run-revoked",
@@ -1068,8 +1057,6 @@ describe("message tool secret scoping", () => {
     );
 
     const tool = createMessageTool({
-      getRuntimeConfig: mocks.getRuntimeConfig,
-      runMessageAction: mocks.runMessageAction as never,
       runId: "run-message-tool",
     });
 
@@ -1282,8 +1269,6 @@ describe("message tool secret scoping", () => {
       currentChannelProvider: "slack",
       currentChannelId: "channel:current",
       agentAccountId: "sut",
-      resolveCommandSecretRefsViaGateway: mocks.resolveCommandSecretRefsViaGateway as never,
-      runMessageAction: mocks.runMessageAction as never,
     });
 
     await expect(
@@ -1392,8 +1377,6 @@ describe("message tool secret scoping", () => {
         currentChannelProvider: "googlechat",
         currentChannelId: "spaces/current",
         agentAccountId: "current",
-        resolveCommandSecretRefsViaGateway: mocks.resolveCommandSecretRefsViaGateway as never,
-        runMessageAction: mocks.runMessageAction as never,
       });
 
       const invocation = broadcast
@@ -1473,9 +1456,6 @@ describe("message tool secret scoping", () => {
       config: rawConfig as never,
       currentChannelProvider: "telegram",
       currentChannelId: "channel:current",
-      getScopedChannelsCommandSecretTargets: mocks.getScopedChannelsCommandSecretTargets as never,
-      resolveCommandSecretRefsViaGateway: mocks.resolveCommandSecretRefsViaGateway as never,
-      runMessageAction: mocks.runMessageAction as never,
     });
 
     await tool.execute("1", {
@@ -1539,8 +1519,6 @@ describe("message tool secret scoping", () => {
       currentChannelProvider: "discord",
       currentChannelId: "channel:123",
       agentAccountId: "ops",
-      resolveCommandSecretRefsViaGateway: mocks.resolveCommandSecretRefsViaGateway as never,
-      runMessageAction: mocks.runMessageAction as never,
     });
 
     await tool.execute("1", {
@@ -1677,7 +1655,6 @@ describe("message tool explicit target guard", () => {
       mocks.runMessageAction.mockImplementationOnce(actualRunMessageAction as never);
       const tool = createMessageTool({
         config: workspaceConfig,
-        runMessageAction: mocks.runMessageAction as never,
       });
       const result = await withGatewayToolCallerIdentity(identity, () =>
         tool.execute("invalid-broadcast-target", {
@@ -1733,7 +1710,6 @@ describe("message tool explicit target guard", () => {
     );
     const tool = wrapToolWithBeforeToolCallHook(
       createMessageTool({
-        runMessageAction: mocks.runMessageAction as never,
         requireExplicitTarget: true,
         currentChannelProvider: "telegram",
         currentChannelId: "telegram:dm-user-1",
@@ -1817,7 +1793,6 @@ describe("message tool explicit target guard", () => {
         dryRun: true,
       });
       const tool = createMessageTool({
-        runMessageAction: mocks.runMessageAction as never,
         requireExplicitTarget: true,
         currentChannelProvider: channel,
         currentChannelId: channel === "telegram" ? "telegram:dm-user-1" : undefined,
@@ -1867,9 +1842,7 @@ describe("message tool loop detection action runner proof", () => {
 
   it("blocks repeated qa-channel sends returned by the wrapped message tool", async () => {
     mockQaChannelGatewayActionRunner();
-    const messageTool = createMessageTool({
-      runMessageAction: mocks.runMessageAction as never,
-    });
+    const messageTool = createMessageTool();
     const wrappedTool = wrapToolWithBeforeToolCallHook(messageTool, {
       agentId: "main",
       sessionKey: "message-tool-action-runner-loop",
