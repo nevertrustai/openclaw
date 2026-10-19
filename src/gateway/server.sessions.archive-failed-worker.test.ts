@@ -80,11 +80,10 @@ async function pendingWorkerCleanup(sessionId: string, key: string) {
 test("failed worker cleanup does not block archive, reopen, or Undo, and retains recoverable work", async () => {
   const fixture = await archiveFixture("retained worker work\n");
   const { key, sessionId, storePath, worktree, target, entry, draftPath } = fixture;
+  const git = (...args: string[]) => execFileAsync("git", ["-C", worktree.path, ...args]);
   const checkpoint = "refs/openclaw/worker-results/archive-cleanup";
-  await execFileAsync("git", ["-C", worktree.path, "update-ref", checkpoint, "HEAD"]);
-  const checkpointBefore = (
-    await execFileAsync("git", ["-C", worktree.path, "rev-parse", checkpoint])
-  ).stdout;
+  await git("update-ref", checkpoint, "HEAD");
+  const checkpointBefore = (await git("rev-parse", checkpoint)).stdout;
   const transcript = await loadSeededTranscriptEvents(fixture.transcriptScope);
   const {
     placements,
@@ -117,21 +116,17 @@ test("failed worker cleanup does not block archive, reopen, or Undo, and retains
   const deleted = await directSessionReq("sessions.delete", target, { context });
   expect(deleted.ok).toBe(false);
   expect(reclaim).toHaveBeenCalledOnce();
-  const restore = vi.spyOn(ManagedWorktreeService.prototype, "restore");
-  try {
+  {
+    using restore = vi.spyOn(ManagedWorktreeService.prototype, "restore");
     expect(await patch(false)).toMatchObject({ ok: true });
     expect(restore).not.toHaveBeenCalled();
-  } finally {
-    restore.mockRestore();
   }
   expect(entry()?.archivedAt).toBeUndefined();
   expect(placements.get(sessionId)).toEqual(failed);
   expect(reclaim).toHaveBeenCalledOnce();
   expect(environment).toMatchObject({ state: "destroying", leaseId: "retained-lease" });
   await expect(fs.readFile(draftPath, "utf8")).resolves.toBe("retained worker work\n");
-  expect((await execFileAsync("git", ["-C", worktree.path, "rev-parse", checkpoint])).stdout).toBe(
-    checkpointBefore,
-  );
+  expect((await git("rev-parse", checkpoint)).stdout).toBe(checkpointBefore);
   await expect(loadSeededTranscriptEvents(fixture.transcriptScope)).resolves.toEqual(transcript);
   expect(await patch(true)).toMatchObject({ ok: true });
   environment.state = "destroyed";
@@ -156,21 +151,17 @@ test("failed worker cleanup keeps worktree reconstruction blocked until the work
   await cleanupWorktrees();
   expect(getRegistryWorktree(process.env, worktree.id)?.removedAt).toEqual(expect.any(Number));
   const { environment, reclaim, context } = await pendingWorkerCleanup(sessionId, key);
-  const restore = vi.spyOn(ManagedWorktreeService.prototype, "restore");
+  using restore = vi.spyOn(ManagedWorktreeService.prototype, "restore");
   const unarchive = () =>
     directSessionReq("sessions.patch", { ...target, archived: false }, { context });
-  try {
-    expect((await unarchive()).ok).toBe(false);
-    expect(restore).not.toHaveBeenCalled();
-    expect(reclaim).not.toHaveBeenCalled();
-    expect(entry()?.archivedAt).toEqual(expect.any(Number));
-    environment.state = "destroyed";
-    expect(await unarchive()).toMatchObject({ ok: true });
-    expect(restore).toHaveBeenCalledOnce();
-    await expect(fs.readFile(draftPath, "utf8")).resolves.toBe("restore this work\n");
-  } finally {
-    restore.mockRestore();
-  }
+  expect((await unarchive()).ok).toBe(false);
+  expect(restore).not.toHaveBeenCalled();
+  expect(reclaim).not.toHaveBeenCalled();
+  expect(entry()?.archivedAt).toEqual(expect.any(Number));
+  environment.state = "destroyed";
+  expect(await unarchive()).toMatchObject({ ok: true });
+  expect(restore).toHaveBeenCalledOnce();
+  await expect(fs.readFile(draftPath, "utf8")).resolves.toBe("restore this work\n");
 });
 
 test("sessions.patchMany commits archive and releases same-session writes before responding and waking cleanup", async ({
@@ -187,12 +178,12 @@ test("sessions.patchMany commits archive and releases same-session writes before
   const before = (gate: PromiseLike<unknown>, operation: PromiseLike<unknown>, message: string) =>
     withinTest(awaitGateBeforeSettlement(gate, operation, message), signal);
   const originalGc = managedWorktrees.gc.bind(managedWorktrees);
-  const gc = vi.spyOn(managedWorktrees, "gc").mockImplementation((params) => {
+  using gc = vi.spyOn(managedWorktrees, "gc").mockImplementation((params) => {
     cleanupEntered.resolve();
     return originalGc(params);
   });
   const originalRemove = managedWorktrees.remove.bind(managedWorktrees);
-  const remove = vi.spyOn(managedWorktrees, "remove").mockImplementation(async (params) => {
+  using remove = vi.spyOn(managedWorktrees, "remove").mockImplementation(async (params) => {
     entered.resolve();
     await release.promise;
     return await originalRemove(params);
@@ -263,7 +254,5 @@ test("sessions.patchMany commits archive and releases same-session writes before
     releaseEffects.resolve();
     release.resolve();
     await Promise.allSettled([archived, beforeResponseTick, cleanup]);
-    gc.mockRestore();
-    remove.mockRestore();
   }
 });

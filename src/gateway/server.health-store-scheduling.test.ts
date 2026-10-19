@@ -1,3 +1,4 @@
+import { once } from "node:events";
 import http from "node:http";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -63,24 +64,16 @@ test.each(["separate", "shared"] as const)(
     const workClock = vi.spyOn(performance, "now").mockImplementation(() => readWorkMs);
     let closing: Promise<void> | undefined;
     const httpAgent = new http.Agent({ keepAlive: true });
-    const requestHealth = () =>
-      new Promise<void>((resolve, reject) => {
-        const request = http.get(
-          `http://127.0.0.1:${harness.port}/healthz`,
-          { agent: httpAgent },
-          (response) => {
-            response.resume();
-            response.once("end", () => {
-              if (response.statusCode !== 200) {
-                reject(new Error(`healthz returned ${response.statusCode}`));
-              } else {
-                resolve();
-              }
-            });
-          },
-        );
-        request.once("error", reject);
+    const requestHealth = async () => {
+      const response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+        http
+          .get(`http://127.0.0.1:${harness.port}/healthz`, { agent: httpAgent }, resolve)
+          .once("error", reject);
       });
+      response.resume();
+      await once(response, "end");
+      expect(response.statusCode).toBe(200);
+    };
     const { calls: sqliteSummaries, restore: restoreSummaries } = spyOnSessionStoreSummaries();
     try {
       const { ws } = await harness.openClient();
@@ -171,32 +164,25 @@ test.each(["separate", "shared"] as const)(
         }
       }
       if (layout === "shared") {
-        const read = vi.spyOn(projection, "selectEntries");
-        try {
-          read.mockImplementationOnce(() => {
-            throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
-          });
-          const failedRead = await health();
-          expect(failedRead.ok).toBe(true);
-          expect(failedRead.payload?.agents.map((agent) => agent.sessions.count)).toEqual(
-            agentIds.map(() => 0),
-          );
-          expect(read).toHaveBeenCalledOnce();
-          expect((await health()).payload?.agents.at(-1)?.sessions.count).toBe(13);
+        using read = vi.spyOn(projection, "selectEntries");
+        const busy = Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+        const failRead = async <T>(request: () => Promise<T>, error: Error) => {
           read.mockClear().mockImplementationOnce(() => {
-            throw new Error("invalid session state");
+            throw error;
           });
-          expect((await health()).ok).toBe(false);
+          const response = await request();
           expect(read).toHaveBeenCalledOnce();
-          read.mockClear().mockImplementationOnce(() => {
-            throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
-          });
-          expect((await statusSummary()).ok).toBe(false);
-          expect(read).toHaveBeenCalledOnce();
-          expect((await statusSummary()).payload?.sessions.count).toBe(146);
-        } finally {
-          read.mockRestore();
-        }
+          return response;
+        };
+        const failedRead = await failRead(health, busy);
+        expect(failedRead.ok).toBe(true);
+        expect(failedRead.payload?.agents.map((agent) => agent.sessions.count)).toEqual(
+          agentIds.map(() => 0),
+        );
+        expect((await health()).payload?.agents.at(-1)?.sessions.count).toBe(13);
+        expect((await failRead(health, new Error("invalid session state"))).ok).toBe(false);
+        expect((await failRead(statusSummary, busy)).ok).toBe(false);
+        expect((await statusSummary()).payload?.sessions.count).toBe(146);
       }
       if (layout === "separate") {
         const read = vi.spyOn(projection, "selectEntries").mockImplementation((...args) => {
@@ -243,7 +229,7 @@ test.each(["separate", "shared"] as const)(
             lifecycle.push("settled");
           }
         });
-        const closingRead = vi
+        using closingRead = vi
           .spyOn(projection, "selectEntries")
           .mockImplementationOnce((...args) => {
             const result = originalRead(...args);
@@ -256,16 +242,12 @@ test.each(["separate", "shared"] as const)(
             });
             return result;
           });
-        try {
-          await Promise.allSettled([health()]);
-          await closing;
-          expect(lifecycle).toEqual(["closing", "settled", "closed"]);
-          const completedReads = closingRead.mock.calls.length;
-          await flushImmediate();
-          expect(closingRead).toHaveBeenCalledTimes(completedReads);
-        } finally {
-          closingRead.mockRestore();
-        }
+        await Promise.allSettled([health()]);
+        await closing;
+        expect(lifecycle).toEqual(["closing", "settled", "closed"]);
+        const completedReads = closingRead.mock.calls.length;
+        await flushImmediate();
+        expect(closingRead).toHaveBeenCalledTimes(completedReads);
       }
       expect(sqliteSummaries).not.toHaveBeenCalled();
     } finally {

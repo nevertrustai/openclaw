@@ -18,6 +18,7 @@ import { createDeferredCore } from "../shared/deferred.js";
 import { markChatAbortTerminalPersistenceError } from "./chat-abort-lifecycle-internal.js";
 import { registerChatAbortController } from "./chat-abort.js";
 import { createChatRunState } from "./server-chat-state.js";
+import { soloClient } from "./server-methods/sessions-sharing.test-support.js";
 import type { GatewayClient, GatewayRequestContext, RespondFn } from "./server-methods/types.js";
 import type { resolveSessionMutationAuthorization } from "./session-sharing.js";
 import {
@@ -50,14 +51,10 @@ export async function activeRunContext(params: {
     timeoutMs: 60_000,
     ownerConnId,
   });
-  if (!registration.entry) {
-    throw new Error("expected active run registration");
-  }
+  const entry = expectDefined(registration.entry, "active run registration");
   onTestFinished(registration.cleanup);
-  const entry = registration.entry;
-  let operation: ReturnType<typeof createReplyOperation> | undefined;
   const claim = await claimSessionControllerTask(entry.input, (mailboxClaim) => {
-    operation = createReplyOperation({
+    const operation = createReplyOperation({
       sessionKey,
       sessionId,
       resetTriggered: false,
@@ -67,10 +64,7 @@ export async function activeRunContext(params: {
     markReplyOperationExecutionStarted(operation);
     operation.setPhase("running");
   });
-  if (!operation) {
-    throw new Error("expected active run operation");
-  }
-  const activeOperation = operation;
+  const activeOperation = expectDefined(claim.operation, "active run operation");
   const finish = () => {
     activeOperation.complete();
     releaseSessionControllerClaim(claim);
@@ -143,6 +137,7 @@ export function waitForArchivePhase(
 
 export function identifiedClient(profileId: string): GatewayClient {
   return {
+    ...soloClient(),
     connId: `${profileId}-connection`,
     authenticatedUserId: `${profileId}@example.com`,
     authenticatedUserProfile: {
@@ -150,18 +145,6 @@ export function identifiedClient(profileId: string): GatewayClient {
       displayName: profileId,
       hasAvatar: false,
       updatedAt: 1,
-    },
-    connect: {
-      minProtocol: 1,
-      maxProtocol: 1,
-      client: {
-        id: "openclaw-control-ui",
-        version: "test",
-        platform: "test",
-        mode: "webchat",
-      },
-      role: "operator",
-      scopes: ["operator.read", "operator.write"],
     },
   };
 }
@@ -173,15 +156,17 @@ export function workerPlacement(params: {
   agentId?: string;
   environmentId?: string | null;
 }): WorkerSessionPlacementRecord {
-  const awaitingEnvironment = params.state === "local" || params.state === "requested";
-  const awaitingBundle = awaitingEnvironment || params.state === "provisioning";
-  const awaitingWorkspace = awaitingBundle || params.state === "syncing";
+  const { state } = params;
+  const awaitingEnvironment = state === "local" || state === "requested";
+  const awaitingBundle = awaitingEnvironment || state === "provisioning";
+  const awaitingWorkspace = awaitingBundle || state === "syncing";
+  const owned = ["active", "draining", "reconciling", "reclaimed", "failed"].includes(state);
   return {
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
     agentId: params.agentId ?? "main",
     executionMode: "worker-turn",
-    state: params.state,
+    state,
     generation: 2,
     turnClaim: null,
     createdAtMs: 1,
@@ -193,17 +178,13 @@ export function workerPlacement(params: {
         : awaitingEnvironment
           ? null
           : "worker-environment",
-    activeOwnerEpoch: ["active", "draining", "reconciling", "reclaimed", "failed"].includes(
-      params.state,
-    )
-      ? 1
-      : null,
+    activeOwnerEpoch: owned ? 1 : null,
     workspaceBaseManifestRef: awaitingWorkspace ? null : "manifest-ref",
     remoteWorkspaceDir: awaitingWorkspace ? null : "/workspace",
     workerBundleHash: awaitingBundle ? null : "bundle-hash",
     lastTranscriptAckCursor: null,
     lastLiveEventAckCursor: null,
-    recoveryError: params.state === "failed" ? "worker recovery stopped" : null,
+    recoveryError: state === "failed" ? "worker recovery stopped" : null,
   } as WorkerSessionPlacementRecord;
 }
 
@@ -254,11 +235,20 @@ type LifecycleHandlerResponse = {
   error?: Parameters<RespondFn>[2];
 };
 
-async function handlerResponse(invoke: (respond: RespondFn) => Promise<void> | undefined) {
+type HandlerContext = { client: GatewayClient; context: GatewayRequestContext };
+
+async function handlerResponse(
+  method: "sessions.patch" | "session.visibility.set",
+  { client, context }: HandlerContext,
+  params: Record<string, unknown>,
+  extra: Record<string, unknown> = {},
+) {
+  const handlers = await getSessionsHandlers();
   let response: LifecycleHandlerResponse | undefined;
-  await invoke((ok, payload, error) => {
+  const respond: RespondFn = (ok, payload, error) => {
     response = { ok, payload, error };
-  });
+  };
+  await handlers[method]?.({ client, context, params, respond, ...extra } as never);
   return expectDefined(response, "lifecycle handler response");
 }
 
@@ -270,43 +260,36 @@ export function expectArchived(storePath: string, sessionKey: string) {
   expect(loadSessionEntry({ storePath, sessionKey })?.archivedAt).toEqual(expect.any(Number));
 }
 
-export async function invokeArchiveHandler(params: {
-  authorization: NonNullable<
-    ReturnType<typeof resolveSessionMutationAuthorization>["authorization"]
-  >;
-  client: GatewayClient;
-  context: GatewayRequestContext;
-  sessionKey: string;
-  expectedSessionId: string;
-}): Promise<LifecycleHandlerResponse> {
-  const handlers = await getSessionsHandlers();
+export async function invokeArchiveHandler(
+  params: HandlerContext & {
+    authorization: NonNullable<
+      ReturnType<typeof resolveSessionMutationAuthorization>["authorization"]
+    >;
+    sessionKey: string;
+    expectedSessionId: string;
+  },
+): Promise<LifecycleHandlerResponse> {
   const target = archiveTarget(params.sessionKey, params.expectedSessionId);
-  return handlerResponse((respond) =>
-    handlers["sessions.patch"]?.({
+  return handlerResponse(
+    "sessions.patch",
+    params,
+    { ...target, archived: true },
+    {
       req: {} as never,
-      params: { ...target, archived: true },
-      client: params.client,
-      context: params.context,
       isWebchatConnect: () => false,
       sessionMutationAuthorization: params.authorization,
-      respond,
-    } as never),
+    },
   );
 }
 
-export async function invokeVisibilityHandler(params: {
-  client: GatewayClient;
-  context: GatewayRequestContext;
-  sessionKey: string;
-  visibility: "draft" | "shared";
-}): Promise<LifecycleHandlerResponse> {
-  const handlers = await getSessionsHandlers();
-  return handlerResponse((respond) =>
-    handlers["session.visibility.set"]?.({
-      params: { sessionKey: params.sessionKey, visibility: params.visibility },
-      client: params.client,
-      context: params.context,
-      respond,
-    } as never),
-  );
+export async function invokeVisibilityHandler(
+  params: HandlerContext & {
+    sessionKey: string;
+    visibility: "draft" | "shared";
+  },
+): Promise<LifecycleHandlerResponse> {
+  return handlerResponse("session.visibility.set", params, {
+    sessionKey: params.sessionKey,
+    visibility: params.visibility,
+  });
 }

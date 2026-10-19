@@ -16,6 +16,7 @@ import {
 } from "./test-helpers.server.js";
 
 installGatewayTestHooks({ scope: "suite" });
+type ApprovalRequest = Parameters<typeof approvalShared.handlePendingApprovalRequest>[0];
 
 function lifetimeResources(signal: AbortSignal) {
   let gateway: Awaited<ReturnType<typeof createGatewaySuiteHarness>> | undefined;
@@ -27,7 +28,7 @@ function lifetimeResources(signal: AbortSignal) {
   const rpcs: Promise<unknown>[] = [];
   const releases: Array<() => void | Promise<void>> = [];
   const unblocks: Array<() => void> = [];
-  const restores: Array<() => void> = [];
+  const spies = new DisposableStack();
   const outcomes = new Map<string, "fulfilled" | "rejected">();
   const release = async () => {
     const settlements = releases.map((settle) => settle());
@@ -41,12 +42,33 @@ function lifetimeResources(signal: AbortSignal) {
   };
   signal.addEventListener("abort", onAbort, { once: true });
   return {
-    releases,
     unblocks,
-    restores,
+    spies,
     rpcs,
     outcomes,
-    release,
+    observeRequest(
+      key: (params: ApprovalRequest) => string | undefined,
+      transform = (params: ApprovalRequest) => params,
+    ) {
+      const original = approvalShared.handlePendingApprovalRequest;
+      spies.use(
+        vi.spyOn(approvalShared, "handlePendingApprovalRequest").mockImplementation((params) => {
+          const name = key(params);
+          if (name === undefined) {
+            return original(params);
+          }
+          releases.push(async () => {
+            const record = params.manager.getLiveSnapshot(params.record.id);
+            if (record && record.resolvedAtMs === undefined) {
+              await params.manager.resolve(record.id, "deny", "lifetime proof cleanup");
+            }
+          });
+          const run = original(transform(params));
+          this.track(name, run);
+          return run;
+        }),
+      );
+    },
     track(key: string, work: Promise<void>) {
       handlers.push(
         work.then(
@@ -91,9 +113,7 @@ function lifetimeResources(signal: AbortSignal) {
       }
       await Promise.allSettled(rpcs);
       await (closing ?? gateway?.server.close({ drainTimeoutMs: 0 }));
-      for (const restore of restores) {
-        restore();
-      }
+      spies.dispose();
       signal.removeEventListener("abort", onAbort);
     },
   };
@@ -117,37 +137,23 @@ describe("public Gateway close approval lifetime", () => {
       await using fixture = lifetimeResources(signal);
       const waitEntered = createDeferredCore();
       let approvalId: string | undefined;
-      const originalRequest = approvalShared.handlePendingApprovalRequest;
       const originalWait = approvalShared.handleApprovalWaitDecision;
-      const requestObservation = vi
-        .spyOn(approvalShared, "handlePendingApprovalRequest")
-        .mockImplementation((params) => {
-          const run = originalRequest(params);
-          if (params.approvalKind === kind) {
-            approvalId = params.record.id;
-            fixture.releases.push(async () => {
-              const record = params.manager.getLiveSnapshot(params.record.id);
-              if (record && record.resolvedAtMs === undefined) {
-                await params.manager.resolve(record.id, "deny", "lifetime proof cleanup");
-              }
-            });
-            fixture.track("request", run);
-          }
-          return run;
-        });
-      const waitObservation = vi
-        .spyOn(approvalShared, "handleApprovalWaitDecision")
-        .mockImplementation((params) => {
+      fixture.observeRequest((params) => {
+        if (params.approvalKind !== kind) {
+          return;
+        }
+        approvalId = params.record.id;
+        return "request";
+      });
+      fixture.spies.use(
+        vi.spyOn(approvalShared, "handleApprovalWaitDecision").mockImplementation((params) => {
           const run = originalWait(params);
           if (params.inputId === approvalId) {
             fixture.track("wait", run);
             waitEntered.resolve();
           }
           return run;
-        });
-      fixture.restores.push(
-        () => requestObservation.mockRestore(),
-        () => waitObservation.mockRestore(),
+        }),
       );
       await fixture.start();
       const requester = await fixture.open();
@@ -193,8 +199,10 @@ describe("public Gateway close approval lifetime", () => {
       fixture.watchdog();
       await fixture.close("approval lifetime proof");
       expect(fixture.emergency).toBe(false);
-      expect(fixture.outcomes.get("request")).toBe("rejected");
-      expect(fixture.outcomes.get("wait")).toBe("rejected");
+      expect(Object.fromEntries(fixture.outcomes)).toMatchObject({
+        request: "rejected",
+        wait: "rejected",
+      });
       // Closing request observers must leave the persisted pending approval unchanged.
       expect(await getOperatorApprovalDetailed({ id })).toEqual(beforeClose);
     },
@@ -216,20 +224,10 @@ describe("public Gateway close approval lifetime", () => {
         handoffFinished: boolean;
         closed: boolean;
       } = { handoffFinished: false, closed: false };
-      const originalRequest = approvalShared.handlePendingApprovalRequest;
-      const requestObservation = vi
-        .spyOn(approvalShared, "handlePendingApprovalRequest")
-        .mockImplementation((params) => {
+      fixture.observeRequest(
+        ({ record: { id } }) => (id === pendingId || id === committedId ? id : undefined),
+        (params) => {
           const id = params.record.id;
-          if (id !== pendingId && id !== committedId) {
-            return originalRequest(params);
-          }
-          fixture.releases.push(async () => {
-            const record = params.manager.getLiveSnapshot(id);
-            if (record && record.resolvedAtMs === undefined) {
-              await params.manager.resolve(id, "deny", "lifetime proof cleanup");
-            }
-          });
           if (id === committedId) {
             observations.commit = async () =>
               terminal === "allow-once"
@@ -237,7 +235,7 @@ describe("public Gateway close approval lifetime", () => {
                 : await params.manager.expire(id);
           }
           const afterDecision = params.afterDecision;
-          const run = originalRequest({
+          return {
             ...params,
             afterDecision: async (decision, event) => {
               await afterDecision?.(decision, event);
@@ -256,12 +254,10 @@ describe("public Gateway close approval lifetime", () => {
               }
               observations.handoffFinished = true;
             },
-          });
-          fixture.track(id, run);
-          return run;
-        });
+          };
+        },
+      );
       fixture.unblocks.push(() => releaseHandoff.resolve());
-      fixture.restores.push(() => requestObservation.mockRestore());
       await fixture.start();
       const ws = await fixture.open();
       for (const id of [pendingId, committedId]) {

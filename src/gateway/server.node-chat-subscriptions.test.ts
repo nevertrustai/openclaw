@@ -73,7 +73,11 @@ function emitCompletedSessionRun(runId: string, sessionKey: string): void {
   });
 }
 
-async function expectNodeChatEvent(events: ReceivedNodeEvent[], runId: string, sessionKey: string) {
+async function expectNodeChatEvent(
+  events: ReceivedNodeEvent[],
+  runId: string,
+  sessionKey = "agent:main:main",
+) {
   await vi.waitFor(
     () => {
       expect(chatEvents(events, runId).map((event) => event.payload)).toContainEqual(
@@ -97,165 +101,136 @@ describeWithGatewayServer("gateway node chat subscriptions over WebSocket", (get
     const firstEvents: ReceivedNodeEvent[] = [];
     const reconnectEvents: ReceivedNodeEvent[] = [];
     let first: GatewayClient | undefined;
-    let reconnected: GatewayClient | undefined;
+    let reconnected: GatewayClient | undefined = undefined;
     const disconnectHistoryPending = createDeferred();
     const recordDisconnection = devicePairingNode.recordPairedNodeDisconnection;
     const disconnectHistory = vi.spyOn(devicePairingNode, "recordPairedNodeDisconnection");
-    try {
-      first = await connectNode(getStarted().port, identity, (event) => firstEvents.push(event));
-      await subscribe(first, "  Main  ");
-      emitCompletedSessionRun("canonical-node-first", "agent:main:main");
-      await expectNodeChatEvent(firstEvents, "canonical-node-first", "agent:main:main");
-
-      disconnectHistory.mockImplementationOnce(async (params) => {
-        await disconnectHistoryPending.promise;
-        return recordDisconnection(params);
-      });
-      await first.stopAndWait();
-      first = undefined;
-      await vi.waitFor(() => expect(disconnectHistory).toHaveBeenCalledOnce());
-
-      reconnected = await connectNode(getStarted().port, identity, (event) =>
-        reconnectEvents.push(event),
-      );
-      await subscribe(reconnected, "  MAIN  ");
-      emitCompletedSessionRun("canonical-node-reconnect", "agent:main:main");
-      await expectNodeChatEvent(reconnectEvents, "canonical-node-reconnect", "agent:main:main");
-
-      // Completing the old connection's history must not retire its replacement's observer.
+    await using cleanup = new AsyncDisposableStack();
+    cleanup.defer(() => reconnected?.stopAndWait());
+    cleanup.defer(() => first?.stopAndWait());
+    cleanup.defer(() => disconnectHistory.mockRestore());
+    cleanup.defer(async () => {
       disconnectHistoryPending.resolve();
       await disconnectHistory.mock.results[0]?.value;
-      emitCompletedSessionRun("canonical-node-after-disconnect-history", "agent:main:main");
-      await expectNodeChatEvent(
-        reconnectEvents,
-        "canonical-node-after-disconnect-history",
-        "agent:main:main",
-      );
+    });
+    first = await connectNode(getStarted().port, identity, (event) => firstEvents.push(event));
+    await subscribe(first, "  Main  ");
+    emitCompletedSessionRun("canonical-node-first", "agent:main:main");
+    await expectNodeChatEvent(firstEvents, "canonical-node-first");
 
-      await subscribe(reconnected, "other");
-      await subscribe(reconnected, "  Main  ", "chat.unsubscribe");
+    disconnectHistory.mockImplementationOnce(async (params) => {
+      await disconnectHistoryPending.promise;
+      return recordDisconnection(params);
+    });
+    await first.stopAndWait();
+    first = undefined;
+    await vi.waitFor(() => expect(disconnectHistory).toHaveBeenCalledOnce());
 
-      // The other subscribed session is an ordered live-transport barrier:
-      // receiving its event proves the unsubscribed main event was not queued.
-      emitCompletedSessionRun("canonical-node-unsubscribed", "agent:main:main");
-      emitCompletedSessionRun("canonical-node-other", "agent:main:other");
-      await expectNodeChatEvent(reconnectEvents, "canonical-node-other", "agent:main:other");
-      expect(chatEvents(reconnectEvents, "canonical-node-unsubscribed")).toHaveLength(0);
-      expect(chatEvents(firstEvents, "canonical-node-reconnect")).toHaveLength(0);
-    } finally {
-      disconnectHistoryPending.resolve();
-      try {
-        await disconnectHistory.mock.results[0]?.value;
-      } finally {
-        disconnectHistory.mockRestore();
-        try {
-          await first?.stopAndWait();
-        } finally {
-          await reconnected?.stopAndWait();
-        }
-      }
-    }
+    reconnected = await connectNode(getStarted().port, identity, (event) =>
+      reconnectEvents.push(event),
+    );
+    await subscribe(reconnected, "  MAIN  ");
+    emitCompletedSessionRun("canonical-node-reconnect", "agent:main:main");
+    await expectNodeChatEvent(reconnectEvents, "canonical-node-reconnect");
+
+    // Completing the old connection's history must not retire its replacement's observer.
+    disconnectHistoryPending.resolve();
+    await disconnectHistory.mock.results[0]?.value;
+    emitCompletedSessionRun("canonical-node-after-disconnect-history", "agent:main:main");
+    await expectNodeChatEvent(reconnectEvents, "canonical-node-after-disconnect-history");
+
+    await subscribe(reconnected, "other");
+    await subscribe(reconnected, "  Main  ", "chat.unsubscribe");
+
+    // The other subscribed session is an ordered live-transport barrier:
+    // receiving its event proves the unsubscribed main event was not queued.
+    emitCompletedSessionRun("canonical-node-unsubscribed", "agent:main:main");
+    emitCompletedSessionRun("canonical-node-other", "agent:main:other");
+    await expectNodeChatEvent(reconnectEvents, "canonical-node-other", "agent:main:other");
+    expect(chatEvents(reconnectEvents, "canonical-node-unsubscribed")).toHaveLength(0);
+    expect(chatEvents(firstEvents, "canonical-node-reconnect")).toHaveLength(0);
   });
 
   test("delivers final and error terminals through one canonical node subscription", async () => {
     const identity = await pairNode("canonical-chat-terminal-fanout");
     const events: ReceivedNodeEvent[] = [];
-    let node: GatewayClient | undefined;
+    let node: GatewayClient | undefined = undefined;
     let operator: GatewayClient | undefined;
     const requestExecution = await observeGatewayRunExecution();
     const finalRunId = "canonical-node-terminal-final";
-    const errorRunId = "canonical-node-terminal-error";
-    const finalTerminal = createDeferred<Record<string, unknown>>();
-    const errorTerminal = createDeferred<Record<string, unknown>>();
-
-    try {
-      node = await connectNode(getStarted().port, identity, (event) => {
-        events.push(event);
-        if (event.event !== "chat") {
-          return;
-        }
-        const payload = event.payload as Record<string, unknown>;
-        if (payload.runId === finalRunId) {
-          finalTerminal.resolve(payload);
-        } else if (payload.runId === errorRunId) {
-          errorTerminal.resolve(payload);
-        }
-      });
-      const sender = (operator = await connectGatewayClient({
-        url: `ws://127.0.0.1:${getStarted().port}`,
-        token: "secret",
-        role: "operator",
-        scopes: ["operator.write"],
-      }));
-      await subscribe(node, " Main ");
-      const sendAndWait = async (
-        runId: string,
-        message: string,
-        terminal: Promise<Record<string, unknown>>,
-      ) => {
-        expect(
-          await sender.request("chat.send", {
-            sessionKey: "main",
-            message,
-            idempotencyKey: runId,
-          }),
-        ).toMatchObject({ runId, status: "started" });
-        // Admission precedes detached dispatch and terminal effects.
-        await requestExecution.waitForCompletion(runId);
-        return withTestTimeout(terminal, 5_000, `node terminal ${runId} was not delivered`);
-      };
-
-      dispatchInboundMessageMock.mockImplementationOnce(async (...args: unknown[]) => {
-        const [{ dispatcher }] = args as Parameters<typeof dispatchInboundMessage>;
-        dispatcher.sendFinalReply({ text: "node subscription final" });
-        dispatcher.markComplete();
-        await dispatcher.waitForIdle();
-        return { queuedFinal: true, counts: dispatcher.getQueuedCounts() };
-      });
-      const finalPayload = await sendAndWait(
-        finalRunId,
-        "deliver a final terminal",
-        finalTerminal.promise,
-      );
-      expect(chatEvents(events, finalRunId)).toHaveLength(1);
-      expect(finalPayload).toMatchObject({
-        runId: finalRunId,
-        sessionKey: "agent:main:main",
-        state: "final",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "node subscription final" }],
-        },
-      });
-
-      dispatchInboundMessageMock.mockRejectedValueOnce(new Error("node dispatch rejected"));
-      const errorPayload = await sendAndWait(
-        errorRunId,
-        "deliver an error terminal",
-        errorTerminal.promise,
-      );
-      await subscribe(node, "main");
-
-      expect(chatEvents(events, finalRunId)).toHaveLength(1);
-      expect(chatEvents(events, errorRunId)).toHaveLength(1);
-      expect(errorPayload).toMatchObject({
-        runId: errorRunId,
-        sessionKey: "agent:main:main",
-        state: "error",
-        errorMessage: expect.stringContaining("node dispatch rejected"),
-      });
-      expect(errorPayload).not.toHaveProperty("message");
-    } finally {
-      try {
-        await requestExecution.restore();
-      } finally {
-        dispatchInboundMessageMock.mockReset();
-        try {
-          await operator?.stopAndWait();
-        } finally {
-          await node?.stopAndWait();
-        }
+    let runId = finalRunId;
+    let terminal = createDeferred<Record<string, unknown>>();
+    await using cleanup = new AsyncDisposableStack();
+    cleanup.defer(() => node?.stopAndWait());
+    cleanup.defer(() => operator?.stopAndWait());
+    cleanup.defer(() => {
+      dispatchInboundMessageMock.mockReset();
+    });
+    cleanup.defer(() => requestExecution.restore());
+    node = await connectNode(getStarted().port, identity, (event) => {
+      events.push(event);
+      if (event.event !== "chat") {
+        return;
       }
+      const payload = event.payload as Record<string, unknown>;
+      if (payload.runId === runId) {
+        terminal.resolve(payload);
+      }
+    });
+    const sender = (operator = await connectGatewayClient({
+      url: `ws://127.0.0.1:${getStarted().port}`,
+      token: "secret",
+      role: "operator",
+      scopes: ["operator.write"],
+    }));
+    await subscribe(node, " Main ");
+    for (const state of ["final", "error"] as const) {
+      runId = `canonical-node-terminal-${state}`;
+      terminal = createDeferred<Record<string, unknown>>();
+      if (state === "final") {
+        dispatchInboundMessageMock.mockImplementationOnce(async (...args: unknown[]) => {
+          const [{ dispatcher }] = args as Parameters<typeof dispatchInboundMessage>;
+          dispatcher.sendFinalReply({ text: "node subscription final" });
+          dispatcher.markComplete();
+          await dispatcher.waitForIdle();
+          return { queuedFinal: true, counts: dispatcher.getQueuedCounts() };
+        });
+      } else {
+        dispatchInboundMessageMock.mockRejectedValueOnce(new Error("node dispatch rejected"));
+      }
+      expect(
+        await sender.request("chat.send", {
+          sessionKey: "main",
+          message: `deliver ${state} terminal`,
+          idempotencyKey: runId,
+        }),
+      ).toMatchObject({ runId, status: "started" });
+      // Admission precedes detached dispatch and terminal effects.
+      await requestExecution.waitForCompletion(runId);
+      const payload = await withTestTimeout(
+        terminal.promise,
+        5_000,
+        `node terminal ${runId} was not delivered`,
+      );
+      if (state === "error") {
+        await subscribe(node, "main");
+        expect(chatEvents(events, finalRunId)).toHaveLength(1);
+        expect(payload).not.toHaveProperty("message");
+      }
+      expect(chatEvents(events, runId)).toHaveLength(1);
+      expect(payload).toMatchObject({
+        runId,
+        sessionKey: "agent:main:main",
+        state,
+        ...(state === "final"
+          ? {
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "node subscription final" }],
+              },
+            }
+          : { errorMessage: expect.stringContaining("node dispatch rejected") }),
+      });
     }
   });
 });
