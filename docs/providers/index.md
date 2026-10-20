@@ -77,6 +77,7 @@ Looking for chat channel docs (WhatsApp/Telegram/Discord/Slack/Mattermost (plugi
 - [Qwen Cloud](/providers/qwen)
 - [Radius](/providers/radius)
 - [Runway](/providers/runway)
+- [Safe AI Labs](/providers/safeailabs)
 - [SenseAudio](/providers/senseaudio)
 - [SGLang (local models)](/providers/sglang)
 - [StepFun](/providers/stepfun)
